@@ -1,0 +1,27 @@
+{
+  "name": "marmaracad",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MarmaraCad - Browser-based parametric CAD, assembly and FEA engineering suite",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node tests/e2e.mjs"
+  },
+  "dependencies": {
+    "lucide": "^0.468.0",
+    "opencascade.js": "1.1.1",
+    "three": "^0.171.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.171.0",
+    "playwright-core": "^1.65.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.6",
+    "vitest": "^2.1.9"
+  }
+}

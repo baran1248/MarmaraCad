@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.log
+npm-debug.log*
+.vite/
+coverage/
+test-results/
+playwright-report/
+screenshots/
+.DS_Store
+Thumbs.db
+*.tmp
+mcad-export-*
