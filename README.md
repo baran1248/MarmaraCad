@@ -28,11 +28,16 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # Playwright end-to-end suite (uses local Chrome)
+npm run test:e2e # Playwright end-to-end suite (start `npm run dev` first; uses local Chrome)
+npm run test:live # smoke test against the published GitHub Pages build
 ```
 
 The OpenCascade WASM binary is served as a static asset from the build output. On first load
 the kernel is initialised inside a worker; a loading screen reports progress.
+
+> Kernel note: the OCCT Emscripten build shipped with `opencascade.js@1.1.1` cannot open MEMFS
+> paths longer than 10 characters (writes land under a mangled name, reads fail), so every
+> worker exchange file uses a short fixed name (`/o.step`, `/i.step`, `/r.step`, `.igs`).
 
 ## Architecture
 

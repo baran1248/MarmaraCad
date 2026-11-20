@@ -87,8 +87,8 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] Playwright end-to-end: fillet, undo/redo, autosave restore
 - [x] Playwright end-to-end: mates
 - [x] Playwright end-to-end: analysis solve and result rendering
-- [ ] Visual QA pass with screenshot review
-- [ ] Live GitHub Pages verification (desktop)
+- [x] Visual QA pass with screenshot review (6 states reviewed; 5 findings fixed)
+- [x] Live GitHub Pages verification (desktop)
 - [x] README with architecture, usage, verification and license notes
 
 ## Verification log
@@ -107,3 +107,10 @@ Live: https://baran1248.github.io/MarmaraCad/
 - Undo/redo and IndexedDB autosave restore verified (4 features, 3 sketches after reload).
 - Kernel note: `opencascade.js@1.1.1` corrupts/fails MEMFS paths longer than 10 characters, so all
   worker exchange files use short names (`/o.step`, `/i.step`, `/r.step`, `/o.igs`, `/i.igs`, `/r.igs`).
+- Live build at https://baran1248.github.io/MarmaraCad/ boots in ~3–4 s and reproduces the local
+  sample, STEP export and FEA results exactly (deploy run 44686524966, commit 36bc5bb).
+- Visual QA fixes: `fmt()` no longer strips trailing zeros from integers (250 MPa was shown as
+  25 MPa, 1000 N as 1 N); PropertyManager subtitle moved to its own line; colorbar widened to
+  92 px with consistent tick formatting and preserved `MPa` casing; the assembly mass card now
+  aggregates visible components; the sketch solver recognises an already-consistent profile so a
+  freshly drawn rectangle no longer reports a false constraint conflict.

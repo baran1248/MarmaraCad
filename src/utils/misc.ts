@@ -7,7 +7,9 @@ export function fmt(v: number, digits = 2): string {
   if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(2) + "e6";
   if (Math.abs(v) < 0.001 && v !== 0) return v.toExponential(2);
   const s = v.toFixed(digits);
-  return s.replace(/\.?0+$/, "");
+  // Trim trailing zeros only after a decimal point — otherwise "250" would become "25".
+  if (!s.includes(".")) return s;
+  return s.replace(/0+$/, "").replace(/\.$/, "");
 }
 
 export function escapeHtml(s: string): string {

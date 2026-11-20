@@ -50,6 +50,23 @@ describe("sketch solver", () => {
     const r = solveSketch(s);
     expect(r.sketch.points[0]).toMatchObject({ x: 0, y: 0 });
   });
+
+  it("reports a freshly drawn rectangle as consistent", () => {
+    // Mirrors the Rectangle tool: exact h/v relations plus width/height dimensions
+    // that already hold. The solver must not warn about this state.
+    const s = rectangleSketch();
+    s.constraints = [
+      { id: "h1", type: "horizontal", entity: "l1" },
+      { id: "v1", type: "vertical", entity: "l2" },
+      { id: "h2", type: "horizontal", entity: "l3" },
+      { id: "v2", type: "vertical", entity: "l4" },
+      { id: "d1", type: "distance", entity: "l1", value: 40 },
+      { id: "d2", type: "distance", entity: "l2", value: 20 },
+    ];
+    const r = solveSketch(s, { maxIterations: 80 });    expect(r.conflict).toEqual([]);
+    expect(r.converged).toBe(true);
+    expect(r.residual).toBeLessThan(1e-6);
+  });
 });
 
 describe("profile builder", () => {

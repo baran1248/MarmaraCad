@@ -611,7 +611,7 @@ export class Shell {
           <span>${formatScale(options.min)}</span>
         </div>
       </div>
-      <div class="cb-title" style="border-top:0;border-radius:0 0 4px 4px;border-top:1px solid rgba(160,180,200,.5)">${options.unit}</div>
+      <div class="cb-title cb-unit">${options.unit}</div>
     `;
   }
 
@@ -641,9 +641,13 @@ export class Shell {
 
 function formatScale(v: number): string {
   if (!Number.isFinite(v)) return "—";
+  // Keep the tick column narrow and consistent: every tick uses a similar width.
+  if (Math.abs(v) < 5e-4) return "0.00";
   if (Math.abs(v) >= 1000) return (v / 1000).toFixed(2) + "k";
+  if (Math.abs(v) >= 100) return v.toFixed(1);
   if (Math.abs(v) >= 10) return v.toFixed(1);
   if (Math.abs(v) >= 1) return v.toFixed(2);
+  if (Math.abs(v) >= 0.01) return v.toFixed(3);
   return v.toExponential(1);
 }
 

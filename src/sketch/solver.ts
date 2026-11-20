@@ -224,7 +224,19 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
   let iterations = 0;
   let converged = false;
 
-  for (let iter = 0; iter < maxIterations; iter++) {
+  // Tolerances scale with the model so a 200 mm profile is not judged by the same
+  // absolute error as a 2 mm one.
+  let lengthScale = 1;
+  for (const p of sketch.points) lengthScale = Math.max(lengthScale, Math.abs(p.x), Math.abs(p.y));
+  const satisfied = (c: number) => c <= 1e-12 * lengthScale * lengthScale;
+
+  if (satisfied(cost)) {
+    // Already consistent (e.g. a freshly drawn rectangle): nothing to iterate.
+    x = x0.slice();
+    converged = true;
+  }
+
+  for (let iter = 0; iter < maxIterations && !converged; iter++) {
     iterations = iter + 1;
     const m = r.length;
     const n = x.length;
@@ -256,7 +268,7 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
     const dx = solveLinear(A, b);
     if (!dx) {
       lambda *= 8;
-      if (lambda > 1e12) break;
+      if (lambda > 1e12 || satisfied(cost)) break;
       continue;
     }
     const tryX = x.slice();
@@ -271,7 +283,7 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
       lambda = Math.max(1e-10, lambda * 0.4);
       let maxStep = 0;
       for (let i = 0; i < n; i++) maxStep = Math.max(maxStep, Math.abs(dx[i]));
-      if (maxStep < tol || cost < 1e-10) {
+      if (maxStep < tol || satisfied(cost)) {
         converged = true;
         break;
       }
@@ -280,6 +292,11 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
         break;
       }
     } else {
+      // A rejected step at an already-consistent state is convergence, not failure.
+      if (satisfied(cost)) {
+        converged = true;
+        break;
+      }
       lambda *= 6;
       if (lambda > 1e12) break;
     }
@@ -322,7 +339,7 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
       if ((c.value ?? 0) <= 0) conflict.push("Dimensions must be greater than zero.");
     }
   }
-  if (cost > 1e-2) conflict.push("The sketch constraints are over-defined or inconsistent.");
+  if (cost > 1e-6 * lengthScale * lengthScale) conflict.push("The sketch constraints are over-defined or inconsistent.");
 
   return { sketch, converged, residual: Math.sqrt(cost), iterations, conflict };
 }

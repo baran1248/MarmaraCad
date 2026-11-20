@@ -683,6 +683,33 @@ export class App {
   }
 
   private updateMassCard(): void {
+    if (this.doc.mode === "assembly") {
+      let volume = 0;
+      let area = 0;
+      let grams = 0;
+      let count = 0;
+      for (const component of this.doc.components) {
+        if (!component.visible) continue;
+        const part = this.doc.parts.find((p) => p.id === component.partId);
+        const mesh = part ? this.meshForPart(part.id) : undefined;
+        if (!part || !mesh || mesh.positions.length === 0) continue;
+        volume += mesh.volume;
+        area += mesh.area;
+        grams += mesh.volume * materialById(part.materialId).density * 1e-6;
+        count++;
+      }
+      if (count === 0) {
+        this.shell.setMassRows([{ label: "Volume", value: "—" }, { label: "Mass", value: "—" }, { label: "Area", value: "—" }]);
+        return;
+      }
+      this.shell.setMassRows([
+        { label: "Volume", value: `${fmt(volume, 0)} mm³` },
+        { label: "Mass", value: grams >= 1000 ? `${fmt(grams / 1000, 3)} kg` : `${fmt(grams, 1)} g` },
+        { label: "Area", value: `${fmt(area, 0)} mm²` },
+        { label: "Components", value: `${count} visible` },
+      ]);
+      return;
+    }
     const part = this.activePart();
     const mesh = part ? this.meshForPart(part.id) : undefined;
     if (!part || !mesh || mesh.positions.length === 0) {
@@ -2973,6 +3000,7 @@ export class App {
     const filename = `${safeFilename(this.doc.name)}.${format}`;
     if (format === "stl") downloadBytes(writeSTL(entries), filename, "model/stl");
     else downloadText(writeOBJ(entries), filename, "text/plain");
+    this.shell.setStatus(`${filename} exported`);
     toast(`${format.toUpperCase()} exported (${entries.length} body(ies)).`, "success");
   }
 

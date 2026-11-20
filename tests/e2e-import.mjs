@@ -106,8 +106,42 @@ console.log(
   }),
 );
 
+// reopen the saved project through File > Open Project
+await page.click('[data-menu="file"]');
+const openChooserPromise = page.waitForEvent("filechooser", { timeout: 30000 });
+await page.click('[data-menu-action="open-project"]');
+const openChooser = await openChooserPromise;
+await openChooser.setFiles(savedPath);
+await page.waitForFunction(
+  () => {
+    const app = window.__marmaracad;
+    const doc = app?.doc?.();
+    if (!doc || doc.parts.length !== 2) return false;
+    const mesh = app.meshes().get(doc.parts[1].id);
+    return Boolean(mesh && mesh.volume > 50000);
+  },
+  null,
+  { timeout: 180000 },
+);
+const reopened = await page.evaluate(() => {
+  const app = window.__marmaracad;
+  const doc = app.doc();
+  const mesh = app.meshes().get(doc.parts[1].id);
+  return {
+    name: doc.name,
+    parts: doc.parts.length,
+    features: doc.parts[0].features.length,
+    importedName: doc.parts[1].name,
+    importedVolume: Math.round(mesh.volume),
+    importedFaces: mesh.faces.length,
+    status: document.getElementById("status-msg")?.textContent,
+  };
+});
+console.log("REOPEN", JSON.stringify(reopened, null, 2));
+
 const volumeOk = Math.abs(imported.volume - 98507) < 50;
-console.log("RESULT", volumeOk && imported.parts === 2 && errors.length === 0 ? "PASS" : "FAIL");
+const reopenOk = reopened.parts === 2 && Math.abs(reopened.importedVolume - 98507) < 50;
+console.log("RESULT", volumeOk && reopenOk && imported.parts === 2 && errors.length === 0 ? "PASS" : "FAIL");
 if (errors.length) console.log("ERRORS", JSON.stringify(errors, null, 2));
 await browser.close();
 await unlink(stepPath).catch(() => undefined);
