@@ -18,8 +18,10 @@ visualisation — executes on the user's own CPU/GPU.
 - Extrude Boss/Base, Extruded Cut, Revolve, Fillet and Chamfer as an editable feature history.
 - Multi-part assemblies with Coincident, Concentric and Distance mates.
 - STEP (AP214), IGES, STL and OBJ import/export; `.mcad.json` projects; IndexedDB autosave.
-- Ansys-inspired structural analysis: material library, conforming tetrahedral mesh,
-  fixed supports, forces/pressures, linear static solve, total deformation and Von Mises stress.
+- Ansys-inspired structural analysis: material library, conforming hexahedral (8-node brick)
+  mesh, fixed supports, forces/pressures, linear static solve, total deformation and Von Mises
+  stress.
+- WebGPU renderer with an automatic WebGL2 fallback (`?renderer=webgl2` forces the fallback).
 
 ## Development
 
@@ -37,7 +39,9 @@ Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow`
 (`gh auth refresh -h github.com -s workflow`).
 
 The OpenCascade WASM binary is served as a static asset from the build output. On first load
-the kernel is initialised inside a worker; a loading screen reports progress.
+the kernel is initialised inside a worker; a loading screen reports progress. The 66 MB binary
+is kept in the Cache API (`marmaracad-kernel-v1`), so repeat visits start in under a second and
+a new deployment invalidates the entry automatically (Tools → Clear Cached Kernel removes it).
 
 > Kernel note: the OCCT Emscripten build shipped with `opencascade.js@1.1.1` cannot open MEMFS
 > paths longer than 10 characters (writes land under a mangled name, reads fail), so every
@@ -48,7 +52,7 @@ the kernel is initialised inside a worker; a loading screen reports progress.
 | Layer | Responsibility |
 | --- | --- |
 | `src/kernel/cad.worker.ts` | OCCT B-Rep operations, tessellation, topological metadata, STEP/IGES |
-| `src/kernel/fea.worker.ts` | voxel tetrahedral meshing, CSR assembly, PCG solve, stress recovery |
+| `src/kernel/fea.worker.ts` | voxel hexahedral meshing, CSR assembly, PCG solve, stress recovery |
 | `src/viewport/` | Three.js scene, picking, sketch rendering, result visualisation |
 | `src/sketch/` | 2D constraint solver, profile extraction, snapping |
 | `src/model/` | project document model, feature history, mates, materials |

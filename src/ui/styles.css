@@ -2033,6 +2033,14 @@ svg {
   animation: boot-slide 1.25s ease-in-out infinite;
 }
 
+/* Once real progress is available the bar becomes determinate. */
+.boot-bar.determinate::after {
+  width: var(--boot-pct, 8%);
+  animation: none;
+  transform: none;
+  transition: width 0.28s ease-out;
+}
+
 @keyframes boot-slide {
   0% {
     transform: translateX(-100%);

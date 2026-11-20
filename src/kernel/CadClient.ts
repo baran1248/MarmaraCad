@@ -21,6 +21,10 @@ export class CadClient {
   private queue: Promise<unknown> = Promise.resolve();
   private bootMs = 0;
   private disposed = false;
+  private booted = false;
+  private bootFromCache = false;
+  private bootBytes = 0;
+  private bootListeners = new Set<(phase: string, percent: number) => void>();
 
   constructor() {
     this.worker = new Worker(new URL("./cad.worker.ts", import.meta.url), { type: "module" });
@@ -35,6 +39,9 @@ export class CadClient {
     };
     this.readyPromise = this.send<{ type: "ready"; bootMs: number }>({ type: "boot" }, ["ready"]).then((r) => {
       this.bootMs = r.bootMs;
+      this.booted = true;
+      this.bootFromCache = Boolean((r as { fromCache?: boolean }).fromCache);
+      this.bootBytes = Number((r as { wasmBytes?: number }).wasmBytes) || 0;
       return r.bootMs;
     });
   }
@@ -43,7 +50,19 @@ export class CadClient {
     return this.bootMs;
   }
 
+  get kernelFromCache(): boolean {
+    return this.bootFromCache;
+  }
+
+  get kernelBytes(): number {
+    return this.bootBytes;
+  }
+
   private onMessage(msg: KernelResponse): void {
+    if (msg.type === "boot-progress") {
+      for (const listener of this.bootListeners) listener(msg.phase, msg.percent);
+      return;
+    }
     if (msg.type === "error") {
       if (this.waiter) {
         window.clearTimeout(this.waiter.timer);
@@ -89,8 +108,16 @@ export class CadClient {
     return next;
   }
 
-  async ready(): Promise<number> {
-    return this.readyPromise;
+  async ready(onProgress?: (phase: string, percent: number) => void): Promise<number> {
+    if (onProgress) {
+      this.bootListeners.add(onProgress);
+      if (this.booted) onProgress("Kernel ready", 100);
+    }
+    try {
+      return await this.readyPromise;
+    } finally {
+      if (onProgress) this.bootListeners.delete(onProgress);
+    }
   }
 
   rebuild(parts: RebuildPart[], quality = 0.12): Promise<RebuildResult> {

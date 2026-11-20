@@ -85,6 +85,7 @@ const MENUS: Record<string, MenuEntry[]> = {
     { label: "Model Info…", action: "model-info", icon: "info" },
     { separator: true },
     { label: "Display Settings", action: "display-settings", icon: "settings" },
+    { label: "Clear Cached Kernel", action: "clear-kernel-cache", icon: "database" },
     { label: "Clear Autosave", action: "clear-autosave", icon: "trash-2" },
   ],
   help: [

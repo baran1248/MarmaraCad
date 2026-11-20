@@ -1,7 +1,7 @@
 /* MarmaraCad geometry kernel worker — OpenCascade.js (OCCT WASM).
  * All B-Rep modelling, tessellation and STEP/IGES exchange happens here so the
  * UI thread never blocks on the CAD kernel. */
-import { getOcct } from "./occt";
+import { getOcct, occtCacheInfo } from "./occt";
 import type { ExportRequest, ImportRequest, KernelResponse, RebuildRequest } from "./protocol";
 import type { EdgeInfo, FaceInfo, Feature, MeshData, Part, RebuildPart, Sketch, SketchPlane, Vec3 } from "../model/types";
 import { buildProfileGroups, planePoint, type ProfileGroup, type ProfileLoop } from "../sketch/geometry";
@@ -173,11 +173,48 @@ function revolveFeature(sketch: Sketch, feature: Feature, shape: any): any {
   return applyBoolean(shape, tool, cut);
 }
 
+/** Unique topological edges of a shape.
+ *
+ *  TopExp_Explorer visits a shared edge once per adjacent face, so a plain
+ *  traversal returns every box edge twice. Deduplicating by the sampled
+ *  endpoint/midpoint key keeps picking, highlighting and fillet indices
+ *  one-to-one with the edges the user actually sees. */
 function collectEdges(shape: any): any[] {
   const edges: any[] = [];
+  const seen = new Map<string, any[]>();
   const exp = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_EDGE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
   while (exp.More()) {
-    edges.push(oc.TopoDS.Edge_1(exp.Current()));
+    const edge = oc.TopoDS.Edge_1(exp.Current());
+    let key = "";
+    try {
+      if (oc.BRep_Tool.Degenerated(edge)) {
+        exp.Next();
+        continue;
+      }
+      const curve = new oc.BRepAdaptor_Curve_2(edge);
+      const first = curve.FirstParameter();
+      const last = curve.LastParameter();
+      const mid = curve.Value((first + last) / 2);
+      const a = curve.Value(first);
+      const b = curve.Value(last);
+      const round = (v: number) => Math.round(v * 1000) / 1000;
+      const pa = [round(a.X()), round(a.Y()), round(a.Z())].join(",");
+      const pb = [round(b.X()), round(b.Y()), round(b.Z())].join(",");
+      key = [pa < pb ? pa : pb, pa < pb ? pb : pa, round(mid.X()), round(mid.Y()), round(mid.Z()), enumVal(curve.GetType())].join("|");
+    } catch {
+      key = "";
+    }
+    if (key && seen.has(key)) {
+      const bucket = seen.get(key)!;
+      if (bucket.some((other) => other.IsSame(edge))) {
+        exp.Next();
+        continue;
+      }
+      bucket.push(edge);
+    } else if (key) {
+      seen.set(key, [edge]);
+    }
+    edges.push(edge);
     exp.Next();
   }
   return edges;
@@ -447,15 +484,10 @@ function tessellate(shape: any, quality: number): MeshData {
   // Topological edges as smooth polylines for display and picking.
   const edges: EdgeInfo[] = [];
   try {
-    const expEdges = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_EDGE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
-    let edgeIndex = 0;
-    while (expEdges.More()) {
-      const edge = oc.TopoDS.Edge_1(expEdges.Current());
+    const topoEdges = collectEdges(shape);
+    for (let edgeIndex = 0; edgeIndex < topoEdges.length; edgeIndex++) {
+      const edge = topoEdges[edgeIndex];
       try {
-        if (oc.BRep_Tool.Degenerated(edge)) {
-          expEdges.Next();
-          continue;
-        }
         const curve = new oc.BRepAdaptor_Curve_2(edge);
         const first = curve.FirstParameter();
         const last = curve.LastParameter();
@@ -478,8 +510,6 @@ function tessellate(shape: any, quality: number): MeshData {
       } catch (e) {
         if (warnings.length < 8) warnings.push("edge read error: " + String(e));
       }
-      edgeIndex++;
-      expEdges.Next();
     }
   } catch (e) {
     warnings.push("edge explorer error: " + String(e));
@@ -705,9 +735,12 @@ async function handleExport(req: ExportRequest) {
 
 async function boot() {
   const t0 = performance.now();
-  oc = await getOcct();
+  oc = await getOcct((progress) => {
+    post({ type: "boot-progress", phase: progress.phase, percent: progress.percent });
+  });
   bootMs = Math.round(performance.now() - t0);
-  post({ type: "ready", bootMs });
+  const info = occtCacheInfo();
+  post({ type: "ready", bootMs, fromCache: info.fromCache, wasmBytes: info.bytes });
 }
 
 self.onmessage = async (e: MessageEvent) => {

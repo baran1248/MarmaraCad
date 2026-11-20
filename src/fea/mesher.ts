@@ -1,10 +1,17 @@
-/** Voxel-based conforming tetrahedral mesher.
- *  Every occupied grid cell is split into six tetrahedra around one diagonal.
+/** Voxel-based conforming hexahedral mesher.
+ *
+ *  Every occupied grid cell becomes one 8-node brick. The structured grid keeps
+ *  the mesh conforming (neighbouring cells share whole faces) while trilinear
+ *  hexahedra with 2x2x2 Gauss integration represent bending far better than
+ *  constant-strain tetrahedra, which is essential for the beam benchmark.
+ *
  *  Interior testing uses parity ray casting along +Z with a 2D bucket index. */
 
-export interface TetMeshData {
+export interface VoxelMeshData {
   positions: Float32Array;
-  tets: Uint32Array;
+  /** Eight node indices per element, bottom ring first (0..3) then top ring (4..7). */
+  hexes: Uint32Array;
+  /** Boundary triangles for result display and pressure loads. */
   surface: Uint32Array;
   h: number;
   nodeCount: number;
@@ -14,16 +21,22 @@ export interface TetMeshData {
 }
 
 interface FaceRecord {
-  tri: [number, number, number];
+  tri: [number, number, number, number];
   count: number;
   element: number;
 }
 
-export function buildTetMesh(
-  sourcePositions: Float32Array,
-  sourceIndices: Uint32Array,
-  meshSize: number,
-): TetMeshData {
+/** The six faces of a hexahedron, wound counter-clockwise when seen from outside. */
+const HEX_FACES: [number, number, number, number][] = [
+  [0, 3, 2, 1], // -Z
+  [4, 5, 6, 7], // +Z
+  [0, 1, 5, 4], // -Y
+  [1, 2, 6, 5], // +X
+  [2, 3, 7, 6], // +Y
+  [3, 0, 4, 7], // -X
+];
+
+export function buildVoxelMesh(sourcePositions: Float32Array, sourceIndices: Uint32Array, meshSize: number): VoxelMeshData {
   const warnings: string[] = [];
   if (sourcePositions.length === 0) throw new Error("The part has no surface mesh. Rebuild the model first.");
   let minX = Infinity, minY = Infinity, minZ = Infinity;
@@ -44,7 +57,7 @@ export function buildTetMesh(
   let cellX = Math.ceil((maxX - minX) / h);
   let cellY = Math.ceil((maxY - minY) / h);
   let cellZ = Math.ceil((maxZ - minZ) / h);
-  const maxCells = 90000;
+  const maxCells = 120000;
   while ((cellX + 2) * (cellY + 2) * (cellZ + 2) > maxCells) {
     h *= 1.22;
     cellX = Math.ceil((maxX - minX) / h);
@@ -65,8 +78,7 @@ export function buildTetMesh(
   const dimZ = cellZ;
   const gridX = dimX + 1;
   const gridY = dimY + 1;
-  const gridZ = dimZ + 1;
-  const gridNodeCount = gridX * gridY * gridZ;
+  const gridNodeCount = gridX * gridY * (dimZ + 1);
   const nodeIndex = (i: number, j: number, k: number) => (k * gridY + j) * gridX + i;
 
   const triCount = Math.floor(sourceIndices.length / 3);
@@ -171,47 +183,32 @@ export function buildTetMesh(
     throw new Error("Meshing produced no elements. Try a smaller mesh size or check that the body is closed.");
   }
 
-  // Six tetrahedra per occupied cell around the cell diagonal.
-  const tets: number[] = [];
+  // One hexahedron per occupied cell.
+  const hexes = new Uint32Array(cellCount * 8);
+  let hexCount = 0;
   for (let k = 0; k < dimZ; k++) {
     for (let j = 0; j < dimY; j++) {
       for (let i = 0; i < dimX; i++) {
         if (!occupied[(k * dimY + j) * dimX + i]) continue;
-        const n0 = nodeIndex(i, j, k);
-        const n1 = nodeIndex(i + 1, j, k);
-        const n2 = nodeIndex(i + 1, j + 1, k);
-        const n3 = nodeIndex(i, j + 1, k);
-        const n4 = nodeIndex(i, j, k + 1);
-        const n5 = nodeIndex(i + 1, j, k + 1);
-        const n6 = nodeIndex(i + 1, j + 1, k + 1);
-        const n7 = nodeIndex(i, j + 1, k + 1);
-        const cells: [number, number, number, number][] = [
-          [n0, n1, n2, n6],
-          [n0, n2, n3, n6],
-          [n0, n3, n7, n6],
-          [n0, n7, n4, n6],
-          [n0, n4, n5, n6],
-          [n0, n5, n1, n6],
-        ];
-        for (const tet of cells) {
-          const p = tet.map((id) => gridPosition(id, i, j, k, startX, startY, startZ, h, gridX, gridY));
-          const vol = tetVolume(p[0], p[1], p[2], p[3]);
-          if (vol < 0) {
-            tets.push(tet[0], tet[2], tet[1], tet[3]);
-          } else {
-            tets.push(tet[0], tet[1], tet[2], tet[3]);
-          }
-        }
+        const o = hexCount * 8;
+        hexes[o] = nodeIndex(i, j, k);
+        hexes[o + 1] = nodeIndex(i + 1, j, k);
+        hexes[o + 2] = nodeIndex(i + 1, j + 1, k);
+        hexes[o + 3] = nodeIndex(i, j + 1, k);
+        hexes[o + 4] = nodeIndex(i, j, k + 1);
+        hexes[o + 5] = nodeIndex(i + 1, j, k + 1);
+        hexes[o + 6] = nodeIndex(i + 1, j + 1, k + 1);
+        hexes[o + 7] = nodeIndex(i, j + 1, k + 1);
+        hexCount++;
       }
     }
   }
-  if (tets.length === 0) throw new Error("No tetrahedra were generated.");
 
   // Compact node numbering.
   const remap = new Int32Array(gridNodeCount).fill(-1);
   const used: number[] = [];
-  for (let i = 0; i < tets.length; i++) {
-    const gid = tets[i];
+  for (let i = 0; i < hexes.length; i++) {
+    const gid = hexes[i];
     if (remap[gid] < 0) {
       remap[gid] = used.length;
       used.push(gid);
@@ -228,45 +225,40 @@ export function buildTetMesh(
     positions[n * 3 + 1] = startY + j * h;
     positions[n * 3 + 2] = startZ + k * h;
   }
-  const compactTets = new Uint32Array(tets.length);
-  for (let i = 0; i < tets.length; i++) compactTets[i] = remap[tets[i]];
+  const compactHexes = new Uint32Array(hexes.length);
+  for (let i = 0; i < hexes.length; i++) compactHexes[i] = remap[hexes[i]];
 
-  // Boundary faces (odd incidence).
+  // Boundary quads (odd incidence) split into outward-wound triangles.
   const faceMap = new Map<number, FaceRecord>();
   const N = used.length;
-  const faceKey = (a: number, b: number, c: number): number => {
-    const min = Math.min(a, b, c);
-    const max = Math.max(a, b, c);
-    const mid = a + b + c - min - max;
-    return (min * N + mid) * N + max;
+  const faceKey = (a: number, b: number, c: number, d: number): number => {
+    // Sort the four ids so the same face hashes identically from both cells.
+    let a0 = a, b0 = b, c0 = c, d0 = d;
+    if (a0 > b0) [a0, b0] = [b0, a0];
+    if (c0 > d0) [c0, d0] = [d0, c0];
+    if (a0 > c0) [a0, c0] = [c0, a0];
+    if (b0 > d0) [b0, d0] = [d0, b0];
+    if (b0 > c0) [b0, c0] = [c0, b0];
+    return ((a0 * N + b0) * N + c0) * N + d0;
   };
-  const elementCount = compactTets.length / 4;
-  const faceSets: [number, number, number, number][] = [
-    [0, 2, 1, 3],
-    [0, 1, 3, 2],
-    [0, 3, 2, 1],
-    [1, 2, 3, 0],
-  ];
+  const elementCount = compactHexes.length / 8;
   for (let e = 0; e < elementCount; e++) {
-    const o = e * 4;
-    for (const [la, lb, lc, opposite] of faceSets) {
-      const a = compactTets[o + la];
-      const b = compactTets[o + lb];
-      const c = compactTets[o + lc];
-      const key = faceKey(a, b, c);
+    const o = e * 8;
+    for (const face of HEX_FACES) {
+      const a = compactHexes[o + face[0]];
+      const b = compactHexes[o + face[1]];
+      const c = compactHexes[o + face[2]];
+      const d = compactHexes[o + face[3]];
+      const key = faceKey(a, b, c, d);
       const rec = faceMap.get(key);
-      if (rec) {
-        rec.count++;
-      } else {
-        faceMap.set(key, { tri: [a, b, c], count: 1, element: e });
-        void opposite;
-      }
+      if (rec) rec.count++;
+      else faceMap.set(key, { tri: [a, b, c, d], count: 1, element: e });
     }
   }
   const surface: number[] = [];
   for (const rec of faceMap.values()) {
     if (rec.count !== 1) continue;
-    const [a, b, c] = rec.tri;
+    const [a, b, c, d] = rec.tri;
     const ax = positions[a * 3], ay = positions[a * 3 + 1], az = positions[a * 3 + 2];
     const bx = positions[b * 3], by = positions[b * 3 + 1], bz = positions[b * 3 + 2];
     const cx = positions[c * 3], cy = positions[c * 3 + 1], cz = positions[c * 3 + 2];
@@ -274,28 +266,28 @@ export function buildTetMesh(
     const ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
     const nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
     // Outward check against the owning element's centroid.
-    const eo = rec.element * 4;
+    const eo = rec.element * 8;
     let ex = 0, ey = 0, ez = 0;
-    for (let k = 0; k < 4; k++) {
-      const n = compactTets[eo + k];
+    for (let k = 0; k < 8; k++) {
+      const n = compactHexes[eo + k];
       ex += positions[n * 3];
       ey += positions[n * 3 + 1];
       ez += positions[n * 3 + 2];
     }
-    ex /= 4;
-    ey /= 4;
-    ez /= 4;
+    ex /= 8;
+    ey /= 8;
+    ez /= 8;
     const mx = (ax + bx + cx) / 3 - ex;
     const my = (ay + by + cy) / 3 - ey;
     const mz = (az + bz + cz) / 3 - ez;
-    if (nx * mx + ny * my + nz * mz < 0) surface.push(a, c, b);
-    else surface.push(a, b, c);
+    if (nx * mx + ny * my + nz * mz < 0) surface.push(a, c, b, a, d, c);
+    else surface.push(a, b, c, a, c, d);
   }
 
   if (surface.length === 0) warnings.push("The mesher found no boundary triangles.");
   return {
     positions,
-    tets: compactTets,
+    hexes: compactHexes,
     surface: new Uint32Array(surface),
     h,
     nodeCount: used.length,
@@ -305,25 +297,26 @@ export function buildTetMesh(
   };
 }
 
-function gridPosition(
-  gid: number,
-  _i: number,
-  _j: number,
-  _k: number,
-  startX: number,
-  startY: number,
-  startZ: number,
-  h: number,
-  gridX: number,
-  gridY: number,
-): [number, number, number] {
-  const k = Math.floor(gid / (gridX * gridY));
-  const rem = gid - k * gridX * gridY;
-  const j = Math.floor(rem / gridX);
-  const i = rem - j * gridX;
-  return [startX + i * h, startY + j * h, startZ + k * h];
+export function hexVolume(coords: [number, number, number][]): number {
+  // Split into five tetrahedra around node 0 and sum absolute volumes.
+  const tets: [number, number, number, number][] = [
+    [0, 1, 2, 6],
+    [0, 2, 3, 6],
+    [0, 3, 7, 6],
+    [0, 7, 4, 6],
+    [0, 4, 5, 6],
+  ];
+  let total = 0;
+  for (const [a, b, c, d] of tets) {
+    const ax = coords[b][0] - coords[a][0], ay = coords[b][1] - coords[a][1], az = coords[b][2] - coords[a][2];
+    const bx = coords[c][0] - coords[a][0], by = coords[c][1] - coords[a][1], bz = coords[c][2] - coords[a][2];
+    const cx = coords[d][0] - coords[a][0], cy = coords[d][1] - coords[a][1], cz = coords[d][2] - coords[a][2];
+    total += Math.abs((ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6);
+  }
+  return total;
 }
 
+/** Kept for the tetrahedral unit test and older callers. */
 export function tetVolume(
   a: [number, number, number],
   b: [number, number, number],

@@ -50,6 +50,14 @@ export interface ExportResponse {
 export interface ReadyResponse {
   type: "ready";
   bootMs: number;
+  fromCache?: boolean;
+  wasmBytes?: number;
+}
+
+export interface BootProgressResponse {
+  type: "boot-progress";
+  phase: string;
+  percent: number;
 }
 
 export interface ErrorResponse {
@@ -58,4 +66,10 @@ export interface ErrorResponse {
   stack?: string;
 }
 
-export type KernelResponse = RebuildResponse | ImportResponse | ExportResponse | ReadyResponse | ErrorResponse;
+export type KernelResponse =
+  | RebuildResponse
+  | ImportResponse
+  | ExportResponse
+  | ReadyResponse
+  | BootProgressResponse
+  | ErrorResponse;

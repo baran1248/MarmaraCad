@@ -854,6 +854,13 @@ export class SketchEditor {
     if (!e) return;
     const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
     if (e.kind === "line") {
+      // Re-dimensioning an already dimensioned line edits the existing value
+      // instead of stacking a second, conflicting constraint on the same edge.
+      const existing = this.sketch.constraints.find((c) => c.type === "distance" && c.entity === entityId);
+      if (existing) {
+        this.callbacks.onRequestDimensionEdit(existing.id);
+        return;
+      }
       const a = pm.get(e.p1);
       const b = pm.get(e.p2);
       if (!a || !b) return;
@@ -869,6 +876,11 @@ export class SketchEditor {
       this.render();
       this.callbacks.onRequestDimensionEdit(id);
     } else {
+      const existing = this.sketch.constraints.find((c) => c.type === "radius" && c.entity === entityId);
+      if (existing) {
+        this.callbacks.onRequestDimensionEdit(existing.id);
+        return;
+      }
       const c = pm.get(e.center);
       if (!c) return;
       const r =

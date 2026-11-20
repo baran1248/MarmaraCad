@@ -3,7 +3,7 @@
 
 import type { Vec3 } from "../model/types";
 import { solveStatic, type FeaLoadSpec } from "./solver";
-import { buildTetMesh } from "./mesher";
+import { buildVoxelMesh } from "./mesher";
 
 interface MeshRequest {
   type: "mesh";
@@ -45,7 +45,7 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const req = event.data;
   try {
     if (req.type === "mesh") {
-      const mesh = buildTetMesh(req.positions, req.indices, req.meshSize);
+      const mesh = buildVoxelMesh(req.positions, req.indices, req.meshSize);
       scope.postMessage({
         type: "mesh-done",
         stats: { nodes: mesh.nodeCount, elements: mesh.elementCount, h: mesh.h, warnings: mesh.warnings },

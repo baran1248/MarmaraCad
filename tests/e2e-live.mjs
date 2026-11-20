@@ -30,7 +30,13 @@ await page.waitForFunction(
   null,
   { timeout: 300000 },
 );
-console.log("BOOT", JSON.stringify({ ms: Date.now() - started }));
+const bootMs = Date.now() - started;
+const bootInfo = await page.evaluate(() => ({
+  renderer: window.__marmaracad?.renderer?.(),
+  canvasRenderer: document.querySelector(".viewport-canvas")?.getAttribute("data-renderer"),
+  kernel: window.__marmaracad?.kernel?.(),
+}));
+console.log("BOOT", JSON.stringify({ ms: bootMs, ...bootInfo }));
 
 await page.click('[data-tree-action="sample"]');
 await page.waitForFunction(
@@ -136,6 +142,9 @@ console.log("ERRORS", errors.length ? JSON.stringify(errors, null, 2) : "none");
 const ok =
   sample.volume === 98507 &&
   bytes > 30000 &&
+  (bootInfo.renderer === "webgpu" || bootInfo.renderer === "webgl2") &&
+  bootInfo.canvasRenderer === bootInfo.renderer &&
+  Number(bootInfo.kernel?.bytes) > 10_000_000 &&
   Boolean(fea.converged) &&
   Number(fea.maxDeformation) > 0 &&
   Number(fea.maxStress) > 0 &&

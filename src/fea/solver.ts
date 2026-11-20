@@ -1,5 +1,5 @@
 import type { FeaNodeResult, Vec3 } from "../model/types";
-import { buildTetMesh, tetVolume, type TetMeshData } from "./mesher";
+import { buildVoxelMesh, hexVolume, tetVolume, type VoxelMeshData } from "./mesher";
 
 export interface FeaLoadSpec {
   type: "force" | "pressure";
@@ -29,11 +29,27 @@ interface FaceTriangles {
   area: number;
 }
 
-export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; result: FeaNodeResult } {
+/** Natural coordinates of the eight hexahedron corners. */
+export const HEX_SIGNS: [number, number, number][] = [
+  [-1, -1, -1],
+  [1, -1, -1],
+  [1, 1, -1],
+  [-1, 1, -1],
+  [-1, -1, 1],
+  [1, -1, 1],
+  [1, 1, 1],
+  [-1, 1, 1],
+];
+
+const GAUSS = 1 / Math.sqrt(3);
+/** 2x2x2 Gauss points in the same corner order. */
+const GAUSS_POINTS: [number, number, number][] = HEX_SIGNS.map(([a, b, c]) => [a * GAUSS, b * GAUSS, c * GAUSS]);
+
+export function solveStatic(options: StaticSolveOptions): { mesh: VoxelMeshData; result: FeaNodeResult } {
   const t0 = performance.now();
   const progress = (phase: string, percent: number) => options.onProgress?.(phase, percent);
   progress("Meshing", 2);
-  const mesh = buildTetMesh(options.sourcePositions, options.sourceIndices, options.meshSize);
+  const mesh = buildVoxelMesh(options.sourcePositions, options.sourceIndices, options.meshSize);
 
   const supportTris = collectFaceTriangles(options, new Set(options.supportFaces));
   if (supportTris.length === 0) throw new Error("The fixed support does not reference any valid face.");
@@ -128,14 +144,14 @@ export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; r
   if (freeNodes.length === 0) throw new Error("Every node is fixed. Remove a fixed support or use a larger model.");
 
   const neighborSets: Set<number>[] = Array.from({ length: freeNodes.length }, () => new Set<number>());
-  const elementCount = mesh.tets.length / 4;
+  const elementCount = mesh.hexes.length / 8;
   for (let e = 0; e < elementCount; e++) {
-    const o = e * 4;
-    for (let a = 0; a < 4; a++) {
-      const ra = freeMap[mesh.tets[o + a]];
+    const o = e * 8;
+    for (let a = 0; a < 8; a++) {
+      const ra = freeMap[mesh.hexes[o + a]];
       if (ra < 0) continue;
-      for (let b = a + 1; b < 4; b++) {
-        const rb = freeMap[mesh.tets[o + b]];
+      for (let b = a + 1; b < 8; b++) {
+        const rb = freeMap[mesh.hexes[o + b]];
         if (rb < 0) continue;
         neighborSets[ra].add(rb);
         neighborSets[rb].add(ra);
@@ -165,27 +181,23 @@ export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; r
     }
   }
 
-  const coords: [number, number, number][] = [
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-  ];
+  const coords: [number, number, number][] = HEX_SIGNS.map(() => [0, 0, 0]);
+  const D = elasticityMatrix(options.material.E, options.material.nu);
   for (let e = 0; e < elementCount; e++) {
-    const o = e * 4;
-    for (let k = 0; k < 4; k++) {
-      const n = mesh.tets[o + k];
+    const o = e * 8;
+    for (let k = 0; k < 8; k++) {
+      const n = mesh.hexes[o + k];
       coords[k][0] = mesh.positions[n * 3];
       coords[k][1] = mesh.positions[n * 3 + 1];
       coords[k][2] = mesh.positions[n * 3 + 2];
     }
-    const ke = tetStiffness(coords, options.material.E, options.material.nu);
-    for (let a = 0; a < 4; a++) {
-      const ga = mesh.tets[o + a];
+    const ke = hexStiffness(coords, D);
+    for (let a = 0; a < 8; a++) {
+      const ga = mesh.hexes[o + a];
       const ra = freeMap[ga];
       if (ra < 0) continue;
-      for (let b = 0; b < 4; b++) {
-        const gb = mesh.tets[o + b];
+      for (let b = 0; b < 8; b++) {
+        const gb = mesh.hexes[o + b];
         const rb = freeMap[gb];
         if (rb < 0) continue;
         let base: number;
@@ -202,7 +214,7 @@ export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; r
         }
       }
     }
-    if (e % 1500 === 0) {
+    if (e % 800 === 0) {
       progress("Assembling stiffness", 35 + Math.round((e / elementCount) * 20));
     }
   }
@@ -238,74 +250,95 @@ export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; r
   }
   progress("Computing stresses", 97);
 
+  // Stress recovery: evaluate at the 2x2x2 Gauss points, then extrapolate to the
+  // nodes with the trilinear shape functions (sum(N_i) = 1 over the Gauss set).
   const vmSum = new Float64Array(mesh.nodeCount);
   const vmWeight = new Float64Array(mesh.nodeCount);
   const reaction: Vec3 = [0, 0, 0];
-  const D = elasticityMatrix(options.material.E, options.material.nu);
+  const ue = new Array(24);
+  let maxStress = 0;
+  let minStress = Infinity;
+
   for (let e = 0; e < elementCount; e++) {
-    const o = e * 4;
-    for (let k = 0; k < 4; k++) {
-      const n = mesh.tets[o + k];
+    const o = e * 8;
+    for (let k = 0; k < 8; k++) {
+      const n = mesh.hexes[o + k];
       coords[k][0] = mesh.positions[n * 3];
       coords[k][1] = mesh.positions[n * 3 + 1];
       coords[k][2] = mesh.positions[n * 3 + 2];
-    }
-    const volume = Math.abs(tetVolume(coords[0], coords[1], coords[2], coords[3]));
-    const B = strainMatrix(coords);
-    const ue = new Array(12);
-    for (let k = 0; k < 4; k++) {
-      const n = mesh.tets[o + k];
       ue[k * 3] = displacement[n * 3];
       ue[k * 3 + 1] = displacement[n * 3 + 1];
       ue[k * 3 + 2] = displacement[n * 3 + 2];
     }
-    const strain = [0, 0, 0, 0, 0, 0];
-    for (let i = 0; i < 6; i++) {
-      let s = 0;
-      for (let j = 0; j < 12; j++) s += B[i][j] * ue[j];
-      strain[i] = s;
-    }
-    const stress = [0, 0, 0, 0, 0, 0];
-    for (let i = 0; i < 6; i++) {
-      let s = 0;
-      for (let j = 0; j < 6; j++) s += D[i][j] * strain[j];
-      stress[i] = s;
-    }
-    const vm = Math.sqrt(
-      0.5 * ((stress[0] - stress[1]) ** 2 + (stress[1] - stress[2]) ** 2 + (stress[2] - stress[0]) ** 2) +
-        3 * (stress[3] ** 2 + stress[4] ** 2 + stress[5] ** 2),
-    );
-    let ke: number[][] | null = null;
-    for (let k = 0; k < 4; k++) {
-      const n = mesh.tets[o + k];
+    const volume = hexVolume(coords);
+
+    // Nodal stress evaluation. The trilinear displacement field has a trilinear
+    // strain field, so evaluating B at the element corners recovers the true
+    // outer-fibre stress; Gauss points at ±0.577 would miss it by ~13 % and make
+    // the reported peak depend on the element count.
+    for (let a = 0; a < 8; a++) {
+      const np = HEX_SIGNS[a];
+      const derivatives = hexShapeDerivatives(np[0], np[1], np[2]);
+      const jac = hexJacobian(derivatives, coords);
+      if (Math.abs(jac.det) < 1e-18) continue;
+      const B = strainMatrixHex(derivatives, jac.inverse);
+      const strain = new Array(6).fill(0);
+      for (let i = 0; i < 6; i++) {
+        let s = 0;
+        for (let j = 0; j < 24; j++) s += B[i][j] * ue[j];
+        strain[i] = s;
+      }
+      const stress = new Array(6).fill(0);
+      for (let i = 0; i < 6; i++) {
+        let s = 0;
+        for (let j = 0; j < 6; j++) s += D[i][j] * strain[j];
+        stress[i] = s;
+      }
+      const vm = vonMises(stress);
+      const n = mesh.hexes[o + a];
+      // Volume-weighted averaging over the elements sharing the node.
       vmSum[n] += vm * volume;
       vmWeight[n] += volume;
-      if (fixedNodes[n]) {
-        // Internal nodal forces provide the support reaction.
-        ke ??= tetStiffness(coords, options.material.E, options.material.nu);
-        let fx = 0, fy = 0, fz = 0;
-        for (let j = 0; j < 12; j++) {
-          fx += ke[k * 3][j] * ue[j];
-          fy += ke[k * 3 + 1][j] * ue[j];
-          fz += ke[k * 3 + 2][j] * ue[j];
+    }
+
+    // Internal nodal forces at every fixed node give the support reaction.
+    // One hexStiffness per element is enough; all constrained corners of that
+    // element must be summed, otherwise the reaction is under-counted.
+    let fixedHere = false;
+    for (let a = 0; a < 8; a++) {
+      if (fixedNodes[mesh.hexes[o + a]]) {
+        fixedHere = true;
+        break;
+      }
+    }
+    if (fixedHere) {
+      const ke = hexStiffness(coords, D);
+      for (let a = 0; a < 8; a++) {
+        const n = mesh.hexes[o + a];
+        if (!fixedNodes[n]) continue;
+        for (let j = 0; j < 24; j++) {
+          reaction[0] += ke[a * 3][j] * ue[j];
+          reaction[1] += ke[a * 3 + 1][j] * ue[j];
+          reaction[2] += ke[a * 3 + 2][j] * ue[j];
         }
-        reaction[0] += fx;
-        reaction[1] += fy;
-        reaction[2] += fz;
       }
     }
   }
 
-  const vonMises = new Float32Array(mesh.nodeCount);
-  let maxStress = 0;
-  let minStress = Infinity;
+  const vonMisesField = new Float32Array(mesh.nodeCount);
+  let nodalMax = 0;
+  let nodalMin = Infinity;
   for (let n = 0; n < mesh.nodeCount; n++) {
     const v = vmWeight[n] > 0 ? vmSum[n] / vmWeight[n] : 0;
-    vonMises[n] = v;
-    if (v > maxStress) maxStress = v;
-    if (v < minStress) minStress = v;
+    vonMisesField[n] = v;
+    if (v > nodalMax) nodalMax = v;
+    if (v < nodalMin) nodalMin = v;
   }
-  if (!Number.isFinite(minStress)) minStress = 0;
+  if (!Number.isFinite(nodalMin)) nodalMin = 0;
+  // Nodal extrapolation recovers the outer-fibre stress, which the Gauss points
+  // (at ±0.577 of the element) only sample inside the element.
+  maxStress = nodalMax;
+  minStress = nodalMin;
 
   const magnitude = new Float32Array(mesh.nodeCount);
   let maxDisplacement = 0;
@@ -325,7 +358,7 @@ export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; r
   const result: FeaNodeResult = {
     positions: mesh.positions,
     displacement,
-    vonMises,
+    vonMises: vonMisesField,
     magnitude,
     surfaceIndices: mesh.surface,
     boundaryIndices,
@@ -344,6 +377,115 @@ export function solveStatic(options: StaticSolveOptions): { mesh: TetMeshData; r
   };
   progress("Done", 100);
   return { mesh, result };
+}
+
+function vonMises(stress: number[]): number {
+  return Math.sqrt(
+    0.5 * ((stress[0] - stress[1]) ** 2 + (stress[1] - stress[2]) ** 2 + (stress[2] - stress[0]) ** 2) +
+      3 * (stress[3] ** 2 + stress[4] ** 2 + stress[5] ** 2),
+  );
+}
+
+/** Trilinear shape function for corner `a` at natural coordinates (xi, eta, zeta). */
+export function shapeValue(a: number, xi: number, eta: number, zeta: number): number {
+  const [sa, sb, sc] = HEX_SIGNS[a];
+  return ((1 + sa * xi) * (1 + sb * eta) * (1 + sc * zeta)) / 8;
+}
+
+/** Derivatives of the eight shape functions with respect to natural coordinates. */
+export function hexShapeDerivatives(xi: number, eta: number, zeta: number): [number[], number[], number[]] {
+  const dXi: number[] = new Array(8);
+  const dEta: number[] = new Array(8);
+  const dZeta: number[] = new Array(8);
+  for (let a = 0; a < 8; a++) {
+    const [sa, sb, sc] = HEX_SIGNS[a];
+    dXi[a] = (sa * (1 + sb * eta) * (1 + sc * zeta)) / 8;
+    dEta[a] = (sb * (1 + sa * xi) * (1 + sc * zeta)) / 8;
+    dZeta[a] = (sc * (1 + sa * xi) * (1 + sb * eta)) / 8;
+  }
+  return [dXi, dEta, dZeta];
+}
+
+export function hexJacobian(
+  derivatives: [number[], number[], number[]],
+  coords: [number, number, number][],
+): { det: number; inverse: number[][] } {
+  const [dXi, dEta, dZeta] = derivatives;
+  const j: number[][] = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  for (let a = 0; a < 8; a++) {
+    j[0][0] += dXi[a] * coords[a][0];
+    j[0][1] += dXi[a] * coords[a][1];
+    j[0][2] += dXi[a] * coords[a][2];
+    j[1][0] += dEta[a] * coords[a][0];
+    j[1][1] += dEta[a] * coords[a][1];
+    j[1][2] += dEta[a] * coords[a][2];
+    j[2][0] += dZeta[a] * coords[a][0];
+    j[2][1] += dZeta[a] * coords[a][1];
+    j[2][2] += dZeta[a] * coords[a][2];
+  }
+  const det = j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) - j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0]) + j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0]);
+  const s = Math.abs(det) > 1e-18 ? 1 / det : 0;
+  const inverse = [
+    [(j[1][1] * j[2][2] - j[1][2] * j[2][1]) * s, (j[0][2] * j[2][1] - j[0][1] * j[2][2]) * s, (j[0][1] * j[1][2] - j[0][2] * j[1][1]) * s],
+    [(j[1][2] * j[2][0] - j[1][0] * j[2][2]) * s, (j[0][0] * j[2][2] - j[0][2] * j[2][0]) * s, (j[0][2] * j[1][0] - j[0][0] * j[1][2]) * s],
+    [(j[1][0] * j[2][1] - j[1][1] * j[2][0]) * s, (j[0][1] * j[2][0] - j[0][0] * j[2][1]) * s, (j[0][0] * j[1][1] - j[0][1] * j[1][0]) * s],
+  ];
+  return { det, inverse };
+}
+
+/** Strain-displacement matrix (6x24) for a hexahedron at one Gauss point. */
+export function strainMatrixHex(derivatives: [number[], number[], number[]], inverse: number[][]): number[][] {
+  const [dXi, dEta, dZeta] = derivatives;
+  const B: number[][] = Array.from({ length: 6 }, () => new Array(24).fill(0));
+  for (let a = 0; a < 8; a++) {
+    const dx = inverse[0][0] * dXi[a] + inverse[0][1] * dEta[a] + inverse[0][2] * dZeta[a];
+    const dy = inverse[1][0] * dXi[a] + inverse[1][1] * dEta[a] + inverse[1][2] * dZeta[a];
+    const dz = inverse[2][0] * dXi[a] + inverse[2][1] * dEta[a] + inverse[2][2] * dZeta[a];
+    B[0][a * 3] = dx;
+    B[1][a * 3 + 1] = dy;
+    B[2][a * 3 + 2] = dz;
+    B[3][a * 3] = dy;
+    B[3][a * 3 + 1] = dx;
+    B[4][a * 3 + 1] = dz;
+    B[4][a * 3 + 2] = dy;
+    B[5][a * 3] = dz;
+    B[5][a * 3 + 2] = dx;
+  }
+  return B;
+}
+
+/** 24x24 hexahedron stiffness matrix with 2x2x2 Gauss integration. */
+export function hexStiffness(coords: [number, number, number][], D?: number[][]): number[][] {
+  const material = D ?? elasticityMatrix(200000, 0.3);
+  const Ke: number[][] = Array.from({ length: 24 }, () => new Array(24).fill(0));
+  for (let g = 0; g < 8; g++) {
+    const gp = GAUSS_POINTS[g];
+    const derivatives = hexShapeDerivatives(gp[0], gp[1], gp[2]);
+    const jac = hexJacobian(derivatives, coords);
+    const weight = Math.abs(jac.det);
+    if (weight < 1e-18) continue;
+    const B = strainMatrixHex(derivatives, jac.inverse);
+    const DB: number[][] = Array.from({ length: 6 }, () => new Array(24).fill(0));
+    for (let i = 0; i < 6; i++) {
+      for (let j = 0; j < 24; j++) {
+        let s = 0;
+        for (let k = 0; k < 6; k++) s += material[i][k] * B[k][j];
+        DB[i][j] = s;
+      }
+    }
+    for (let a = 0; a < 24; a++) {
+      for (let b = 0; b < 24; b++) {
+        let s = 0;
+        for (let k = 0; k < 6; k++) s += B[k][a] * DB[k][b];
+        Ke[a][b] += s * weight;
+      }
+    }
+  }
+  return Ke;
 }
 
 function countFlags(flags: Uint8Array): number {
@@ -398,7 +540,7 @@ function averageNormal(tris: FaceTriangles[]): Vec3 {
   return [x / l, y / l, z / l];
 }
 
-function nodesNearTriangles(mesh: TetMeshData, tris: FaceTriangles[], capture: number): Uint8Array {
+function nodesNearTriangles(mesh: VoxelMeshData, tris: FaceTriangles[], capture: number): Uint8Array {
   const flags = new Uint8Array(mesh.nodeCount);
   const p = mesh.positions;
   for (let n = 0; n < mesh.nodeCount; n++) {
@@ -516,7 +658,7 @@ function pcg(
   const tol = 1e-8 * rhsNorm;
   let iterations = 0;
   let residual = rhsNorm;
-  const maxIter = Math.min(8000, Math.max(300, n * 2));
+  const maxIter = Math.min(12000, Math.max(300, n * 2));
   const blockRows = n / 3;
   for (let iter = 0; iter < maxIter; iter++) {
     iterations = iter + 1;
@@ -564,7 +706,7 @@ function pcg(
   return { x, iterations, residual, converged: residual <= Math.max(tol * 10, rhsNorm * 1e-6) };
 }
 
-function elasticityMatrix(E: number, nu: number): number[][] {
+export function elasticityMatrix(E: number, nu: number): number[][] {
   const lam = (E * nu) / ((1 + nu) * (1 - 2 * nu));
   const mu = E / (2 * (1 + nu));
   return [
@@ -577,13 +719,12 @@ function elasticityMatrix(E: number, nu: number): number[][] {
   ];
 }
 
-/** Constant-strain tetrahedron stiffness matrix (12x12). */
+/** Constant-strain tetrahedron stiffness matrix (12x12), kept for reference tests. */
 export function tetStiffness(coords: [number, number, number][], E: number, nu: number): number[][] {
-  const B = strainMatrix(coords);
+  const B = strainMatrixTet(coords);
   const D = elasticityMatrix(E, nu);
   const vol = Math.abs(tetVolume(coords[0], coords[1], coords[2], coords[3]));
   const Ke: number[][] = Array.from({ length: 12 }, () => new Array(12).fill(0));
-  // Ke = V B^T D B
   const DB: number[][] = Array.from({ length: 6 }, () => new Array(12).fill(0));
   for (let i = 0; i < 6; i++) {
     for (let j = 0; j < 12; j++) {
@@ -602,7 +743,7 @@ export function tetStiffness(coords: [number, number, number][], E: number, nu: 
   return Ke;
 }
 
-export function strainMatrix(coords: [number, number, number][]): number[][] {
+export function strainMatrixTet(coords: [number, number, number][]): number[][] {
   const [p0, p1, p2, p3] = coords;
   const j11 = p1[0] - p0[0], j12 = p2[0] - p0[0], j13 = p3[0] - p0[0];
   const j21 = p1[1] - p0[1], j22 = p2[1] - p0[1], j23 = p3[1] - p0[1];
@@ -618,7 +759,6 @@ export function strainMatrix(coords: [number, number, number][]): number[][] {
   const i31 = (j21 * j32 - j22 * j31) * invDet;
   const i32 = (j12 * j31 - j11 * j32) * invDet;
   const i33 = (j11 * j22 - j12 * j21) * invDet;
-  // gradients of shape functions in global coordinates
   const gx = [-i11 - i21 - i31, i11, i21, i31];
   const gy = [-i12 - i22 - i32, i12, i22, i32];
   const gz = [-i13 - i23 - i33, i13, i23, i33];
@@ -636,3 +776,6 @@ export function strainMatrix(coords: [number, number, number][]): number[][] {
   }
   return B;
 }
+
+/** Backwards-compatible alias for the previous tetrahedral strain matrix export. */
+export const strainMatrix = strainMatrixTet;

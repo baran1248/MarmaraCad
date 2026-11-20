@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { EdgeInfo, FaceInfo, MeshData, SketchPlane, Vec3 } from "../model/types";
 import { bodyGeometry, edgeLineGeometry, edgePolylineGeometry, faceGeometry } from "./geometry";
+import type { RendererBackend, RendererLike } from "./renderer";
 
 export type ViewName = "front" | "back" | "top" | "bottom" | "right" | "left" | "iso";
 export type DisplayStyle = "shaded-edges" | "shaded" | "wireframe";
@@ -75,7 +76,8 @@ function makeBodyMaterial(color: string): THREE.MeshStandardMaterial {
 
 export class Viewport {
   readonly container: HTMLElement;
-  readonly renderer: THREE.WebGLRenderer;
+  readonly renderer: RendererLike;
+  readonly backend: RendererBackend;
   readonly scene: THREE.Scene;
   readonly camera: THREE.PerspectiveCamera;
   readonly controls: OrbitControls;
@@ -115,9 +117,10 @@ export class Viewport {
   private disposed = false;
   private debugWire: THREE.Mesh | null = null;
 
-  constructor(container: HTMLElement) {
+  constructor(container: HTMLElement, renderer: RendererLike, backend: RendererBackend = "webgl2") {
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    this.renderer = renderer;
+    this.backend = backend;
     this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -203,12 +206,14 @@ export class Viewport {
       mesh.userData.planeLabel = d.label;
       this.planeGroup.add(mesh);
 
-      const border = new THREE.LineLoop(
+      // Line (not LineLoop): Three's WebGPU renderer does not implement LineLoop.
+      const border = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints([
           new THREE.Vector3(-size / 2, -size / 2, 0),
           new THREE.Vector3(size / 2, -size / 2, 0),
           new THREE.Vector3(size / 2, size / 2, 0),
           new THREE.Vector3(-size / 2, size / 2, 0),
+          new THREE.Vector3(-size / 2, -size / 2, 0),
         ]),
         new THREE.LineBasicMaterial({ color: d.color, transparent: true, opacity: 0.5 }),
       );

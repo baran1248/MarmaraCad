@@ -68,7 +68,7 @@ Live: https://baran1248.github.io/MarmaraCad/
 
 - [x] Ansys Mechanical-style analysis tree
 - [x] Engineering material library (Structural Steel, Aluminum 6061, Titanium Ti-6Al-4V, Copper, ABS, custom)
-- [x] Voxel-based conforming tetrahedral mesh generator (6 tets per cell)
+- [x] Voxel-based conforming hexahedral mesh generator (8-node bricks, 2×2×2 Gauss integration)
 - [x] Mesh size control + element/node counters
 - [x] Face selection for Fixed Support
 - [x] Face selection for Force and Pressure loads
@@ -82,12 +82,17 @@ Live: https://baran1248.github.io/MarmaraCad/
 
 ## Quality gates
 - [x] `npm run build` clean
-- [x] Unit tests (sketch solver, profile builder, FEA mesh/solver) — 8/8
+- [x] Unit tests (sketch solver, profile builder, hex element, FEA mesh/solver) — 12/12
+- [x] Playwright end-to-end: boot, WASM cache, WebGPU/WebGL2 fallback
+- [x] Playwright end-to-end: every sketch tool (line, rectangle, circle, 3-point arc, dimension,
+      equal/fix relations) → Extrude Boss / Extruded Cut, volumes checked analytically
+- [x] Playwright end-to-end: Revolve, Fillet and Chamfer with parametric FeatureManager edits
 - [x] Playwright end-to-end: sketch → extrude → STEP export/import round-trip
+- [x] Playwright end-to-end: STEP AP214 header + B-Rep entity validation, volume/face preservation
+- [x] Playwright end-to-end: Coincident + Concentric mates with independently recomputed residuals
 - [x] Playwright end-to-end: fillet, undo/redo, autosave restore
-- [x] Playwright end-to-end: mates
-- [x] Playwright end-to-end: analysis solve and result rendering
-- [x] Visual QA pass with screenshot review (6 states reviewed; 5 findings fixed)
+- [x] Playwright end-to-end: analysis solve, result rendering and analytical beam benchmark
+- [x] Visual QA pass with screenshot review
 - [x] Live GitHub Pages verification (desktop)
 - [x] README with architecture, usage, verification and license notes
 
@@ -101,9 +106,23 @@ Live: https://baran1248.github.io/MarmaraCad/
 - STEP export of the filleted bracket: 41,808 bytes; re-imported volume 98,507 mm³ (13 faces).
 - IGES export: 40 KB; STEP 37–41 KB; STL and OBJ downloads verified.
 - Assembly: 2 components, coincident mate solved (component B at 0, 0, −80).
-- FEA bracket: 4,854 nodes / 20,112 tets, PCG converged in 1,058 iterations,
-  max deformation 0.078 mm, max von Mises 35.7 MPa, safety factor 7.0.
-- Solver benchmark (40×10×10 bar, 756 nodes / 3,000 tets): 0.00227 mm, 23.09 MPa, 178 iterations.
+- FEA bracket: 4,854 nodes / 3,352 hexahedra (5.5 mm), PCG converged in 833 iterations,
+  max deformation 0.102 mm, max von Mises 61.4 MPa, safety factor 4.07.
+- Analytical beam benchmark (100×10×10 mm steel cantilever, 1000 N tip load, 1.25 mm mesh):
+  6,561 nodes / 5,120 hexahedra, 561 iterations, deflection 1.988 mm vs 2.000 mm (−0.6 %),
+  root stress 595.1 MPa vs 600 MPa (−0.8 %), reaction [0, 0, 1000] N exactly.
+  Halving the load halves both results, and vertex colours correlate > 0.9 with the stress field.
+- Solver benchmark (40×10×10 bar, hex mesh): 0.002 mm axial stretch, 10 MPa axial stress.
+- STEP AP214 audit: `FILE_SCHEMA AUTOMOTIVE_DESIGN { 1 0 10303 214 ... }`, one
+  `MANIFOLD_SOLID_BREP`, one `CLOSED_SHELL`, 7 `ADVANCED_FACE`, 1 `CYLINDRICAL_SURFACE`;
+  plate-with-hole round trip preserves 7,214.6 mm³ and 7 faces.
+- Assembly mate audit: Coincident residual 0.000 mm, Concentric axis cross 0 and radial 0.000 mm
+  after the component was first offset 40/25 mm and tilted 30°.
+- Kernel cache: first boot downloads 65.86 MB into the Cache API, second boot restores it in
+  ~0.9 s (vs ~1.8 s cold); WebGPU is selected when an adapter exists and `?renderer=webgl2`
+  produces the identical frame through the fallback path.
+- Edge picking now lists each topological edge once (a box reports 12, not 24), so fillet and
+  chamfer selections match what the user sees.
 - Undo/redo and IndexedDB autosave restore verified (4 features, 3 sketches after reload).
 - Kernel note: `opencascade.js@1.1.1` corrupts/fails MEMFS paths longer than 10 characters, so all
   worker exchange files use short names (`/o.step`, `/i.step`, `/r.step`, `/o.igs`, `/i.igs`, `/r.igs`).

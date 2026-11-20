@@ -290,7 +290,7 @@ export interface FeaNodeResult {
   displacement: Float32Array;
   vonMises: Float32Array;
   magnitude: Float32Array;
-  /** Triangles of the tetrahedral boundary, indexing into positions. */
+  /** Boundary triangles of the hexahedral mesh, indexing into positions. */
   surfaceIndices: Uint32Array;
   boundaryIndices: Uint32Array;
   elementCount: number;

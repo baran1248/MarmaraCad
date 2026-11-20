@@ -56,6 +56,8 @@ import {
 import { FeaClient } from "./fea/FeaClient";
 import type { FeaLoadSpec } from "./fea/solver";
 import { ResultView, type ResultDisplay, type ResultMode } from "./fea/ResultView";
+import { createBestRenderer, type RendererChoice } from "./viewport/renderer";
+import { clearKernelCache, kernelCacheSize } from "./kernel/wasmCache";
 
 type Selection = { kind: string; id: string };
 
@@ -132,6 +134,7 @@ export class App {
   private editor: SketchEditor;
   private fea = new FeaClient();
   private resultView: ResultView;
+  private graphics: RendererChoice;
 
   private meshes = new Map<string, MeshData>();
   private undos: ProjectDocument[] = [];
@@ -153,10 +156,11 @@ export class App {
   private autosaveTimer = 0;
   private bootMs = 0;
 
-  constructor(root: HTMLElement) {
+  constructor(root: HTMLElement, graphics: RendererChoice) {
     this.doc = createDocument();
+    this.graphics = graphics;
     this.shell = new Shell(root);
-    this.viewport = new Viewport(this.shell.viewHost);
+    this.viewport = new Viewport(this.shell.viewHost, graphics.renderer, graphics.backend);
     this.resultView = new ResultView(this.viewport);
 
     this.editor = new SketchEditor(this.viewport, {
@@ -194,16 +198,25 @@ export class App {
     const boot = document.getElementById("boot");
     const status = document.getElementById("boot-status");
     const pct = document.getElementById("boot-pct");
+    const bar = document.querySelector<HTMLElement>(".boot-bar");
     const setBoot = (text: string, percent?: number) => {
       if (status) status.textContent = text;
       if (pct && percent !== undefined) pct.textContent = `${Math.round(percent)}%`;
+      if (bar && percent !== undefined) {
+        bar.classList.add("determinate");
+        bar.style.setProperty("--boot-pct", `${Math.max(2, Math.min(100, percent))}%`);
+      }
     };
 
     try {
       setBoot("Loading the OCCT WASM geometry kernel…", 12);
-      const bootMs = await cadClient().ready();
+      const bootMs = await cadClient().ready((phase, percent) => {
+        // Map kernel progress into the 6–60 % range of the boot bar.
+        setBoot(phase, Math.max(6, Math.min(60, percent)));
+      });
       this.bootMs = bootMs;
-      setBoot(`Kernel ready in ${(bootMs / 1000).toFixed(1)} s — restoring workspace…`, 62);
+      const cached = cadClient().kernelFromCache;
+      setBoot(`Kernel ${cached ? "restored from cache" : "ready"} in ${(bootMs / 1000).toFixed(1)} s — restoring workspace…`, 62);
 
       const saved = await loadAutosave();
       if (saved && saved.doc.parts.length > 0) {
@@ -235,6 +248,12 @@ export class App {
         doc: () => this.doc,
         meshes: () => this.meshes,
         app: this,
+        renderer: () => this.graphics.backend,
+        kernel: () => ({
+          bootMs: this.bootMs,
+          fromCache: cadClient().kernelFromCache,
+          bytes: cadClient().kernelBytes,
+        }),
       };
     } catch (error) {
       setBoot(`Startup failed: ${messageOf(error)}`, 100);
@@ -2300,7 +2319,7 @@ export class App {
           </div>
           ${resultStats}`,
         ) +
-        `<div class="hint">Units: mm, N, MPa. The solver uses 4-node tetrahedra with a Jacobi-preconditioned conjugate-gradient iteration.</div>`,
+        `<div class="hint">Units: mm, N, MPa. The solver uses 8-node hexahedra with a Jacobi-preconditioned conjugate-gradient iteration.</div>`,
       onMount: (root) => {
         this.refreshPickLists(study);
         this.bindPickListRemoval(study);
@@ -2602,7 +2621,7 @@ export class App {
       return;
     }
     this.shell.setKernel("FEA meshing", "busy");
-    this.shell.setStatus("Generating tetrahedral mesh…");
+    this.shell.setStatus("Generating hexahedral mesh…");
     try {
       const stats = await this.fea.mesh(
         { positions: mesh.positions, indices: mesh.indices, meshSize: study.meshSize },
@@ -3410,8 +3429,9 @@ export class App {
       <span>Features</span><span>${features}</span>
       <span>Active bodies</span><span>${this.viewport.bodyCount}</span>
       <span>Triangles (active)</span><span>${triangles.toLocaleString()}</span>
-      <span>Kernel</span><span>OCCT WASM · boot ${(this.bootMs / 1000).toFixed(2)} s</span>
-      <span>Renderer</span><span>WebGL 2 · Three.js</span>
+      <span>Kernel</span><span>OCCT WASM · boot ${(this.bootMs / 1000).toFixed(2)} s${cadClient().kernelFromCache ? " · cached" : ""}</span>
+      <span>Kernel cache</span><span>${cadClient().kernelBytes > 0 ? `${(cadClient().kernelBytes / 1048576).toFixed(1)} MB in Cache API` : "Cache API unavailable"}</span>
+      <span>Renderer</span><span>${this.graphics.label} · Three.js</span>
       <span>Autosave</span><span>IndexedDB</span>
     </div>`;
     void openModal({ title: "Model Info", icon: "info", body, width: 470, actions: [{ label: "Close", value: "close", kind: "primary" }] });
@@ -3457,7 +3477,7 @@ export class App {
       <div class="study-stats" style="text-align:left">
         <span>Geometry kernel</span><span>Open CASCADE (OCCT) compiled to WebAssembly</span>
         <span>Rendering</span><span>Three.js WebGL 2</span>
-        <span>FEA solver</span><span>4-node tetrahedra · Jacobi-PCG</span>
+        <span>FEA solver</span><span>8-node hexahedra · Jacobi-PCG</span>
         <span>License</span><span>MIT (application code)</span>
         <span>OCCT license</span><span>LGPL-2.1</span>
       </div>
@@ -3513,6 +3533,20 @@ export class App {
     toast("Autosave and recent documents cleared.", "success");
   }
 
+  private async clearKernelCacheAction(): Promise<void> {
+    const bytes = await kernelCacheSize();
+    const ok = await confirmDialog(
+      "Clear Cached Kernel",
+      bytes > 0
+        ? `Remove the ${(bytes / 1048576).toFixed(1)} MB cached geometry kernel? The next reload downloads it again.`
+        : "The geometry kernel is not cached in this browser yet.",
+      "Clear",
+    );
+    if (!ok) return;
+    await clearKernelCache();
+    toast("Cached kernel removed. The next reload re-downloads OCCT.", "success");
+  }
+
   // ------------------------------------------------------------- dispatcher
 
   private async runAction(action: string, kind?: string, id?: string): Promise<void> {
@@ -3557,6 +3591,9 @@ export class App {
         break;
       case "clear-autosave":
         await this.clearAutosave();
+        break;
+      case "clear-kernel-cache":
+        await this.clearKernelCacheAction();
         break;
       case "undo":
         this.undo();
@@ -3835,8 +3872,34 @@ export class App {
 function startApplication(): void {
   const root = document.getElementById("app");
   if (!root) throw new Error("Missing #app mount point.");
-  const app = new App(root);
-  void app.start();
+  const bootStatus = document.getElementById("boot-status");
+  void (async () => {
+    try {
+      if (bootStatus) bootStatus.textContent = "Detecting the graphics backend…";
+      const graphics = await createBestRenderer();
+      const app = new App(root, graphics);
+      void app.start();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (bootStatus) bootStatus.textContent = message;
+      const bar = document.querySelector<HTMLElement>(".boot-bar");
+      if (bar) bar.style.display = "none";
+      const pct = document.getElementById("boot-pct");
+      if (pct) pct.textContent = "";
+      const note = document.createElement("div");
+      note.className = "boot-error";
+      note.textContent = "MarmaraCad needs WebGL2 or WebGPU. Enable hardware acceleration and reload.";
+      note.style.cssText = "margin-top:14px;font-size:12px;color:#b23b3b;max-width:420px;text-align:center;line-height:1.5;";
+      document.querySelector(".boot")?.appendChild(note);
+      const btn = document.createElement("button");
+      btn.className = "btn primary";
+      btn.textContent = "Reload";
+      btn.style.marginTop = "14px";
+      btn.addEventListener("click", () => window.location.reload());
+      document.querySelector(".boot")?.appendChild(btn);
+      console.error("MarmaraCad graphics startup failed:", error);
+    }
+  })();
 }
 
 if (document.readyState === "loading") {
