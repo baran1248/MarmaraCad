@@ -3,10 +3,32 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MarmaraCad — Kernel Probe</title>
+    <meta name="description" content="MarmaraCad — browser-native parametric CAD, assembly and linear-static FEA powered by OCCT WebAssembly." />
+    <meta name="theme-color" content="#182838" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%231668b3'/%3E%3Ctext x='32' y='45' font-family='Segoe UI,Arial' font-size='38' font-weight='700' text-anchor='middle' fill='white'%3EM%3C/text%3E%3C/svg%3E"
+    />
+    <title>MarmaraCad — Browser CAD, Assembly &amp; FEA</title>
   </head>
   <body>
-    <pre id="out">booting…</pre>
-    <script type="module" src="/src/probe.ts"></script>
+    <div id="boot" class="boot">
+      <div class="boot-logo"><div class="boot-mark">M</div></div>
+      <div class="boot-title">Marmara<span>Cad</span></div>
+      <div class="boot-sub">Browser-native CAD · Assembly · FEA</div>
+      <div class="boot-progress">
+        <div class="boot-bar"></div>
+        <div class="boot-status"><span id="boot-status">Starting the geometry kernel…</span><span class="pct" id="boot-pct">0%</span></div>
+      </div>
+      <div class="boot-features">
+        <div>OCCT WASM</div>
+        <div>STEP / IGES</div>
+        <div>Static Structural FEA</div>
+        <div>No data leaves your device</div>
+      </div>
+    </div>
+    <div id="app"></div>
+    <noscript>MarmaraCad needs JavaScript and WebGL 2. Please enable JavaScript in your browser.</noscript>
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
