@@ -5,6 +5,7 @@ import { join } from "node:path";
 const tmpDir = "C:\\Users\\MBB\\AppData\\Local\\Temp\\opencode\\marmaracad-e2e";
 await mkdir(tmpDir, { recursive: true });
 const stepPath = join(tmpDir, "roundtrip.step");
+const BASE = process.env.MARMARACAD_URL || "http://localhost:5173/MarmaraCad/";
 
 const browser = await chromium.launch({
   executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -20,7 +21,7 @@ page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
 page.on("requestfailed", (r) => errors.push(`requestfailed: ${r.url().slice(-100)} ${r.failure()?.errorText}`));
 
 const boot = async () => {
-  await page.goto("http://localhost:5173/MarmaraCad/", { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForFunction(
     () => {
       const el = document.getElementById("boot");

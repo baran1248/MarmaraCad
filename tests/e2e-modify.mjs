@@ -14,7 +14,8 @@ page.on("console", (m) => {
 page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
 page.on("requestfailed", (r) => errors.push(`requestfailed: ${r.url().slice(-100)} ${r.failure()?.errorText}`));
 
-await page.goto("http://localhost:5173/MarmaraCad/", { waitUntil: "domcontentloaded", timeout: 60000 });
+const BASE = process.env.MARMARACAD_URL || "http://localhost:5173/MarmaraCad/";
+await page.goto(BASE, { waitUntil: "domcontentloaded", timeout: 60000 });
 await page.waitForFunction(() => {
   const boot = document.getElementById("boot");
   return !boot || boot.classList.contains("hidden");
