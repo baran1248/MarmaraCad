@@ -32,6 +32,10 @@ npm run test:e2e # Playwright end-to-end suite (start `npm run dev` first; uses 
 npm run test:live # smoke test against the published GitHub Pages build
 ```
 
+CI runs `npm test` and `npm run build` on every push to `main`, then publishes `dist` to GitHub
+Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow` scope
+(`gh auth refresh -h github.com -s workflow`).
+
 The OpenCascade WASM binary is served as a static asset from the build output. On first load
 the kernel is initialised inside a worker; a loading screen reports progress.
 
