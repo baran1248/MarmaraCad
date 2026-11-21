@@ -312,6 +312,10 @@ Live: https://baran1248.github.io/MarmaraCad/
   `os.tmpdir()`, and `vite.config.ts` ignores `tests/.tmp-*`, `tests/*.pdf`, `tests/*.step` and
   `tests/*.mcad.json`. Verified by re-running the suite against a live dev server: PDF 92,963 bytes,
   `RESULT PASS`, dev server still answering 200 with no watcher errors.
+- Final live check after deploy run 44892175060 (commit `ec80e7b`): `e2e-live` on
+  https://baran1248.github.io/MarmaraCad/ — boot 4,994 ms, WebGPU, sample 98,507 mm³ / 13 faces /
+  30 edges, STEP 37,607 bytes, FEA 4,854 nodes / 3,352 hexahedra, max 0.102 mm / 61.35 MPa,
+  `ERRORS none`; `e2e-hud` on the same URL reports 0 collisions at 1440 and 1180 px.
 - Technical drawing: the front view spans y 215.53…278.47; the width dimension sits at y 302.47
   (gap 23.997 px, slot limit 368) and the height dimension at x 564 (28 px right of the outline),
   so neither dimension crosses the part.
