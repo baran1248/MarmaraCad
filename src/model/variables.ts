@@ -109,8 +109,14 @@ export function applyVariables(doc: ProjectDocument): void {
 }
 
 export function variableValues(doc: ProjectDocument): Record<string, number> {
+  // Re-evaluate in declaration order: a stored value can be stale after the
+  // expression was edited and the panel closed without pressing Apply.
   const values: Record<string, number> = {};
-  for (const v of doc.variables ?? []) values[v.name] = v.value;
+  for (const v of doc.variables ?? []) {
+    const value = evaluateExpression(v.expression, values);
+    v.value = value;
+    values[v.name] = value;
+  }
   return values;
 }
 
@@ -118,7 +124,13 @@ export function makeVariable(name: string, expression: string): Variable {
   return { id: uid("var"), name, expression, value: 0 };
 }
 
-/** A short, deterministic set used by the demo templates. */
+/** A short, deterministic set used by the demo templates. Values are evaluated
+ *  in declaration order so the panel never shows `L = 0` for a new document. */
 export function standardVariables(entries: [string, string][]): Variable[] {
-  return entries.map(([name, expression]) => makeVariable(name, expression));
+  const values: Record<string, number> = {};
+  return entries.map(([name, expression]) => {
+    const value = evaluateExpression(expression, values);
+    values[name] = value;
+    return { ...makeVariable(name, expression), value };
+  });
 }

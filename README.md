@@ -45,7 +45,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 19 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 25 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -56,7 +56,8 @@ Any end-to-end suite can target a deployed build instead of the dev server:
 MARMARACAD_URL=https://baran1248.github.io/MarmaraCad/ npm run test:e2e
 ```
 
-The phase-2 suites cover Ctrl+click multi-selection into a bulk fillet, dynamic input
+The phase-2 suites cover Ctrl+click multi-selection into a bulk fillet/chamfer and into Mate,
+Fixed Support and a multi-face Force, right-click Select Loop/Tangency, dynamic input
 (`100`, `Tab`, `0`, `Enter`), midpoint/endpoint/origin snaps and alignment guides, window vs
 crossing selection, construction/trim/offset/convert plus sketch definition colours, the Box + Lid
 template (shell volume, placement, zero interference, mass), technical drawing + PDF, Section View,

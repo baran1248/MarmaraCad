@@ -133,10 +133,26 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] Playwright end-to-end: Coincident + Concentric mates with independently recomputed residuals
 - [x] Playwright end-to-end: fillet, undo/redo, autosave restore
 - [x] Playwright end-to-end: analysis solve, result rendering and analytical beam benchmark
-- [x] Playwright end-to-end: Ctrl+click multi-selection → bulk fillet, Measure, window/crossing box
-      selection, pick filters (`e2e-multiselect.mjs`)
+- [x] Playwright end-to-end: Ctrl+click multi-selection → bulk fillet/chamfer, Measure, window/crossing
+      box selection, pick filters, right-click Select Loop/Tangency (`e2e-multiselect.mjs`)
+- [x] Playwright end-to-end: Ctrl+click faces seed the Mate panel (one per component) and become
+      Fixed Supports / one shared Force (`e2e-mates.mjs`, `e2e-fea-multiselect.mjs`)
+- [x] Playwright end-to-end: Normal To (`N` / `Ctrl+8`), `F` zoom fit, right-click Hide/Show with
+      undo, right-click Sketch on Face, and Esc closing a PropertyManager / empty sketch
+      (`e2e-shortcuts.mjs`)
+- [x] Playwright end-to-end: Linear Pattern 3 × 50 mm (8,000 → 24,000 mm³) and Mirror across the
+      Right Plane (4,000 → 8,000 mm³, bbox −30…30), both deletable (`e2e-body-features.mjs`)
+- [x] Playwright end-to-end: parametric variables `L = 100`, `W = L / 2`, a dimension bound to `L`
+      re-solves the sketch and the extrude (20,000 → 32,000 mm³) (`e2e-variables.mjs`)
+- [x] Playwright end-to-end: Ansys-style strip — Geometry/Material/Mesh/Loads/Results pills with
+      `Input required` → `Current` → `Stale · re-solve`, MMGS · NMM label (`e2e-analysis-strip.mjs`)
+- [x] Playwright end-to-end: Cantilever Beam (28,800 mm³ + study), L-Bracket (22,080 mm³) and Blank
+      Part templates (`e2e-templates.mjs`)
+- [x] Playwright end-to-end: interference detection both ways — clear when the lid rests on the box,
+      and ≈1,152 mm³ when pushed 5 mm inside (`e2e-template-boxlid.mjs`)
 - [x] Playwright end-to-end: dynamic input `100` + `Tab` + `0` + `Enter` → exact 100 mm line with
-      driving dimensions; typed rectangle 40 × 25 and R12 circle (`e2e-dynamic-input.mjs`)
+      driving dimensions; typed rectangle 40 × 25, Ø24 circle (R12) and a typed R25 3-point arc
+      (`e2e-dynamic-input.mjs`)
 - [x] Playwright end-to-end: For Construction, Trim between intersections, Offset Entities and
       Convert Entities, plus the under/full/over-defined colours and status text
       (`e2e-sketch-utils.mjs`)
@@ -158,9 +174,30 @@ Live: https://baran1248.github.io/MarmaraCad/
 - Phase-2 verification (local dev server, headless Chrome, all measured from the live document):
   - Ctrl+click builds a 3-edge selection that Fillet consumes (`3 EDGE(S)`), volume 19,935.62 mm³
     against the analytical three-R2-corner value; Ctrl+click on a selected edge removes it and adds
-    it back (3 → 2 → 3); Measure lists the same three edges.
+    it back (3 → 2 → 3); Measure lists the same three edges. The same selection drives Chamfer
+    (`2 EDGE(S)`, 19,900 mm³ = 20,000 − 2 × 2²/2 × 25). Right-click → Select Loop selects the four
+    edges bounding the face under the cursor; Select Tangency stops at the sharp corners.
+  - Mate preselection: Ctrl+click one face on each component, then Mate → the panel already lists
+    both picks (`2` rows) and the mate solves; the preselection is consumed so the next command
+    starts empty. Ctrl+click faces then Fixed Support adds every face in the set, and Force applies
+    one shared magnitude to all queued faces (`2` loads at 250 N → solved, 0.66 MPa).
   - Dynamic input: `100` + `Tab` + `0` + `Enter` produces a 100.000 mm / 0.000° line with
     `distance` and `angle` constraints; typed rectangle 40 × 25 and Ø24 circle (R12) match exactly.
+  - Shortcuts: `N` and `Ctrl+8` put the camera on the face normal (direction dot 1.000), `F` frames
+    all 8 bbox corners, right-click Hide/Show toggles the part and Ctrl+Z restores it, Sketch on Face
+    opens a sketch whose plane carries the picked face index, and Esc closes a PropertyManager.
+    Mouse wheel closes from 217.4 to 82.6 mm while the world point under the cursor drifts 2 px.
+  - Body features: 40 × 20 × 10 box (8,000 mm³) → Linear Pattern 3 × 50 mm = 24,000 mm³, bbox
+    0…140 mm; a 4,000 mm³ box at x = 10…30 mirrored about the Right Plane = 8,000 mm³, bbox
+    −30…30 mm; deleting the Mirror feature returns to 4,000 mm³.
+  - Variables: `L = 100`, `W = L / 2` → 50; editing `L` to 160 gives 80 before Apply; a rectangle
+    width dimension typed as `L` solves to 100 mm, and changing `L` to 160 re-solves the sketch and
+    rebuilds the extrude from 19,999.9 mm³ to 31,999.9 mm³ (bbox width 160 mm).
+  - Analysis strip (FeatureManager, Analysis mode): Geometry/Material/Mesh/Loads/Results with
+    `MMGS / NMM · mm, N, MPa`; a fresh study on a part without material shows `Input required`
+    (Material) and `Solve required` (Results); after material + BCs + mesh the Mesh and Loads pills
+    read `Current`; after the solve Results reads `Current`; editing the extrude depth (20 → 25 mm)
+    flips Mesh and Results to `Stale` / `Stale · re-solve` while Geometry stays `Current`.
   - Snaps: `△ Midpoint`, `□ Endpoint`, `⊕ Origin`; two dashed alignment guides while tracking; a
     line started on a snapped midpoint shares that point and infers `vertical` + `perpendicular`.
   - Sketch utilities: construction toggle flips one entity only (blue `Under defined · 2 DOF` →
@@ -203,6 +240,13 @@ Live: https://baran1248.github.io/MarmaraCad/
   plate-with-hole round trip preserves 7,214.6 mm³ and 7 faces.
 - Assembly mate audit: Coincident residual 0.000 mm, Concentric axis cross 0 and radial 0.000 mm
   after the component was first offset 40/25 mm and tilted 30°.
+- Interference detector fix: `transformMeshData` used to return a zeroed bbox, so every component
+  pair failed the AABB pre-check and the dialog always said "No interference detected". It now
+  recomputes the bbox from the transformed vertices; the sampling step is capped by the shortest
+  extent too, so 2 mm shell walls are visible. The Box + Lid template pushed 5 mm inside reports
+  ≈1,152 mm³ (2·2·40·3 side walls + 2·56·2·3 end walls = 1,152 mm³), and the resting lid stays clear.
+- Template audit: Cantilever Beam 120 × 20 × 12 mm = 28,800 mm³ with AISI 1020 and a static study,
+  L-Bracket (60·8 + 8·32) · 30 = 22,080 mm³, Blank Part with no material and no variables.
 - Kernel cache: first boot downloads 65.86 MB into the Cache API, second boot restores it in
   ~0.9 s (vs ~1.8 s cold); WebGPU is selected when an adapter exists and `?renderer=webgl2`
   produces the identical frame through the fallback path.

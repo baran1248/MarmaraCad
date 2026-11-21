@@ -404,7 +404,15 @@ export class App {
         this.shell.hideShortcutBar();
         this.shell.hideViewSelector();
         if (this.editor.isActive) {
-          if (!this.editor.cancel()) this.editor.setTool("select");
+          if (this.editor.cancel()) return;
+          // Nothing to cancel: Esc backs out of an empty sketch, but never
+          // discards a sketch that already has geometry.
+          const sketch = this.editor.sketch;
+          if (sketch && sketch.entities.length === 0 && sketch.points.length === 0) {
+            this.cancelSketch();
+            return;
+          }
+          this.editor.setTool("select");
           return;
         }
         if (this.command) this.cancelCommand();
@@ -1919,7 +1927,16 @@ export class App {
         const lo: Vec3 = [Math.max(minA[0], minB[0]), Math.max(minA[1], minB[1]), Math.max(minA[2], minB[2])];
         const hi: Vec3 = [Math.min(maxA[0], maxB[0]), Math.min(maxA[1], maxB[1]), Math.min(maxA[2], maxB[2])];
         if (hi[0] <= lo[0] || hi[1] <= lo[1] || hi[2] <= lo[2]) continue;
-        const step = Math.max(0.6, Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 14);
+        // Sampling step: fine enough to see thin walls and small bosses, but
+        // capped so a large assembly pair stays within a bounded sample count.
+        // (A step keyed only to the longest extent missed 2 mm shell walls.)
+        const extents: Vec3 = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+        const volume = extents[0] * extents[1] * extents[2];
+        const step = Math.max(
+          0.4,
+          Math.min(1.5, Math.min(extents[0], extents[1], extents[2]) / 3),
+          Math.cbrt(volume / 120000),
+        );
         let inside = 0;
         for (let x = lo[0] + step / 2; x < hi[0]; x += step) {
           for (let y = lo[1] + step / 2; y < hi[1]; y += step) {
@@ -3397,6 +3414,9 @@ export class App {
         picks.push(face);
         if (picks.length === 2) break;
       }
+      // The preselection is consumed here; the panel owns the picks from now on.
+      this.selFaces = [];
+      this.selectedFace = null;
     }
     if (existing) {
       const a = this.doc.components.find((c) => c.id === existing.a.componentId);
@@ -3820,8 +3840,12 @@ export class App {
     this.command = { kind: "support-pick", onFace: addSupport };
     this.viewport.setPickFilter("face");
     this.viewport.setSelectedFaces([]);
-    // A Ctrl+click face selection made before the command becomes the support set.
-    for (const pick of this.selFaces.filter((f) => f.partId === study.partId)) addSupport(pick);
+    // A Ctrl+click face selection made before the command becomes the support set,
+    // and is consumed so the next command starts from an empty selection.
+    const preselected = this.selFaces.filter((f) => f.partId === study.partId);
+    this.selFaces = [];
+    this.selectedFace = null;
+    for (const pick of preselected) addSupport(pick);
     this.shell.setHint("Click faces to add fixed supports. Press Esc or Done when finished.");
     this.showPanel({
       icon: "anchor",
@@ -3848,11 +3872,27 @@ export class App {
     const study = this.activeStudy();
     if (!study) return;
     if (this.command) this.cancelCommand();
+    const addFaces = (faces: FacePick[]) => {
+      const valid = faces.filter((f) => f.partId === study.partId);
+      if (valid.length) void this.openForceDialog(study, valid);
+    };
     this.command = {
       kind: "force-pick",
-      onFace: (pick) => {
+      onFace: (pick, mods) => {
         if (pick.partId !== study.partId) {
           toast("Pick a face on the study part.", "warn");
+          return;
+        }
+        if (mods?.additive) {
+          // Ctrl+click collects faces, then the Apply Force button loads them all.
+          const exists = this.selFaces.some((f) => f.faceIndex === pick.faceIndex && f.partId === pick.partId);
+          this.selFaces = exists
+            ? this.selFaces.filter((f) => !(f.faceIndex === pick.faceIndex && f.partId === pick.partId))
+            : [...this.selFaces, pick];
+          this.viewport.setSelectedFaces(this.selFaces.map((f) => ({ componentId: f.componentId, faceIndex: f.faceIndex })));
+          const button = this.panelRoot?.querySelector<HTMLButtonElement>('[data-force-apply="pending"]');
+          if (button) button.disabled = this.selFaces.length === 0;
+          this.shell.setStatus(`${this.selFaces.length} face(s) queued for the force`);
           return;
         }
         void this.openForceDialog(study, pick);
@@ -3860,7 +3900,12 @@ export class App {
     };
     this.viewport.setPickFilter("face");
     this.viewport.setSelectedFaces([]);
-    this.shell.setHint("Click a face to apply a force. Press Esc or Done when finished.");
+    const preselected = this.selFaces.filter((f) => f.partId === study.partId);
+    this.shell.setHint(
+      preselected.length
+        ? `${preselected.length} face(s) selected — click Apply Force, or Ctrl+click to change the set.`
+        : "Click a face to apply a force, or Ctrl+click several faces and press Apply Force. Esc when finished.",
+    );
     this.showPanel({
       icon: "arrow-down-to-line",
       title: "Force",
@@ -3871,12 +3916,23 @@ export class App {
         pmSection(
           "Applied Loads",
           "arrow-down-to-line",
-          `<div class="selection-list" id="pm-load-list"></div>
-          <div class="hint" style="margin-top:6px">A force is distributed evenly over the nodes of the selected face.</div>`,
+          `<div class="inline-options"><button class="opt-btn" data-force-apply="pending" ${preselected.length ? "" : "disabled"}>${icon("check")} Apply Force</button></div>
+          <div class="selection-list" id="pm-load-list" style="margin-top:8px"></div>
+          <div class="hint" style="margin-top:6px">A force is distributed evenly over the nodes of every selected face.</div>`,
         ),
       onMount: () => {
         this.refreshPickLists(study);
         this.bindPickListRemoval(study);
+        this.panelRoot?.querySelector<HTMLElement>("[data-force-apply]")?.addEventListener("click", () => {
+          const faces = this.selFaces.slice();
+          if (faces.length === 0) {
+            toast("Ctrl+click one or more faces first.", "info");
+            return;
+          }
+          this.selFaces = [];
+          this.viewport.setSelectedFaces([]);
+          addFaces(faces);
+        });
       },
       onOk: () => this.finishCommand(),
     });
@@ -3920,7 +3976,9 @@ export class App {
     });
   }
 
-  private async openForceDialog(study: AnalysisStudy, pick: FacePick): Promise<void> {
+  private async openForceDialog(study: AnalysisStudy, pick: FacePick | FacePick[]): Promise<void> {
+    const picks = Array.isArray(pick) ? pick : [pick];
+    const first = picks[0];
     const body = document.createElement("div");
     body.innerHTML = `
       <div class="field"><label>Magnitude</label><div class="input-wrap"><input id="force-mag" type="number" step="10" value="1000" min="0.001" /><span class="unit">N</span></div></div>
@@ -3931,12 +3989,12 @@ export class App {
         <option value="zdown">Global −Z</option>
         <option value="x">Global +X</option>
       </select></div>
-      <div class="hint">Face ${pick.faceIndex + 1} · ${escapeHtml(pick.face.surface)}</div>
+      <div class="hint">${picks.length === 1 ? `Face ${first.faceIndex + 1} · ${escapeHtml(first.face.surface)}` : `${picks.length} faces (Ctrl+click selection) · shared magnitude`}</div>
     `;
     let magnitudeInput: HTMLInputElement | null = null;
     let directionSelect: HTMLSelectElement | null = null;
     const result = await openModal({
-      title: "Force",
+      title: picks.length > 1 ? `Force — ${picks.length} faces` : "Force",
       icon: "arrow-down-to-line",
       body,
       width: 420,
@@ -3952,34 +4010,41 @@ export class App {
     const directionEl = body.querySelector<HTMLSelectElement>("#force-dir");
     if (!magnitudeEl || !directionEl) return;
     const magnitude = Math.max(0.001, Number(magnitudeEl.value) || 1000);
-    const n = pick.face.normal;
-    const direction: Vec3 =
-      directionEl.value === "normal"
-        ? [-n[0], -n[1], -n[2]]
-        : directionEl.value === "along"
-          ? [n[0], n[1], n[2]]
-          : directionEl.value === "down"
-            ? [0, -1, 0]
-            : directionEl.value === "zdown"
-              ? [0, 0, -1]
-              : [1, 0, 0];
     const before = this.capture();
-    const load: AnalysisLoad = {
-      id: uid("load"),
-      type: "force",
-      faceIndex: pick.faceIndex,
-      face: { faceIndex: pick.faceIndex, surface: pick.face.surface, point: pick.face.point, normal: pick.face.normal },
-      magnitude,
-      direction,
-      label: `Force ${fmt(magnitude, 0)} N`,
-    };
-    study.loads.push(load);
+    for (const p of picks) {
+      const n = p.face.normal;
+      const direction: Vec3 =
+        directionEl.value === "normal"
+          ? [-n[0], -n[1], -n[2]]
+          : directionEl.value === "along"
+            ? [n[0], n[1], n[2]]
+            : directionEl.value === "down"
+              ? [0, -1, 0]
+              : directionEl.value === "zdown"
+                ? [0, 0, -1]
+                : [1, 0, 0];
+      const load: AnalysisLoad = {
+        id: uid("load"),
+        type: "force",
+        faceIndex: p.faceIndex,
+        face: { faceIndex: p.faceIndex, surface: p.face.surface, point: p.face.point, normal: p.face.normal },
+        magnitude,
+        direction,
+        label: `Force ${fmt(magnitude, 0)} N`,
+      };
+      study.loads.push(load);
+    }
     this.invalidateStudy(study);
     this.commit(before);
     this.refreshTree();
     this.refreshScene();
     this.refreshPickLists(study);
-    toast(`Force ${fmt(magnitude, 0)} N added on face ${pick.faceIndex + 1}.`, "success");
+    toast(
+      picks.length === 1
+        ? `Force ${fmt(magnitude, 0)} N added on face ${first.faceIndex + 1}.`
+        : `Force ${fmt(magnitude, 0)} N added on ${picks.length} faces.`,
+      "success",
+    );
   }
 
   private async openPressureDialog(study: AnalysisStudy, pick: FacePick): Promise<void> {
@@ -4977,18 +5042,21 @@ export class App {
 
   private async buildTemplate(template: string): Promise<void> {
     const doc = createDocument();
-    doc.variables = standardVariables([["L", "100"]]);
     const base = doc.parts[0];
-    base.materialId = "aisi1020";
     if (template === "blank") {
+      // A blank document has no material and no variables — just one empty part.
+      base.materialId = undefined;
+      doc.variables = [];
       this.doc = doc;
       this.applyDocumentState({ history: false, clearResults: true });
       return;
     }
+    doc.variables = standardVariables([["L", "100"]]);
+    base.materialId = "aisi1020";
     if (template === "beam") {
       doc.name = "Cantilever Beam";
       base.name = "Beam";
-      const sketch = this.addRectSketch(base, "right", -30, -6, 90, 6, "Sketch1");
+      const sketch = this.addRectSketch(base, "right", -30, -10, 90, 10, "Sketch1");
       this.addExtrude(base, sketch.id, 12, "new");
       const study: AnalysisStudy = {
         id: uid("study"),

@@ -1265,7 +1265,8 @@ export class SketchEditor {
 
   /** Live numeric boxes next to the cursor while a drawing tool is armed. */
   private updateDynamicInput(e: PointerEvent): void {
-    if (!this.cursor || this.pending.stage !== 1) {
+    const arcPlacing = this.tool === "arc" && this.pending.stage === 2;
+    if (!this.cursor || (this.pending.stage !== 1 && !arcPlacing)) {
       this.dynamic.hide();
       this.renderSnapMarker();
       return;
@@ -1312,7 +1313,10 @@ export class SketchEditor {
 
   /** Enter pressed in the dynamic boxes: draw exactly the typed geometry. */
   private applyDynamicInput(values: Record<string, number>): void {
-    if (!this.sketch || this.pending.stage !== 1) return;
+    // 3-point arc: the radius box belongs to the third-point stage, when both
+    // chord endpoints already exist.
+    const arcStage = this.tool === "arc" && this.pending.stage === 2 && this.pending.points.length === 2;
+    if (!this.sketch || (this.pending.stage !== 1 && !arcStage)) return;
     const a = this.pending.points[0];
     if (this.tool === "line") {
       const length = Math.max(0.01, values.length ?? 0);

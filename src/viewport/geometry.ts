@@ -76,11 +76,23 @@ export function emptyGeometry(): THREE.BufferGeometry {
 export function transformMeshData(mesh: MeshData, matrix: THREE.Matrix4): MeshData {
   const positions = new Float32Array(mesh.positions.length);
   const v = new THREE.Vector3();
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
   for (let i = 0; i < mesh.positions.length; i += 3) {
     v.set(mesh.positions[i], mesh.positions[i + 1], mesh.positions[i + 2]).applyMatrix4(matrix);
     positions[i] = v.x;
     positions[i + 1] = v.y;
     positions[i + 2] = v.z;
+    if (v.x < minX) minX = v.x;
+    if (v.y < minY) minY = v.y;
+    if (v.z < minZ) minZ = v.z;
+    if (v.x > maxX) maxX = v.x;
+    if (v.y > maxY) maxY = v.y;
+    if (v.z > maxZ) maxZ = v.z;
   }
   const normalMatrix = new THREE.Matrix3().getNormalMatrix(matrix);
   const normals = new Float32Array(mesh.normals.length);
@@ -95,8 +107,8 @@ export function transformMeshData(mesh: MeshData, matrix: THREE.Matrix4): MeshDa
     positions,
     normals,
     bbox: {
-      min: [0, 0, 0],
-      max: [0, 0, 0],
+      min: [mesh.positions.length ? minX : 0, mesh.positions.length ? minY : 0, mesh.positions.length ? minZ : 0],
+      max: [mesh.positions.length ? maxX : 0, mesh.positions.length ? maxY : 0, mesh.positions.length ? maxZ : 0],
     },
   };
 }

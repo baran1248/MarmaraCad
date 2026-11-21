@@ -135,6 +135,9 @@ export function nextFeatureName(type: string, features: { type: string; name: st
     revolve: "Revolve",
     fillet: "Fillet",
     chamfer: "Chamfer",
+    shell: "Shell",
+    mirror: "Mirror",
+    pattern: "LPattern",
     imported: "Imported Body",
   };
   const prefix = base[type] ?? type;

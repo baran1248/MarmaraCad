@@ -771,6 +771,59 @@ export class Viewport {
     );
     if (!view) return [start];
     const keyOf = (p: Vec3) => `${Math.round(p[0] * 100)},${Math.round(p[1] * 100)},${Math.round(p[2] * 100)}`;
+    const startEdge = view.data.edges.find((e) => e.index === start.edgeIndex);
+    if (!startEdge) return [start];
+    const picked = new Set<number>([start.edgeIndex]);
+    const visited = new Set<number>([start.edgeIndex]);
+    const queue: EdgeInfo[] = [startEdge];
+    const connects = (edge: EdgeInfo, endpointKey: string): boolean => {
+      const a = edge.points[0];
+      const b = edge.points[edge.points.length - 1];
+      if (!a || !b) return false;
+      return keyOf(a) === endpointKey || keyOf(b) === endpointKey;
+    };
+
+    if (!tangentOnly) {
+      // Select Loop: the boundary of the planar face the picked edge lies on.
+      // A box edge therefore yields the four edges of that face, not the whole
+      // connected shell.
+      const a0 = startEdge.points[0];
+      const b0 = startEdge.points[startEdge.points.length - 1];
+      if (a0 && b0) {
+        const onPlane = (p: Vec3, face: FaceInfo) =>
+          Math.abs(
+            (p[0] - face.point[0]) * face.normal[0] +
+              (p[1] - face.point[1]) * face.normal[1] +
+              (p[2] - face.point[2]) * face.normal[2],
+          ) < 0.05;
+        const face = view.data.faces.find(
+          (f) => f.surface === "plane" && onPlane(a0, f) && onPlane(b0, f),
+        );
+        if (face) {
+          const onFace = (edge: EdgeInfo) => {
+            const a = edge.points[0];
+            const b = edge.points[edge.points.length - 1];
+            if (!a || !b) return false;
+            return onPlane(a, face) && (edge.closed || onPlane(b, face));
+          };
+          while (queue.length && picked.size < 400) {
+            const current = queue.shift()!;
+            for (const endpoint of [current.points[0], current.points[current.points.length - 1]]) {
+              if (!endpoint) continue;
+              const endpointKey = keyOf(endpoint);
+              for (const other of view.data.edges) {
+                if (visited.has(other.index) || !onFace(other) || !connects(other, endpointKey)) continue;
+                visited.add(other.index);
+                picked.add(other.index);
+                queue.push(other);
+              }
+            }
+          }
+          return this.edgePicks(view, picked);
+        }
+      }
+    }
+
     const dirAt = (edge: EdgeInfo, point: Vec3): Vec3 | null => {
       const pts = edge.points;
       if (pts.length < 2) return null;
@@ -782,37 +835,37 @@ export class Viewport {
       const l = Math.hypot(v[0], v[1], v[2]) || 1;
       return [v[0] / l, v[1] / l, v[2] / l];
     };
-    const startEdge = view.data.edges.find((e) => e.index === start.edgeIndex);
-    if (!startEdge) return [start];
-    const picked = new Set<number>([start.edgeIndex]);
-    const queue: EdgeInfo[] = [startEdge];
+
+    // Select Tangency: follow the direction of the previous edge, so fillet
+    // surfaces and tangent arcs chain together and sharp corners stop the walk.
     while (queue.length && picked.size < 400) {
       const current = queue.shift()!;
       for (const endpoint of [current.points[0], current.points[current.points.length - 1]]) {
         if (!endpoint) continue;
         const endpointKey = keyOf(endpoint);
         for (const other of view.data.edges) {
-          if (picked.has(other.index)) continue;
+          if (visited.has(other.index) || !connects(other, endpointKey)) continue;
+          const d1 = dirAt(current, endpoint);
           const a = other.points[0];
           const b = other.points[other.points.length - 1];
-          if (!a || !b) continue;
-          let shared: Vec3 | null = null;
-          if (keyOf(a) === endpointKey) shared = a;
-          else if (keyOf(b) === endpointKey) shared = b;
-          if (!shared) continue;
-          if (tangentOnly) {
-            const d1 = dirAt(current, endpoint);
-            const d2 = dirAt(other, shared);
-            if (!d1 || !d2) continue;
-            const dot = Math.abs(d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]);
-            if (dot < 0.985) continue;
-          }
+          const d2 = keyOf(a!) === endpointKey ? dirAt(other, a!) : dirAt(other, b!);
+          if (!d1 || !d2) continue;
+          const dot = Math.abs(d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]);
+          if (dot < 0.985) continue;
+          visited.add(other.index);
           picked.add(other.index);
           queue.push(other);
         }
       }
     }
-    return [...picked]
+    return this.edgePicks(view, picked);
+  }
+
+  private edgePicks(
+    view: { componentId: string | null; partId: string; data: MeshData },
+    indices: Set<number>,
+  ): EdgePick[] {
+    return [...indices]
       .map((index) => {
         const edge = view.data.edges.find((e) => e.index === index);
         return edge ? { componentId: view.componentId, partId: view.partId, edgeIndex: index, edge } : null;

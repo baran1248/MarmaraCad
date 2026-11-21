@@ -276,6 +276,48 @@ try {
     { bolt, boltSpan },
   );
 
+  // The size list covers the whole M4–M12 range, and M12 scales the hex across flats.
+  await page.click('[data-cmd-tab="features"]');
+  await page.click('[data-cmd-action="toolbox-bolt"]');
+  await page.waitForSelector("#tb-size");
+  const sizeOptions = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("#tb-size option")).map((o) => o.value),
+  );
+  const beforeM12 = await page.evaluate(() => window.__marmaracad.doc().parts.length);
+  await page.selectOption("#tb-size", "M12");
+  await page.fill("#tb-length", "30");
+  await page.click(".modal .btn.primary");
+  await page.waitForFunction((n) => window.__marmaracad.doc().parts.length === n + 1, beforeM12, { timeout: 180000 });
+  await page.waitForFunction(
+    (n) => {
+      const api = window.__marmaracad;
+      const doc = api.doc();
+      const mesh = doc.parts[n] && api.meshes().get(doc.parts[n].id);
+      return Boolean(mesh && mesh.volume > 100);
+    },
+    beforeM12,
+    { timeout: 180000 },
+  );
+  const m12 = await page.evaluate((n) => {
+    const api = window.__marmaracad;
+    const doc = api.doc();
+    const part = doc.parts[n];
+    const mesh = api.meshes().get(part.id);
+    return {
+      name: part.name,
+      span: [(mesh.bbox.max[0] - mesh.bbox.min[0]), (mesh.bbox.max[1] - mesh.bbox.min[1]), (mesh.bbox.max[2] - mesh.bbox.min[2])],
+      volume: mesh.volume,
+    };
+  }, beforeM12);
+  record(
+    "Toolbox offers M4–M12 and an M12 × 30 bolt scales to 18 mm across flats",
+    ["M4", "M5", "M6", "M8", "M10", "M12"].every((s) => sizeOptions.includes(s)) &&
+      /M12/.test(m12.name) &&
+      Math.abs(Math.min(m12.span[0], m12.span[1]) - 18) < 0.9 &&
+      m12.span[2] > 30,
+    { sizeOptions, m12 },
+  );
+
   // --- TR/EN language switch.
   await page.click('[data-title-action="language"]');
   await page.waitForTimeout(200);

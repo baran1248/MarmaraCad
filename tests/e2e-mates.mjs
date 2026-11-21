@@ -51,6 +51,33 @@ const inserted = await page.evaluate(() => {
 });
 record("two components inserted, one fixed", inserted.length === 2 && inserted[0].fixed === true, inserted);
 
+// ---------------------------------------------------- preselection into Mate
+// Ctrl+click fills app.selFaces; opening Mate must keep both picks (one per
+// component) instead of asking for them again.
+await page.evaluate(
+  ({ aId, bId }) => {
+    const app = window.__marmaracad.app;
+    const doc = window.__marmaracad.doc();
+    const mesh = window.__marmaracad.meshes().get(doc.parts[0].id);
+    const bottom = mesh.faces.findIndex((f) => f.surface === "plane" && f.normal[2] < -0.9);
+    const top = mesh.faces.findIndex((f) => f.surface === "plane" && f.normal[2] > 0.9);
+    app.selFaces = [
+      { componentId: aId, partId: doc.parts[0].id, faceIndex: bottom, face: mesh.faces[bottom] },
+      { componentId: bId, partId: doc.parts[0].id, faceIndex: top, face: mesh.faces[top] },
+    ];
+    app.syncSelection();
+  },
+  { aId: inserted[0].id, bId: inserted[1].id },
+);
+await page.click('[data-cmd-tab="assembly"]');
+await page.click('[data-cmd-action="mate-coincident"]');
+await page.waitForSelector("#pm-mate-picks", { timeout: 15000 });
+await page.waitForTimeout(300);
+const seededRows = await page.locator("#pm-mate-picks .selection-item").count();
+record("Mate panel accepts the two preselected faces", seededRows === 2, { rows: seededRows });
+await page.click("[data-pm-cancel]");
+await page.waitForTimeout(250);
+
 // ---------------------------------------------------------------- misplace B
 const secondId = inserted[1].id;
 await page.dblclick(`[data-key="component:${secondId}"]`);

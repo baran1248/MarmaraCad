@@ -94,6 +94,40 @@ try {
   await page.click(".modal .btn.primary");
   await page.waitForTimeout(150);
 
+  // Positive case: drop the lid 5 mm into the box and detect the overlap.
+  await page.evaluate(() => {
+    const app = window.__marmaracad.app;
+    const doc = window.__marmaracad.doc();
+    const lid = doc.components.find((c) => /Lid/i.test(c.name));
+    lid.position = [0, 25, 0];
+    app.refreshScene();
+    app.refreshTree();
+  });
+  await page.waitForTimeout(400);
+  await page.click('[data-cmd-tab="features"]');
+  await page.click('[data-cmd-action="interference"]');
+  await page.waitForSelector(".modal");
+  const overlapText = await page.locator(".modal .modal-body").innerText();
+  const overlapVolume = Number((overlapText.match(/≈\s*([\d.,]+)\s*mm³/) ?? [])[1]?.replace(",", ".") ?? 0);
+  record(
+    "Interference detection finds the lid pushed 5 mm into the box (≈1,152 mm³)",
+    /interference/i.test(overlapText) &&
+      !/No interference detected/i.test(overlapText) &&
+      Math.abs(overlapVolume - 1152) < 120,
+    { volume: overlapVolume, text: overlapText.split("\n").slice(0, 3) },
+  );
+  await page.click(".modal .btn.primary");
+  await page.waitForTimeout(150);
+  // Put the lid back on top for the mass checks.
+  await page.evaluate(() => {
+    const app = window.__marmaracad.app;
+    const lid = window.__marmaracad.doc().components.find((c) => /Lid/i.test(c.name));
+    lid.position = [0, 30, 0];
+    app.refreshScene();
+    app.refreshTree();
+  });
+  await page.waitForTimeout(300);
+
   // Mass properties combine both components with the material density.
   await page.click('[data-cmd-tab="evaluate"]');
   await page.click('[data-cmd-action="mass-props"]');

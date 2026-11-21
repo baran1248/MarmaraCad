@@ -138,6 +138,43 @@ try {
   const hidden = await dyn();
   record("Escape hides the dynamic input", hidden === null, { hidden });
 
+  // 3-point arc: pick two points on a Ø40 chord, then type R = 25 for the third.
+  await setTool(page, "arc");
+  const arcStart = await page.evaluate(() => {
+    const app = window.__marmaracad.app;
+    const s = app.viewport.projectToScreen([-20, -25, 0]);
+    const rect = app.viewport.renderer.domElement.getBoundingClientRect();
+    return { x: rect.left + s.x, y: rect.top + s.y };
+  });
+  const arcEnd = await page.evaluate(() => {
+    const app = window.__marmaracad.app;
+    const s = app.viewport.projectToScreen([20, -25, 0]);
+    const rect = app.viewport.renderer.domElement.getBoundingClientRect();
+    return { x: rect.left + s.x, y: rect.top + s.y };
+  });
+  await page.mouse.click(arcStart.x, arcStart.y);
+  await page.mouse.click(arcEnd.x, arcEnd.y);
+  await page.mouse.move((arcStart.x + arcEnd.x) / 2, arcStart.y - 60);
+  const arcDyn = await dyn();
+  record(
+    "3-point arc shows a radius box at the third point",
+    !!arcDyn && arcDyn.fields.length === 1 && arcDyn.fields[0].label === "R",
+    arcDyn ?? {},
+  );
+  await page.keyboard.type("25");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(300);
+  const arc = await page.evaluate(() => {
+    const s = window.__marmaracad.app.editor.sketch;
+    const e = s.entities.filter((x) => x.kind === "arc").at(-1);
+    return e ? { radius: e.radius, constraint: s.constraints.find((c) => c.type === "radius" && c.entity === e.id)?.value ?? null } : null;
+  });
+  record(
+    "Typed 25 creates an R25 arc with a radius constraint",
+    !!arc && Math.abs(arc.radius - 25) < 1e-3 && Math.abs((arc.constraint ?? 0) - 25) < 1e-3,
+    { arc },
+  );
+
   console.log("RESULT", results.every((r) => r.pass) ? "PASS" : "FAIL", JSON.stringify({ results, errors }, null, 2));
   if (!results.every((r) => r.pass) || errors.length) process.exitCode = 1;
 } catch (error) {

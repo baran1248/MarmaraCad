@@ -93,6 +93,39 @@ try {
   const afterReAdd = await page.evaluate(() => window.__marmaracad.selections().edges.length);
   record("Ctrl+click toggles a selected edge off and back on", afterRemove === 2 && afterReAdd === 3, { afterRemove, afterReAdd });
 
+  // Right-click → Select Loop collects the parallel band (4 vertical edges of a box).
+  const rightClick = async (point) => {
+    await page.mouse.click(point.x, point.y, { button: "right" });
+    await page.waitForSelector("#viewport-context.visible", { timeout: 5000 });
+  };
+  await rightClick(vertical[0]);
+  await page.click('#viewport-context .ctx-item:has-text("Select Loop")');
+  await page.waitForTimeout(200);
+  const loopEdges = await page.evaluate(() => window.__marmaracad.selections().edges.map((e) => e.edgeIndex));
+  const loopVertical = loopEdges.filter((i) => vertical.some((v) => v.i === i));
+  record(
+    "Select Loop picks the four edges bounding the face under the cursor",
+    loopEdges.length === 4 && loopVertical.length === 2 && loopEdges.includes(vertical[0].i),
+    { loopEdges, loopVertical },
+  );
+  await rightClick(vertical[0]);
+  await page.click('#viewport-context .ctx-item:has-text("Select Tangency")');
+  await page.waitForTimeout(200);
+  const tangentEdges = await page.evaluate(() => window.__marmaracad.selections().edges.map((e) => e.edgeIndex));
+  record(
+    "Select Tangency stops at the sharp box corners",
+    tangentEdges.length === 1 && tangentEdges[0] === vertical[0].i,
+    { tangentEdges },
+  );
+  // Restore the three-edge selection for Measure and Fillet.
+  await page.mouse.click(vertical[1].x, vertical[1].y);
+  for (const edge of [vertical[0], vertical[2]]) {
+    await page.keyboard.down("Control");
+    await page.mouse.click(edge.x, edge.y);
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(120);
+  }
+
   // Measure accepts the multi-selection.
   await page.click('[data-cmd-tab="evaluate"]');
   await page.click('[data-cmd-action="measure"]');
@@ -162,6 +195,79 @@ try {
   await drag({ x: canvas.l + 6, y: canvas.t + 6 }, { x: canvas.r - 6, y: canvas.b - 6 });
   const boxEdges = await page.evaluate(() => window.__marmaracad.selections().edges.length);
   record("3D window selection selects every visible edge", boxEdges >= 9, { edges: boxEdges });
+
+  // Crossing selection (right→left) only takes edges the rectangle touches.
+  await page.mouse.click(canvas.l + 40, canvas.t + 40);
+  await page.waitForTimeout(120);
+  const width = canvas.r - canvas.l;
+  const height = canvas.b - canvas.t;
+  await drag(
+    { x: canvas.r - 12, y: canvas.b - 12 },
+    { x: canvas.l + width * 0.48, y: canvas.t + height * 0.42 },
+  );
+  const crossEdges = await page.evaluate(() => window.__marmaracad.selections().edges.length);
+  record(
+    "3D crossing selection (right→left) selects only the touched edges",
+    crossEdges > 0 && crossEdges < boxEdges,
+    { edges: crossEdges, windowEdges: boxEdges },
+  );
+
+  // Bulk chamfer on a fresh box (a fillet regenerates the edge indices).
+  await newDocument(page);
+  await startSketch(page, "front");
+  await setTool(page, "rectangle");
+  await sketchClick(page, 0, 0);
+  await sketchClick(page, 40, 20);
+  await setTool(page, "select");
+  await finishSketch(page);
+  await extrude(page, { depth: 25 });
+  await waitVolume(page, "Math.abs(v - 20000) < 1");
+  await page.click('[data-pick-filter="edge"]');
+  const chamferEdges = await page.evaluate(() => {
+    const api = window.__marmaracad;
+    const doc = api.doc();
+    const mesh = api.meshes().get(doc.parts[0].id);
+    const vp = api.app.viewport;
+    const rect = vp.renderer.domElement.getBoundingClientRect();
+    return mesh.edges
+      .map((e, i) => {
+        const a = e.points[0];
+        const b = e.points[e.points.length - 1];
+        const s = vp.projectToScreen([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2]);
+        return {
+          i,
+          vertical: Math.abs(a[0] - b[0]) < 0.2 && Math.abs(a[1] - b[1]) < 0.2 && Math.abs(a[2] - b[2]) > 5,
+          x: rect.left + s.x,
+          y: rect.top + s.y,
+        };
+      })
+      .filter((e) => e.vertical)
+      .slice(0, 2);
+  });
+  for (const edge of chamferEdges) {
+    await page.keyboard.down("Control");
+    await page.mouse.click(edge.x, edge.y);
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(120);
+  }
+  await page.click('[data-cmd-tab="features"]');
+  await page.click('[data-cmd-action="chamfer"]');
+  await page.waitForSelector("#pm-chamfer-distance");
+  const chamferPanel = await page.locator(".panel-body").innerText();
+  await page.fill("#pm-chamfer-distance", "2");
+  await page.click("[data-pm-ok]");
+  await waitVolume(page, "Math.abs(v - 19900) < 1");
+  const chamfer = await page.evaluate(() => {
+    const doc = window.__marmaracad.doc();
+    const feature = doc.parts[0].features.at(-1);
+    const mesh = window.__marmaracad.meshes().get(doc.parts[0].id);
+    return { type: feature.type, edges: feature.params.edgeIndices, distance: feature.params.distance, volume: mesh.volume };
+  });
+  record(
+    "Chamfer uses all selected edges (2 corners × 2 mm × 25 mm)",
+    chamfer.type === "chamfer" && chamfer.edges.length === 2 && /2 EDGE/i.test(chamferPanel) && near(chamfer.volume, 19900, 0.5).ok,
+    { panel: chamferPanel.split("\n").slice(0, 3), ...chamfer },
+  );
 
   console.log("RESULT", results.every((r) => r.pass) ? "PASS" : "FAIL", JSON.stringify({ results, errors }, null, 2));
   if (!results.every((r) => r.pass) || errors.length) process.exitCode = 1;
