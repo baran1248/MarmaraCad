@@ -45,7 +45,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 25 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 26 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -64,7 +64,10 @@ definition colours, the Box + Lid template (shell volume, placement, zero interf
 1,152 mm³ overlap, mass), the Beam/L-Bracket/Blank templates, Linear Pattern + Mirror, parametric
 variables (`L = 100`, `W = L / 2`), the Ansys-style analysis strip, technical drawing + PDF, Section
 View, rollback, Toolbox M4–M12, TR/EN, keyboard shortcuts (N, Ctrl+8, F, Esc, wheel zoom), the view
-selector, the `?` guide, and the Gemini assistant with a mocked API.
+selector, the `?` guide, and the Gemini assistant with a mocked API. The newest suites add the HUD
+overlap guard (`e2e-hud.mjs`), per-generation Gemini thinking config with AI-driven FEA supports/loads
+and AI cut/revolve/mirror/pattern/mate commands, the drawing dimension placement check, and Turkish
+Assembly/mass-card/menu labels.
 
 CI runs `npm test` and `npm run build` on every push to `main`, then publishes `dist` to GitHub
 Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow` scope

@@ -34,6 +34,16 @@ const COOKIE = "marmaracad_gemini_key";
 const DEFAULT_MODEL = "hydrogen";
 const DEFAULT_MODEL_ID = "gemini-2.5-flash";
 const THINK_LEVELS: Record<string, string> = { low: "low", mid: "medium", high: "high" };
+const THINK_BUDGETS: Record<string, number> = { low: 1024, mid: 8192, high: 24576 };
+
+/** Google split thinking controls between model generations:
+ *  Gemini 3 uses `thinkingLevel`, 2.5 uses a token `thinkingBudget`, and older
+ *  models reject the whole `thinkingConfig` object. */
+export function thinkingConfigFor(modelId: string, thinking: string): Record<string, unknown> | undefined {
+  if (/gemini-3/i.test(modelId)) return { thinkingLevel: THINK_LEVELS[thinking] ?? "medium" };
+  if (/gemini-2\.5/i.test(modelId)) return { thinkingBudget: THINK_BUDGETS[thinking] ?? 8192 };
+  return undefined;
+}
 
 export function systemPrompt(doc: ProjectDocument): string {
   return `You are the MarmaraCad CAD assistant. MarmaraCad is a browser CAD/assembly/FEA app (mm, N, MPa).
@@ -46,16 +56,21 @@ Allowed actions and params:
 - box: {length,width,height,centered?} - create a rectangular part (new document part).
 - cylinder: {diameter,height,centered?}
 - extrude: {sketch?:"Sketch1",depth,direction?} - extrude an existing sketch.
+- cut: {sketch?:"Sketch2",depth,direction?} - extruded cut that removes material from the body.
+- revolve: {sketch?:"Sketch1",angle?,axis?:"u"|"v",operation?:"join"|"cut"|"new"} - revolve a sketch.
 - fillet: {radius,edges?:"all"} - round the body edges.
 - chamfer: {distance,edges?:"all"}
 - shell: {thickness}
+- mirror: {plane?:"right"|"front"|"top"} - mirror and fuse the body about a base plane.
+- pattern: {axis?:"x"|"y"|"z",count,spacing} - linear pattern of the body.
+- mate: {type?:"coincident"|"concentric"|"distance",componentA?,componentB?,distance?} - mate two inserted components.
 - material: {id:"aisi1020"|"steel"|"al6061"|"ss304"|"ti6al4v"|"abs"|"brass"}
 - variable: {name,expression} - global equation, e.g. {"name":"L","expression":"100"}.
 - measure: {} - open the measure tool.
 - view: {name:"front"|"top"|"right"|"iso"}
 - section: {axis:"x"|"y"|"z",offset}
 - drawing: {} - generate the technical drawing.
-- fea: {material?,meshSize?,force?,pressure?,direction?} - create/setup a static study.
+- fea: {material?,meshSize?,force?,pressure?,direction?:"down"|"up"|"x"|"zdown"|"normal"|[x,y,z]} - create/setup a static study; the fixed support goes on the lowest X or Z face and the force/pressure on the opposite end.
 - action: {name:"zoom-fit"|"mass-props"|"interference"|"toolbox-bolt"|"new-sketch"} - run an app command.
 Keep models small and printable. If the request is ambiguous, ask a question in "message" and return an empty commands array.
 Current document: "${doc.name}", ${doc.parts.length} part(s), mode ${doc.mode}. Active part features: ${
@@ -204,12 +219,7 @@ export class Assistant {
     });
     this.modelSelect?.addEventListener("change", () => {
       this.model = this.modelSelect?.value ?? DEFAULT_MODEL;
-      if (this.model === DEFAULT_MODEL) {
-        const flash = this.models.find((m) => /flash/i.test(m.id)) ?? this.models[0];
-        this.modelId = flash?.id ?? DEFAULT_MODEL_ID;
-      } else {
-        this.modelId = this.model;
-      }
+      this.modelId = this.model === DEFAULT_MODEL ? this.defaultModelId() : this.model;
       try {
         localStorage.setItem(MODEL_STORAGE, this.model);
       } catch {
@@ -252,11 +262,22 @@ export class Assistant {
     if (head) head.textContent = `${this.key ? "Local key" : "No key"} · ${this.model} · ${this.thinking}`;
   }
 
+  /** `hydrogen` is the visible default. When Google lists a model with that
+   *  exact id use it unchanged, otherwise alias it to the first flash model. */
+  private defaultModelId(): string {
+    if (this.models.some((m) => m.id === DEFAULT_MODEL)) return DEFAULT_MODEL;
+    return (this.models.find((m) => /flash/i.test(m.id)) ?? this.models[0])?.id ?? DEFAULT_MODEL_ID;
+  }
+
   private renderModelOptions(): void {
     if (!this.modelSelect) return;
-    const flash = this.models.find((m) => /flash/i.test(m.id)) ?? this.models[0];
+    const hydrogen = this.models.find((m) => m.id === DEFAULT_MODEL);
+    const fallback = hydrogen ?? this.models.find((m) => /flash/i.test(m.id)) ?? this.models[0];
     const list = this.models.length
-      ? [{ id: DEFAULT_MODEL, label: `hydrogen (default · ${flash.label})` }, ...this.models.map((m) => ({ id: m.id, label: m.label }))]
+      ? [
+          { id: DEFAULT_MODEL, label: hydrogen ? "hydrogen (default)" : `hydrogen (default · ${fallback.label})` },
+          ...this.models.filter((m) => m.id !== DEFAULT_MODEL).map((m) => ({ id: m.id, label: m.label })),
+        ]
       : [{ id: DEFAULT_MODEL, label: "hydrogen (default)" }];
     this.modelSelect.innerHTML = list
       .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`)
@@ -270,7 +291,7 @@ export class Assistant {
       this.modelSelect.value = selected.id;
       if (selected.id === DEFAULT_MODEL) {
         this.model = DEFAULT_MODEL;
-        this.modelId = flash?.id ?? DEFAULT_MODEL_ID;
+        this.modelId = this.defaultModelId();
       } else {
         this.model = selected.id;
         this.modelId = selected.id;
@@ -292,13 +313,15 @@ export class Assistant {
           return { id, label: m.displayName ?? id };
         });
       this.models = models;
-      // `hydrogen` stays the visible default; it is aliased to the first flash
-      // model at request time in renderModelOptions().
-      const flash = models.find((m) => /flash/i.test(m.id)) ?? models[0];
+      // `hydrogen` stays the visible default; it is used directly when the API
+      // lists that id, otherwise aliased to the first flash model.
       this.renderModelOptions();
       this.updateKeyState();
       this.setStatus(`${this.models.length} model(s) available`);
-      this.pushMessage(`${this.models.length} Gemini model(s) listed. Default is hydrogen (${flash?.id ?? DEFAULT_MODEL_ID}), thinking mid.`, "bot");
+      this.pushMessage(
+        `${this.models.length} Gemini model(s) listed. Default is hydrogen (${this.modelId}), thinking mid.`,
+        "bot",
+      );
     } catch (error) {
       this.pushMessage(`Could not list models: ${error instanceof Error ? error.message : String(error)}`, "error");
       this.setStatus("Model listing failed");
@@ -348,16 +371,18 @@ export class Assistant {
     this.setStatus("Gemini is thinking…");
     try {
       const debugDoc = (window as unknown as { __marmaracad?: { doc?: () => ProjectDocument } }).__marmaracad?.doc?.();
+      const generationConfig: Record<string, unknown> = {
+        temperature: 0.15,
+        responseMimeType: "application/json",
+      };
+      const thinkingConfig = thinkingConfigFor(this.modelId, this.thinking);
+      if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
       const body = {
         systemInstruction: { parts: [{ text: systemPrompt(debugDoc ?? createDocument()) }] },
         contents: [
           ...this.history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
         ],
-        generationConfig: {
-          temperature: 0.15,
-          responseMimeType: "application/json",
-          thinkingConfig: { thinkingLevel: THINK_LEVELS[this.thinking] ?? "medium" },
-        },
+        generationConfig,
       };
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.modelId)}:generateContent?key=${encodeURIComponent(this.key)}`,

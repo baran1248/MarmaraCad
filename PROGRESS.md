@@ -117,8 +117,15 @@ Live: https://baran1248.github.io/MarmaraCad/
 
 ### Gemini assistant
 - [x] Slide-out panel; key stored in localStorage + first-party cookie; `Clear API Key`; no relay server
-- [x] Automatic model listing; visible default `hydrogen` alias + `mid` thinking
-- [x] System prompt teaches the JSON command schema; replies validated against an action whitelist
+- [x] Automatic model listing; visible default `hydrogen` (used directly when listed, otherwise aliased
+      to the first flash model) + `mid` thinking
+- [x] Thinking config per generation: Gemini 3 → `thinkingLevel`, 2.5 → `thinkingBudget`
+      (low 1,024 / mid 8,192 / high 24,576 tokens); older models omit `thinkingConfig`
+- [x] System prompt teaches the JSON command schema (box/cylinder, extrude, cut, revolve, fillet,
+      chamfer, shell, mirror, pattern, mate, material, variable, fea, …); replies are validated
+      against an action whitelist
+- [x] `fea` binds a real Fixed Support on the lowest X/Z face plus a Force/Pressure on the free end,
+      honouring the AI's `force`, `pressure` and `direction` parameters
 - [x] One-click apply inside the normal undo/redo transaction
 
 
@@ -164,8 +171,17 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] Playwright end-to-end: material assignment, drawing views + title block, real PDF download,
       capped Section View, rollback drag, Toolbox M8 bolt, TR/EN, view selector, confirmation
       corner, `S` bar and `?` guide (`e2e-faz2.mjs`)
+- [x] Playwright end-to-end: HUD overlay guard — view tools, selection filters, view badge,
+      confirmation corner and view cube have zero rect overlaps at 1440 and 1180 px (`e2e-hud.mjs`)
+- [x] Playwright end-to-end: drawing width dimension stays 24 px under the front-view lower edge and
+      the height dimension 28 px outside its right edge (`e2e-faz2.mjs`)
+- [x] Playwright end-to-end: TR/EN also relabels the Assembly/Analysis tabs, mass card title and every
+      dropdown menu item (`e2e-faz2.mjs`)
 - [x] Playwright end-to-end: Gemini assistant against a mocked API — local key, model listing,
-      `hydrogen`/`mid`, validated commands, apply + undo, `Clear API Key` (`e2e-ai.mjs`)
+      `hydrogen`/`mid`, validated commands, apply + undo, `Clear API Key`; plus Gemini 3
+      `thinkingLevel`, Gemini 1.5 without `thinkingConfig`, direct `hydrogen` ids, AI-driven FEA
+      support/force, AI pattern+mirror (20,000 mm³) and AI mate seating the lid at y = 30
+      (`e2e-ai.mjs`)
 - [x] Visual QA pass with screenshot review
 - [x] Live GitHub Pages verification (desktop)
 - [x] README with architecture, usage, verification and license notes
@@ -287,3 +303,15 @@ Live: https://baran1248.github.io/MarmaraCad/
   the published URL — `e2e-live`, `e2e-sample`, `e2e-multiselect`, `e2e-dynamic-input`, `e2e-snap`,
   `e2e-template-boxlid`, `e2e-faz2`, `e2e-ai`, `e2e-variables`, `e2e-analysis-strip` and
   `e2e-templates` — all `RESULT PASS` with `EXIT=0` and no console errors.
+- HUD audit (1440 × 900): tools `top 144…172`, filters `180…209`, corner `144…181`, cube
+  `186…332` — every pair disjoint (0 collisions); the same holds at 1180 px. The view cube moved to
+  `top: 52px` and the filter bar to `top: 46px`.
+- Technical drawing: the front view spans y 215.53…278.47; the width dimension sits at y 302.47
+  (gap 23.997 px, slot limit 368) and the height dimension at x 564 (28 px right of the outline),
+  so neither dimension crosses the part.
+- Gemini assistant (mocked API): 2.5 Flash request sends `thinkingBudget: 8192`; Gemini 3 sends
+  `thinkingLevel: "medium"`; Gemini 1.5 sends no `thinkingConfig`; a listed `hydrogen` id is called
+  directly. An AI batch `box + fea(force 250, direction down)` produces a fixed support with normal
+  `[-1,0,0]` and one 250 N `[0,-1,0]` load on the opposite face. AI `pattern(3 × 40) + mirror`
+  yields 20,000 mm³ over x −90…90; AI `mate(coincident)` pairs Box/Lid and seats the lid at
+  y = 30.000.

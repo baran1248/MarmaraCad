@@ -1294,7 +1294,9 @@ svg {
 /* ---------------------------------------------------------------- viewcube */
 .viewcube {
   position: absolute;
-  top: 40px;
+  /* Clears the confirmation corner (top 10px + 37px tall) so the two HUD
+     clusters never overlap when a feature panel is open. */
+  top: 52px;
   right: 22px;
   width: 118px;
   height: 146px;
@@ -2383,7 +2385,9 @@ body.has-legend .toast-stack {
 
 .selection-filters {
   position: absolute;
-  top: 10px;
+  /* Second HUD row: the view tools own top:10px, so the filter bar sits right
+     below them instead of covering the front/top/right buttons. */
+  top: 46px;
   left: 10px;
   z-index: 12;
   display: flex;

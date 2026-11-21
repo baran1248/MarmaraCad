@@ -2175,9 +2175,48 @@ export class App {
         });
         return true;
       }
+      case "cut": {
+        if (!active) return false;
+        const sketch = active.sketches.find((s) => s.name === text("sketch") || s.id === text("sketch")) ?? this.defaultSketchForFeature(active);
+        if (!sketch) return false;
+        active.features.push({
+          id: uid("feat"),
+          type: "cut",
+          name: nextFeatureName("cut", active.features),
+          sketchId: sketch.id,
+          params: {
+            depth: Math.max(0.1, num("depth", 25)),
+            direction: params.direction === -1 ? -1 : 1,
+            symmetric: params.symmetric === true,
+            operation: "cut",
+          },
+        });
+        return true;
+      }
+      case "revolve": {
+        if (!active) return false;
+        const sketch = active.sketches.find((s) => s.name === text("sketch") || s.id === text("sketch")) ?? this.defaultSketchForFeature(active);
+        if (!sketch) return false;
+        const operation = text("operation", "join");
+        active.features.push({
+          id: uid("feat"),
+          type: "revolve",
+          name: nextFeatureName("revolve", active.features),
+          sketchId: sketch.id,
+          params: {
+            angle: Math.min(360, Math.max(0.1, num("angle", 360))),
+            axisMode: text("axis", "v") === "u" ? "u" : "v",
+            axisEntityId: null,
+            operation: operation === "cut" || operation === "new" ? operation : "join",
+          },
+        });
+        return true;
+      }
       case "fillet":
       case "chamfer": {
         if (!active) return false;
+        // An AI batch can create the body first; rebuild so edge indices exist.
+        if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
         const mesh = this.meshForPart(active.id);
         if (!mesh) return false;
         const indices = text("edges") === "all" || !params.edges ? mesh.edges.map((e) => e.index) : (params.edges as number[]);
@@ -2193,6 +2232,41 @@ export class App {
         if (!active) return false;
         active.features.push({ id: uid("feat"), type: "shell", name: nextFeatureName("shell", active.features), params: { thickness: Math.max(0.05, num("thickness", 2)) } });
         return true;
+      case "mirror": {
+        if (!active) return false;
+        if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
+        if (!this.meshForPart(active.id)) return false;
+        const plane = text("plane", "right");
+        const mirrorPlane = plane === "front" || plane === "top" ? plane : "right";
+        active.features.push({
+          id: uid("feat"),
+          type: "mirror",
+          name: nextFeatureName("mirror", active.features),
+          params: { mirrorPlane },
+        });
+        active.rollbackIndex = undefined;
+        return true;
+      }
+      case "pattern": {
+        if (!active) return false;
+        if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
+        if (!this.meshForPart(active.id)) return false;
+        const axis = text("axis", "x");
+        active.features.push({
+          id: uid("feat"),
+          type: "pattern",
+          name: nextFeatureName("pattern", active.features),
+          params: {
+            patternAxis: axis === "y" || axis === "z" ? axis : "x",
+            patternCount: Math.max(2, Math.round(num("count", 2))),
+            patternSpacing: Math.max(0.01, num("spacing", 20)),
+          },
+        });
+        active.rollbackIndex = undefined;
+        return true;
+      }
+      case "mate":
+        return this.createMateFromAi(params);
       case "material": {
         const id = text("id", "aisi1020");
         if (!MATERIALS.some((m) => m.id === id)) return false;
@@ -2226,7 +2300,7 @@ export class App {
         await this.makeDrawing();
         return true;
       case "fea":
-        this.setupFeaFromAi(params);
+        await this.setupFeaFromAi(params);
         return true;
       case "action":
         await this.runAction(text("name"));
@@ -2286,7 +2360,7 @@ export class App {
     this.refreshTree();
   }
 
-  private setupFeaFromAi(params: Record<string, unknown>): void {
+  private async setupFeaFromAi(params: Record<string, unknown>): Promise<void> {
     const part = this.activePart();
     if (!part) return;
     if (this.doc.mode !== "analysis") {
@@ -2310,8 +2384,203 @@ export class App {
       this.doc.activeStudyId = study.id;
     }
     if (typeof params.material === "string" && MATERIALS.some((m) => m.id === params.material)) study.materialId = params.material;
+    if (typeof params.meshSize === "number" && params.meshSize > 0) {
+      study.meshSize = clamp(params.meshSize, 0.2, 50);
+    }
+    if ("force" in params || "pressure" in params) {
+      // An AI batch may create the part first; rebuild so the faces exist.
+      if (!this.meshForPart(part.id) && part.features.length) await this.rebuild();
+      this.bindStudyLoadsFromAi(study, params, part);
+    }
     this.refreshTree();
     this.openStudyPanel();
+  }
+
+  /** Bind the AI's force/pressure onto real study entries: a fixed support on
+   *  the lowest X (or Z) face and the load on the opposite end face. */
+  private bindStudyLoadsFromAi(study: AnalysisStudy, params: Record<string, unknown>, part: Part): void {
+    const mesh = this.meshForPart(part.id);
+    if (!mesh || mesh.faces.length === 0) return;
+    const num = (key: string): number | undefined => {
+      const value = Number(params[key]);
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    };
+    const axialFaces = mesh.faces
+      .filter((f) => f.surface === "plane")
+      .map((face) => {
+        const nx = Math.abs(face.normal[0]);
+        const nz = Math.abs(face.normal[2]);
+        if (nx < 0.9 && nz < 0.9) return null;
+        const axis: "x" | "z" = nx >= nz ? "x" : "z";
+        return { face, axis, coord: face.point[axis === "x" ? 0 : 2] };
+      })
+      .filter((e): e is NonNullable<typeof e> => !!e);
+    if (axialFaces.length === 0) return;
+    axialFaces.sort((a, b) => a.coord - b.coord);
+    const support = axialFaces[0];
+    if (!study.supports.some((s) => s.faceIndex === support.face.index)) {
+      study.supports.push({
+        id: uid("sup"),
+        faceIndex: support.face.index,
+        face: { faceIndex: support.face.index, surface: support.face.surface, point: support.face.point, normal: support.face.normal },
+      });
+    }
+    // Free end: the furthest planar face on the same axis, opposite normal.
+    const endCandidates = axialFaces
+      .filter((e) => e.axis === support.axis && e.face.normal[0] * support.face.normal[0] + e.face.normal[2] * support.face.normal[2] < -0.5)
+      .sort((a, b) => b.coord - a.coord);
+    const endFace = (endCandidates[0] ?? axialFaces[axialFaces.length - 1]).face;
+    const faceSelection = {
+      faceIndex: endFace.index,
+      surface: endFace.surface,
+      point: endFace.point,
+      normal: endFace.normal,
+    };
+    const direction = this.aiDirection(params.direction, endFace.normal);
+    const force = num("force");
+    const pressure = num("pressure");
+    if (force !== undefined && !study.loads.some((l) => l.type === "force" && Math.abs(l.magnitude - force) < 1e-9)) {
+      study.loads.push({
+        id: uid("load"),
+        type: "force",
+        faceIndex: endFace.index,
+        face: faceSelection,
+        magnitude: force,
+        direction,
+        label: `Force ${fmt(force, 0)} N`,
+      });
+    }
+    if (pressure !== undefined && !study.loads.some((l) => l.type === "pressure" && Math.abs(l.magnitude - pressure) < 1e-9)) {
+      study.loads.push({
+        id: uid("load"),
+        type: "pressure",
+        faceIndex: endFace.index,
+        face: faceSelection,
+        magnitude: pressure,
+        direction: [...endFace.normal] as Vec3,
+        label: `Pressure ${fmt(pressure, 2)} MPa`,
+      });
+    }
+    this.invalidateStudy(study);
+  }
+
+  private aiDirection(value: unknown, faceNormal: Vec3): Vec3 {
+    if (Array.isArray(value) && value.length === 3 && value.every((v) => Number.isFinite(Number(v)))) {
+      const vec: Vec3 = [Number(value[0]), Number(value[1]), Number(value[2])];
+      const len = Math.hypot(vec[0], vec[1], vec[2]);
+      if (len > 1e-9) return [vec[0] / len, vec[1] / len, vec[2] / len];
+    }
+    const key = String(value ?? "down").toLowerCase();
+    switch (key) {
+      case "up":
+      case "+y":
+      case "y":
+        return [0, 1, 0];
+      case "x":
+      case "+x":
+        return [1, 0, 0];
+      case "z":
+      case "+z":
+        return [0, 0, 1];
+      case "zdown":
+      case "-z":
+        return [0, 0, -1];
+      case "normal":
+        return [...faceNormal] as Vec3;
+      case "opposite":
+        return [-faceNormal[0], -faceNormal[1], -faceNormal[2]];
+      case "down":
+      case "-y":
+      case "y-":
+      default:
+        return [0, -1, 0];
+    }
+  }
+
+  /** Build a real Mate from an AI command by pairing the facing faces of two
+   *  components (cylinders for concentric, closest anti-parallel planes otherwise). */
+  private createMateFromAi(params: Record<string, unknown>): boolean {
+    const components = this.doc.components;
+    if (components.length < 2) return false;
+    const requested = String(params.type ?? "coincident");
+    const type: Mate["type"] = requested === "concentric" || requested === "distance" ? requested : "coincident";
+    const wantedA = String(params.componentA ?? "");
+    const wantedB = String(params.componentB ?? "");
+    const a = components.find((c) => c.id === wantedA || c.name === wantedA) ?? components[0];
+    const b =
+      components.find((c) => (c.id === wantedB || c.name === wantedB) && c.id !== a.id) ??
+      components.find((c) => c.id !== a.id);
+    if (!a || !b) return false;
+    const meshA = this.meshForPart(a.partId);
+    const meshB = this.meshForPart(b.partId);
+    if (!meshA || !meshB) return false;
+    type FaceEntry = { face: MeshData["faces"][number]; point: THREE.Vector3; normal: THREE.Vector3; axis: THREE.Vector3 };
+    const matrixA = componentMatrix(a.position, a.rotation);
+    const matrixB = componentMatrix(b.position, b.rotation);
+    const worldEntry = (mesh: MeshData, matrix: THREE.Matrix4, face: MeshData["faces"][number]): FaceEntry => ({
+      face,
+      point: new THREE.Vector3(...face.point).applyMatrix4(matrix),
+      normal: new THREE.Vector3(...face.normal).transformDirection(matrix).normalize(),
+      axis: new THREE.Vector3(...(face.axis ?? face.normal)).transformDirection(matrix).normalize(),
+    });
+    let bestA: FaceEntry | null = null;
+    let bestB: FaceEntry | null = null;
+    let bestScore = Infinity;
+    if (type === "concentric") {
+      for (const fa of meshA.faces.filter((f) => f.surface === "cylinder")) {
+        for (const fb of meshB.faces.filter((f) => f.surface === "cylinder")) {
+          const wa = worldEntry(meshA, matrixA, fa);
+          const wb = worldEntry(meshB, matrixB, fb);
+          const delta = wb.point.clone().sub(wa.point);
+          const radial = delta.clone().sub(wa.axis.clone().multiplyScalar(delta.dot(wa.axis))).length();
+          const score = radial + (1 - Math.abs(wa.axis.dot(wb.axis))) * 100;
+          if (score < bestScore) {
+            bestScore = score;
+            bestA = wa;
+            bestB = wb;
+          }
+        }
+      }
+    }
+    if (!bestA || !bestB) {
+      bestScore = Infinity;
+      for (const fa of meshA.faces.filter((f) => f.surface === "plane")) {
+        for (const fb of meshB.faces.filter((f) => f.surface === "plane")) {
+          const wa = worldEntry(meshA, matrixA, fa);
+          const wb = worldEntry(meshB, matrixB, fb);
+          // Closest pair whose normals face each other.
+          const score = wa.point.distanceTo(wb.point) + 12 * (1 + wa.normal.dot(wb.normal));
+          if (score < bestScore) {
+            bestScore = score;
+            bestA = wa;
+            bestB = wb;
+          }
+        }
+      }
+    }
+    if (!bestA || !bestB) return false;
+    const label = type === "concentric" ? "Concentric" : type === "distance" ? "Distance" : "Coincident";
+    let suffix = 1;
+    while (this.doc.mates.some((m) => m.name === `${label}${suffix}`)) suffix++;
+    const mate: Mate = {
+      id: uid("mate"),
+      type,
+      name: `${label}${suffix}`,
+      a: faceRefFromPick(a, bestA.face.index, bestA.face.surface, bestA.face.point, bestA.face.normal, bestA.face.axis, bestA.face.radius),
+      b: faceRefFromPick(b, bestB.face.index, bestB.face.surface, bestB.face.point, bestB.face.normal, bestB.face.axis, bestB.face.radius),
+      distance: type === "distance" ? Math.max(0, Number(params.distance) || 0) : undefined,
+    };
+    this.doc.mates.push(mate);
+    this.selection = { kind: "mate", id: mate.id };
+    if (this.doc.mode !== "assembly") {
+      this.doc.mode = "assembly";
+      this.shell.setMode("assembly");
+      this.shell.setCommandTab("assembly");
+      this.shell.setDocument(this.doc);
+    }
+    const report = solveMates(this.doc);
+    if (report.errors) toast(`${report.errors} mate(s) could not be resolved.`, "warn");
+    return true;
   }
 
   private cancelCommand(): void {

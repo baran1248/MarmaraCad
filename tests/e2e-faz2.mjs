@@ -91,6 +91,45 @@ try {
     { excerpt: drawing.text.replace(/\s+/g, " ").slice(0, 260) },
   );
 
+  // The width dimension must stay below the front view outline: the fit
+  // transform flips Y, so the old p1.y + 32 landed inside tall parts.
+  const dimLayout = await page.evaluate(() => {
+    const svg = document.querySelector(".drawing-preview svg");
+    if (!svg) return null;
+    const paths = [...svg.querySelectorAll("path")].filter((p) => !p.closest("defs"));
+    const front = paths[0]?.getBBox();
+    const lines = [...svg.querySelectorAll("line")];
+    const horizontal = lines.find((l) => {
+      const a = l.getAttribute("marker-start");
+      return a && Math.abs(Number(l.getAttribute("y1")) - Number(l.getAttribute("y2"))) < 0.01;
+    });
+    const vertical = lines.find((l) => {
+      const a = l.getAttribute("marker-start");
+      return a && Math.abs(Number(l.getAttribute("x1")) - Number(l.getAttribute("x2"))) < 0.01;
+    });
+    if (!front || !horizontal || !vertical) return null;
+    const bottom = front.y + front.height;
+    const right = front.x + front.width;
+    return {
+      front: { x: front.x, y: front.y, width: front.width, height: front.height },
+      widthDimY: Number(horizontal.getAttribute("y1")),
+      widthGap: Number(horizontal.getAttribute("y1")) - bottom,
+      heightDimX: Number(vertical.getAttribute("x1")),
+      heightGap: Number(vertical.getAttribute("x1")) - right,
+      slotBottom: 96 + 300 - 28,
+    };
+  });
+  record(
+    "Width dimension sits just below the front view, not inside the part",
+    !!dimLayout && dimLayout.widthGap >= 0 && dimLayout.widthGap <= 30 && dimLayout.widthDimY <= dimLayout.slotBottom + 0.5,
+    dimLayout ?? {},
+  );
+  record(
+    "Height dimension sits outside the right edge of the front view",
+    !!dimLayout && dimLayout.heightGap >= 0 && dimLayout.heightGap <= 40,
+    dimLayout ? { heightGap: dimLayout.heightGap, heightDimX: dimLayout.heightDimX } : {},
+  );
+
   const tmpPdf = path.join(process.cwd(), "tests", ".tmp-drawing.pdf");
   const [download] = await Promise.all([
     page.waitForEvent("download", { timeout: 60000 }),
@@ -325,18 +364,57 @@ try {
     button: document.querySelector('[data-title-action="language"]')?.textContent,
     language: window.__marmaracad.doc().language,
     tab: document.querySelector('[data-cmd-tab="features"]')?.textContent,
+    assemblyTab: document.querySelector('[data-mode="assembly"]')?.textContent?.trim(),
+    analysisTab: document.querySelector('[data-mode="analysis"]')?.textContent?.trim(),
+    massTitle: document.querySelector("#mass-card .title span")?.textContent?.trim(),
   }));
+  await page.click('[data-menu="file"]');
+  await page.waitForSelector("#dropdown-layer .menu");
+  const trMenu = await page.evaluate(() => ({
+    items: [...document.querySelectorAll("#dropdown-layer .menu-item > span:not(.shortcut)")].map((el) => el.textContent?.trim() ?? ""),
+    text: document.querySelector("#dropdown-layer .menu")?.textContent ?? "",
+  }));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(100);
+
   await page.click('[data-title-action="language"]');
   await page.waitForTimeout(150);
   const en = await page.evaluate(() => ({
     button: document.querySelector('[data-title-action="language"]')?.textContent,
     language: window.__marmaracad.doc().language,
     tab: document.querySelector('[data-cmd-tab="features"]')?.textContent,
+    assemblyTab: document.querySelector('[data-mode="assembly"]')?.textContent?.trim(),
+    analysisTab: document.querySelector('[data-mode="analysis"]')?.textContent?.trim(),
+    massTitle: document.querySelector("#mass-card .title span")?.textContent?.trim(),
   }));
+  await page.click('[data-menu="file"]');
+  await page.waitForSelector("#dropdown-layer .menu");
+  const enMenu = await page.evaluate(() => ({
+    items: [...document.querySelectorAll("#dropdown-layer .menu-item > span:not(.shortcut)")].map((el) => el.textContent?.trim() ?? ""),
+    text: document.querySelector("#dropdown-layer .menu")?.textContent ?? "",
+  }));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(100);
   record(
     "TR/EN switch relabels the command manager and persists in the document",
     tr.button === "TR" && tr.language === "tr" && tr.tab !== en.tab && en.button === "EN" && en.language === "en",
     { tr, en },
+  );
+  record(
+    "TR/EN switch relabels the Assembly tab, mass card and dropdown menus",
+    tr.assemblyTab === "Montaj" &&
+      tr.massTitle === "Kütle Özellikleri" &&
+      tr.analysisTab === "Analiz" &&
+      trMenu.items.includes("Yeni Belge") &&
+      trMenu.items.includes("Şablondan Yeni…") &&
+      /İÇE AKTAR/.test(trMenu.text) &&
+      en.assemblyTab === "Assembly" &&
+      en.massTitle === "Mass Properties" &&
+      en.analysisTab === "Analysis" &&
+      enMenu.items.includes("New Document") &&
+      enMenu.items.includes("New from Template…") &&
+      /IMPORT/.test(enMenu.text),
+    { tr, trMenu: trMenu.items.slice(0, 6), en, enMenu: enMenu.items.slice(0, 6) },
   );
 
   // --- Space view selector + confirmation corner.

@@ -119,7 +119,10 @@ export function buildDrawingSvg(mesh: MeshData | undefined, info: DrawingInfo): 
     const p1 = f({ x: b.maxX, y: b.maxY });
     const width = Math.round(b.maxX - b.minX);
     const height = Math.round(b.maxY - b.minY);
-    const yDim = Math.min(slots[0].y + slots[0].h - 28, p1.y + 32);
+    // The fit transform flips screen Y, so p0 is the lower-left corner and p1
+    // the upper-right one. Place the width dimension 24 px BELOW the lower edge
+    // (not below p1, which is the top) and keep it inside the slot.
+    const yDim = Math.min(slots[0].y + slots[0].h - 28, p0.y + 24);
     dims += `<line x1="${p0.x}" y1="${yDim}" x2="${p1.x}" y2="${yDim}" stroke="#2f4d68" stroke-width="0.9" marker-start="url(#arrow)" marker-end="url(#arrow)"/>`;
     dims += `<text x="${(p0.x + p1.x) / 2}" y="${yDim - 5}" text-anchor="middle" font-size="10.5" fill="#2f4d68">${width}</text>`;
     dims += `<line x1="${p1.x + 28}" y1="${p0.y}" x2="${p1.x + 28}" y2="${p1.y}" stroke="#2f4d68" stroke-width="0.9" marker-start="url(#arrow)" marker-end="url(#arrow)"/>`;

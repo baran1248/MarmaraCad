@@ -109,6 +109,73 @@ const MENUS: Record<string, MenuEntry[]> = {
   ],
 };
 
+/** Turkish labels for the dropdown menus; openMenu() looks them up so the menu
+ *  always follows the current interface language. */
+const MENU_TR: Record<string, string> = {
+  // File
+  "New Document": "Yeni Belge",
+  "New from Template…": "Şablondan Yeni…",
+  "Open Project…": "Proje Aç…",
+  "Save Project": "Projeyi Kaydet",
+  "Save As…": "Farklı Kaydet…",
+  IMPORT: "İÇE AKTAR",
+  "STEP / IGES CAD…": "STEP / IGES CAD…",
+  "STL / OBJ Mesh…": "STL / OBJ Mesh…",
+  EXPORT: "DIŞA AKTAR",
+  "STEP (AP214)": "STEP (AP214)",
+  "STL (binary)": "STL (ikili)",
+  "Recent Documents…": "Son Belgeler…",
+  "Sample: Mounting Plate": "Örnek: Montaj Plakası",
+  // Edit
+  Undo: "Geri Al",
+  Redo: "Yinele",
+  Delete: "Sil",
+  "Rename…": "Yeniden Adlandır…",
+  "Select All": "Tümünü Seç",
+  // View
+  Front: "Ön",
+  Top: "Üst",
+  Right: "Sağ",
+  Isometric: "İzometrik",
+  "Zoom Fit": "Sığdır",
+  "Shaded with Edges": "Kenarlı Gölgeli",
+  Shaded: "Gölgeli",
+  Wireframe: "Tel Kafes",
+  "Toggle Origin Planes": "Orijin Düzlemlerini Aç/Kapat",
+  // Insert
+  "New Sketch": "Yeni Eskiz",
+  "Extruded Boss": "Ekstrüzyon",
+  "Extruded Cut": "Ekstrüzyon Kes",
+  Revolve: "Döndür",
+  Fillet: "Yuvarlat",
+  Chamfer: "Pah Kır",
+  Shell: "Kabuk",
+  Mirror: "Aynala",
+  "Linear Pattern": "Doğrusal Desen",
+  "Toolbox Bolt…": "Toolbox Cıvata…",
+  "Technical Drawing…": "Teknik Resim…",
+  "Section View…": "Kesit Görünümü…",
+  "Interference Detection…": "Girişim Denetimi…",
+  "Insert Component": "Bileşen Ekle",
+  Mate: "Eşleştir",
+  "New Static Study": "Yeni Statik Çalışma",
+  // Tools
+  "Mass Properties…": "Kütle Özellikleri…",
+  "Measure…": "Ölç…",
+  "Equations / Variables…": "Denklemler / Değişkenler…",
+  "Material Library…": "Malzeme Kütüphanesi…",
+  "Edit Material…": "Malzemeyi Düzenle…",
+  "Model Info…": "Model Bilgisi…",
+  "Display Settings": "Görünüm Ayarları",
+  "Clear Cached Kernel": "Önbellek Çekirdeğini Temizle",
+  "Clear Autosave": "Otomatik Kaydı Temizle",
+  // Help
+  "Quick Start": "Hızlı Başlangıç",
+  "Keyboard Shortcuts": "Klavye Kısayolları",
+  "About MarmaraCad": "MarmaraCad Hakkında",
+  "GitHub Repository": "GitHub Deposu",
+};
+
 export class Shell {
   readonly root: HTMLElement;
   readonly viewHost: HTMLElement;
@@ -176,6 +243,7 @@ export class Shell {
   private busy = false;
   private snapOn = true;
   private language: "en" | "tr" = "en";
+  private massRows: MassRow[] | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -406,16 +474,18 @@ export class Shell {
     const items = MENUS[name];
     if (!items) return;
     this.closeMenu();
+    const localize = (text: string | undefined): string =>
+      text && this.language === "tr" ? MENU_TR[text] ?? text : text ?? "";
     const rect = anchor.getBoundingClientRect();
     const menu = document.createElement("div");
     menu.className = "menu";
     menu.innerHTML = items
       .map((item) => {
         if (item.separator) return `<div class="menu-sep"></div>`;
-        if (item.heading) return `<div class="menu-label">${item.heading}</div>`;
+        if (item.heading) return `<div class="menu-label">${localize(item.heading)}</div>`;
         return `<div class="menu-item" data-menu-action="${item.action}">
           ${item.icon ? icon(item.icon) : ""}
-          <span>${item.label}</span>
+          <span>${localize(item.label)}</span>
           ${item.shortcut ? `<span class="shortcut">${item.shortcut}</span>` : ""}
         </div>`;
       })
@@ -451,7 +521,19 @@ export class Shell {
     this.modeTabs.querySelectorAll<HTMLElement>("[data-mode]").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.mode === mode);
     });
-    this.badgeEl.textContent = `${mode === "part" ? "Part" : mode === "assembly" ? "Assembly" : "Static Structural"} · mm`;
+    this.badgeEl.textContent = `${
+      mode === "part"
+        ? this.language === "tr"
+          ? "Parça"
+          : "Part"
+        : mode === "assembly"
+          ? this.language === "tr"
+            ? "Montaj"
+            : "Assembly"
+          : this.language === "tr"
+            ? "Statik Yapısal"
+            : "Static Structural"
+    } · mm`;
     if (this.activePanel === "display") this.renderDisplayPanel();
   }
 
@@ -750,6 +832,7 @@ export class Shell {
   applyLanguage(lang: "en" | "tr"): void {
     this.language = lang;
     this.setLanguageButton(lang);
+    this.closeMenu();
     const tr: Record<string, string> = {
       File: "Dosya",
       Edit: "Düzen",
@@ -758,6 +841,8 @@ export class Shell {
       Tools: "Araçlar",
       Help: "Yardım",
       Part: "Parça",
+      Assembly: "Montaj",
+      Analysis: "Analiz",
       "FeatureManager": "Özellik Yöneticisi",
       "PropertyManager": "Özellik Paneli",
       "Static Structural": "Statik Yapısal",
@@ -772,6 +857,8 @@ export class Shell {
       Tools: "Tools",
       Help: "Help",
       Part: "Part",
+      Assembly: "Assembly",
+      Analysis: "Analysis",
       "FeatureManager": "FeatureManager",
       "PropertyManager": "PropertyManager",
       "Static Structural": "Static Structural",
@@ -787,12 +874,26 @@ export class Shell {
     this.root.querySelector<HTMLElement>(".panel-tab[data-panel=property]")!.textContent = map["PropertyManager"] ?? "PropertyManager";
     const partTab = this.root.querySelector<HTMLElement>('[data-mode="part"]');
     if (partTab) partTab.innerHTML = `${icon("box")} ${map.Part ?? "Part"}`;
-    this.badgeEl.textContent = `${this.mode === "part" ? (map.Part ?? "Part") : this.mode === "assembly" ? "Assembly" : map["Static Structural"] ?? "Static Structural"} · mm`;
+    const assemblyTab = this.root.querySelector<HTMLElement>('[data-mode="assembly"]');
+    if (assemblyTab) assemblyTab.innerHTML = `${icon("boxes")} ${map.Assembly ?? "Assembly"}`;
+    const analysisTab = this.root.querySelector<HTMLElement>('[data-mode="analysis"]');
+    if (analysisTab) analysisTab.innerHTML = `${icon("activity")} ${map.Analysis ?? "Analysis"}`;
+    this.badgeEl.textContent = `${this.mode === "part" ? (map.Part ?? "Part") : this.mode === "assembly" ? (map.Assembly ?? "Assembly") : map["Static Structural"] ?? "Static Structural"} · mm`;
+    this.renderMassCard();
     hydrateIcons();
   }
 
   setMassRows(rows: MassRow[]): void {
-    this.massCard.innerHTML = `<div class="title"><span>Mass Properties</span><span>${icon("gauge")}</span></div><div class="mass-grid">${rows
+    this.massRows = rows;
+    this.renderMassCard();
+  }
+
+  /** Repaint the mass card in the current language (also called when the
+   *  language changes, so the card title follows immediately). */
+  private renderMassCard(): void {
+    if (!this.massRows) return;
+    const title = this.language === "tr" ? "Kütle Özellikleri" : "Mass Properties";
+    this.massCard.innerHTML = `<div class="title"><span>${title}</span><span>${icon("gauge")}</span></div><div class="mass-grid">${this.massRows
       .map((r) => `<span>${r.label}</span><span>${r.value}</span>`)
       .join("")}</div>`;
     hydrateIcons();
