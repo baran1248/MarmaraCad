@@ -839,7 +839,7 @@ export class App {
     // it behaves the same on the WebGL2 and WebGPU backends. Picking is disabled
     // while the cut is active, so rebuilding the topology here is safe.
     const cut = this.sectionState;
-    const sectionActive = cut.enabled && this.doc.mode !== "analysis";
+    const sectionActive = cut.enabled && this.doc.mode !== "analysis" && !this.editor?.isActive;
     const cutMesh = (mesh: MeshData): MeshData =>
       sectionActive ? sectionMesh(mesh, { enabled: true, axis: cut.axis, offset: cut.offset, flipped: cut.flipped }) : mesh;
     if (this.doc.mode === "assembly") {
@@ -3387,7 +3387,17 @@ export class App {
       this.refreshTree();
     }
     if (this.command) this.cancelCommand();
+    // Seed from a Ctrl+click multi-selection: two faces on different components
+    // open the panel with both picks ready (SolidWorks' "Mate" with a preselection).
     const picks: FacePick[] = [];
+    if (!existing) {
+      for (const face of this.selFaces) {
+        if (!face.componentId) continue;
+        if (picks.some((p) => p.componentId === face.componentId)) continue;
+        picks.push(face);
+        if (picks.length === 2) break;
+      }
+    }
     if (existing) {
       const a = this.doc.components.find((c) => c.id === existing.a.componentId);
       const b = this.doc.components.find((c) => c.id === existing.b.componentId);
@@ -3785,33 +3795,33 @@ export class App {
     const study = this.activeStudy();
     if (!study) return;
     if (this.command) this.cancelCommand();
-    this.command = {
-      kind: "support-pick",
-      onFace: (pick) => {
-        if (pick.partId !== study.partId) {
-          toast("Pick a face on the study part.", "warn");
-          return;
-        }
-        if (study.supports.some((s) => s.faceIndex === pick.faceIndex)) {
-          toast("This face already has a fixed support.", "info");
-          return;
-        }
-        const before = this.capture();
-        study.supports.push({
-          id: uid("sup"),
-          faceIndex: pick.faceIndex,
-          face: { faceIndex: pick.faceIndex, surface: pick.face.surface, point: pick.face.point, normal: pick.face.normal },
-        });
-        this.invalidateStudy(study);
-        this.commit(before);
-        this.refreshTree();
-        this.refreshScene();
-        this.refreshPickLists(study);
-        this.shell.setStatus(`Fixed support added · face ${pick.faceIndex + 1}`);
-      },
+    const addSupport = (pick: FacePick) => {
+      if (pick.partId !== study.partId) {
+        toast("Pick a face on the study part.", "warn");
+        return;
+      }
+      if (study.supports.some((s) => s.faceIndex === pick.faceIndex)) {
+        toast("This face already has a fixed support.", "info");
+        return;
+      }
+      const before = this.capture();
+      study.supports.push({
+        id: uid("sup"),
+        faceIndex: pick.faceIndex,
+        face: { faceIndex: pick.faceIndex, surface: pick.face.surface, point: pick.face.point, normal: pick.face.normal },
+      });
+      this.invalidateStudy(study);
+      this.commit(before);
+      this.refreshTree();
+      this.refreshScene();
+      this.refreshPickLists(study);
+      this.shell.setStatus(`Fixed support added · face ${pick.faceIndex + 1}`);
     };
+    this.command = { kind: "support-pick", onFace: addSupport };
     this.viewport.setPickFilter("face");
     this.viewport.setSelectedFaces([]);
+    // A Ctrl+click face selection made before the command becomes the support set.
+    for (const pick of this.selFaces.filter((f) => f.partId === study.partId)) addSupport(pick);
     this.shell.setHint("Click faces to add fixed supports. Press Esc or Done when finished.");
     this.showPanel({
       icon: "anchor",

@@ -71,6 +71,17 @@ export function sketchStatus(sketch: Sketch, solved: boolean, conflict: boolean)
       detail: conflict ? "Conflicting or redundant relations — remove the yellow/red one." : "The solver could not satisfy every relation.",
     };
   }
+  const redundant = redundantConstraints(sketch);
+  if (redundant) {
+    return {
+      state: "over",
+      dof,
+      freePoints,
+      equations,
+      label: "Over defined",
+      detail: `${redundant} — delete the duplicate dimension or relation.`,
+    };
+  }
   if (dof === 0) {
     return { state: "full", dof: 0, freePoints, equations, label: "Fully defined", detail: "All geometry is located by dimensions and relations." };
   }
@@ -83,6 +94,25 @@ export function sketchStatus(sketch: Sketch, solved: boolean, conflict: boolean)
     label: "Under defined",
     detail: `${dof} ${plural} of freedom — add dimensions or relations (blue geometry).`,
   };
+}
+
+/** A driving dimension applied twice to the same target, or a duplicate
+ *  horizontal/vertical/equal relation, is redundant: SolidWorks flags that as
+ *  over-defined even when the solver can still converge. */
+function redundantConstraints(sketch: Sketch): string | null {
+  const seen = new Set<string>();
+  for (const c of sketch.constraints) {
+    let key: string | null = null;
+    if (c.type === "distance" || c.type === "radius" || c.type === "angle") {
+      key = `dim:${c.entity ?? `${c.a ?? ""}|${c.b ?? ""}`}`;
+    } else if (c.type === "horizontal" || c.type === "vertical" || c.type === "equal" || c.type === "fix") {
+      key = `${c.type}:${c.entity ?? c.a ?? ""}`;
+    }
+    if (!key) continue;
+    if (seen.has(key)) return "Repeated dimension or relation";
+    seen.add(key);
+  }
+  return null;
 }
 
 export const SKETCH_COLORS = {

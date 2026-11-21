@@ -137,6 +137,9 @@ Live: https://baran1248.github.io/MarmaraCad/
       selection, pick filters (`e2e-multiselect.mjs`)
 - [x] Playwright end-to-end: dynamic input `100` + `Tab` + `0` + `Enter` → exact 100 mm line with
       driving dimensions; typed rectangle 40 × 25 and R12 circle (`e2e-dynamic-input.mjs`)
+- [x] Playwright end-to-end: For Construction, Trim between intersections, Offset Entities and
+      Convert Entities, plus the under/full/over-defined colours and status text
+      (`e2e-sketch-utils.mjs`)
 - [x] Playwright end-to-end: midpoint/endpoint/origin snap markers, alignment guides, inferred
       horizontal/vertical/perpendicular relations, clickable badge deletion, snap toggle
       (`e2e-snap.mjs`)
@@ -160,6 +163,11 @@ Live: https://baran1248.github.io/MarmaraCad/
     `distance` and `angle` constraints; typed rectangle 40 × 25 and Ø24 circle (R12) match exactly.
   - Snaps: `△ Midpoint`, `□ Endpoint`, `⊕ Origin`; two dashed alignment guides while tracking; a
     line started on a snapped midpoint shares that point and infers `vertical` + `perpendicular`.
+  - Sketch utilities: construction toggle flips one entity only (blue `Under defined · 2 DOF` →
+    black `Fully defined · 0 DOF` after fixing every point → amber `Over defined` when a second
+    driving dimension lands on the same edge); Trim splits a crossing line into 10 mm + 10 mm;
+    Offset Entities duplicates the 6-line selection at 3 mm (x = 3 / 17 / 37 appear); Convert
+    Entities projects a 40 mm 3D edge into the sketch.
   - Box + Lid template: shelled box 15,552 mm³, lid 8,448 mm³, lid at y = 30 mm, no interference,
     assembly mass 0.1889 kg from AISI 1020 (7,850 kg/m³).
   - Drawing: 5 paths / 6 lines / 19 texts, views FRONT/TOP/RIGHT/ISOMETRIC, title block carries

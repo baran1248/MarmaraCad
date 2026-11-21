@@ -465,6 +465,9 @@ export class SketchEditor {
     }
 
     // Definition colour: under-defined blue, fully defined black, over-defined amber/red.
+    // Recompute the status first so the geometry colour matches the status text
+    // in the same frame (a constraint change previously lagged one render).
+    this.status = sketchStatus(this.sketch, this.solved, this.conflict);
     const state = this.status.state;
     const baseColor = state === "full" ? SKETCH_COLORS.full : state === "over" ? (this.conflict ? SKETCH_COLORS.overSevere : SKETCH_COLORS.over) : SKETCH_COLORS.under;
     for (const e of this.sketch.entities) {

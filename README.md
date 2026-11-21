@@ -45,7 +45,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 18 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 19 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -58,9 +58,10 @@ MARMARACAD_URL=https://baran1248.github.io/MarmaraCad/ npm run test:e2e
 
 The phase-2 suites cover Ctrl+click multi-selection into a bulk fillet, dynamic input
 (`100`, `Tab`, `0`, `Enter`), midpoint/endpoint/origin snaps and alignment guides, window vs
-crossing selection, the Box + Lid template (shell volume, placement, zero interference, mass),
-technical drawing + PDF, Section View, rollback, Toolbox, TR/EN, the view selector, the `?` guide,
-and the Gemini assistant with a mocked API.
+crossing selection, construction/trim/offset/convert plus sketch definition colours, the Box + Lid
+template (shell volume, placement, zero interference, mass), technical drawing + PDF, Section View,
+rollback, Toolbox, TR/EN, the view selector, the `?` guide, and the Gemini assistant with a mocked
+API.
 
 CI runs `npm test` and `npm run build` on every push to `main`, then publishes `dist` to GitHub
 Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow` scope
