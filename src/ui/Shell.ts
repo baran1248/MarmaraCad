@@ -26,6 +26,7 @@ interface MenuEntry {
 const MENUS: Record<string, MenuEntry[]> = {
   file: [
     { label: "New Document", action: "new-document", icon: "file-plus-2", shortcut: "Ctrl+N" },
+    { label: "New from Template…", action: "templates", icon: "layout-grid" },
     { label: "Open Project…", action: "open-project", icon: "folder-open", shortcut: "Ctrl+O" },
     { label: "Save Project", action: "save", icon: "save", shortcut: "Ctrl+S" },
     { label: "Save As…", action: "save-as", icon: "file-down" },
@@ -73,6 +74,14 @@ const MENUS: Record<string, MenuEntry[]> = {
     { label: "Revolve", action: "revolve", icon: "rotate-3d" },
     { label: "Fillet", action: "fillet", icon: "circle" },
     { label: "Chamfer", action: "chamfer", icon: "triangle" },
+    { label: "Shell", action: "shell", icon: "box" },
+    { label: "Mirror", action: "mirror", icon: "arrow-right-left" },
+    { label: "Linear Pattern", action: "linear-pattern", icon: "layout-grid" },
+    { separator: true },
+    { label: "Toolbox Bolt…", action: "toolbox-bolt", icon: "wrench" },
+    { label: "Technical Drawing…", action: "make-drawing", icon: "file-down" },
+    { label: "Section View…", action: "section-view", icon: "scan" },
+    { label: "Interference Detection…", action: "interference", icon: "boxes" },
     { separator: true },
     { label: "Insert Component", action: "insert-component", icon: "component" },
     { label: "Mate", action: "mate", icon: "link" },
@@ -81,7 +90,10 @@ const MENUS: Record<string, MenuEntry[]> = {
   ],
   tools: [
     { label: "Mass Properties…", action: "mass-props", icon: "gauge" },
+    { label: "Measure…", action: "measure", icon: "ruler" },
+    { label: "Equations / Variables…", action: "equations", icon: "equal" },
     { label: "Material Library…", action: "material-library", icon: "layers" },
+    { label: "Edit Material…", action: "edit-material", icon: "layers" },
     { label: "Model Info…", action: "model-info", icon: "info" },
     { separator: true },
     { label: "Display Settings", action: "display-settings", icon: "settings" },
@@ -124,6 +136,13 @@ export class Shell {
   onSnapStep: (step: number) => void = () => undefined;
   onMeshQuality: (q: number) => void = () => undefined;
   onDisplaySettingsChanged: () => void = () => undefined;
+  onPickFilter: (filter: string) => void = () => undefined;
+  onSnapToggle: (enabled: boolean) => void = () => undefined;
+  onAssistantToggle: () => void = () => undefined;
+  onLanguageToggle: () => void = () => undefined;
+  onShortcut: (action: string) => void = () => undefined;
+  onNavScheme: (scheme: "cad" | "legacy") => void = () => undefined;
+  onSnapSettings: (settings: Partial<Record<"endpoint" | "midpoint" | "center" | "origin" | "quadrant" | "intersection" | "perpendicular" | "tangent" | "grid", boolean>>) => void = () => undefined;
 
   private panelBody: HTMLElement;
   private docNameEl: HTMLElement;
@@ -134,6 +153,7 @@ export class Shell {
   private statusMsg: HTMLElement;
   private cursorItem: HTMLElement;
   private selectionItem: HTMLElement;
+  private sketchStateItem: HTMLElement;
   private kernelItem: HTMLElement;
   private kernelDot: HTMLElement;
   private badgeEl: HTMLElement;
@@ -141,12 +161,21 @@ export class Shell {
   private menuLayer: HTMLElement;
   private toolButtons: Record<string, HTMLElement> = {};
   private planesBtn: HTMLElement;
+  readonly aiPanelEl: HTMLElement;
+  readonly contextEl: HTMLElement;
+  readonly shortcutEl: HTMLElement;
+  readonly confirmationEl: HTMLElement;
+  readonly measureEl: HTMLElement;
+  private filterEl: HTMLElement;
+  private spaceSelectorEl: HTMLElement;
   private activePanel: PanelTab = "tree";
   private treeContext: TreeContext | null = null;
   private propertyHtml: string | null = null;
   private displayState = { style: "shaded-edges" as DisplayStyle, planes: false, snapStep: 1, quality: 0.12 };
   private mode: WorkspaceMode = "part";
   private busy = false;
+  private snapOn = true;
+  private language: "en" | "tr" = "en";
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -164,6 +193,9 @@ export class Shell {
           </nav>
           <div class="doc-title"><span class="doc-name">Untitled</span><span class="doc-sub">Part</span></div>
           <div class="title-actions">
+            <button class="ai-launch" data-title-action="ai" title="Gemini AI assistant">${icon("sparkles")} AI</button>
+            <button class="lang-btn" data-title-action="language" title="Switch language (TR/EN)">EN</button>
+            <span class="title-sep"></span>
             <button class="icon-btn" data-title-action="undo" title="Undo (Ctrl+Z)">${icon("undo-2")}</button>
             <button class="icon-btn" data-title-action="redo" title="Redo (Ctrl+Y)">${icon("redo-2")}</button>
             <span class="title-sep"></span>
@@ -208,6 +240,32 @@ export class Shell {
               <button class="view-tool-btn" data-planes="toggle" title="Show origin planes">${icon("frame")}</button>
             </div>
             <div class="viewcube" id="viewcube"></div>
+            <div class="selection-filters" id="selection-filters">
+              <span class="sf-label">Select</span>
+              <button class="sel-filter active" data-pick-filter="all" title="Select faces, edges and vertices">All</button>
+              <button class="sel-filter" data-pick-filter="face" title="Faces only">Faces</button>
+              <button class="sel-filter" data-pick-filter="edge" title="Edges only">Edges</button>
+              <button class="sel-filter" data-pick-filter="vertex" title="Vertices only">Vertices</button>
+              <span class="sf-sep"></span>
+              <button class="sel-filter snap-toggle active" id="snap-toggle" title="Object snap on/off (sketch)">${icon("magnet")} Snap</button>
+            </div>
+            <div class="confirmation-corner" id="confirmation-corner"></div>
+            <div class="space-selector" id="space-selector">
+              <div class="ss-title">View Selector <span>Space</span></div>
+              <div class="ss-cube">
+                <button data-ss-view="top" class="ss-face top">TOP</button>
+                <button data-ss-view="front" class="ss-face front">FRONT</button>
+                <button data-ss-view="right" class="ss-face right">RIGHT</button>
+                <button data-ss-view="back" class="ss-face back">BACK</button>
+                <button data-ss-view="left" class="ss-face left">LEFT</button>
+                <button data-ss-view="bottom" class="ss-face bottom">BOTTOM</button>
+              </div>
+              <button class="ss-iso" data-ss-view="iso">Isometric</button>
+            </div>
+            <div class="shortcut-bar" id="shortcut-bar"></div>
+            <div class="measure-readout" id="measure-readout"></div>
+            <div class="ai-panel" id="ai-panel"></div>
+            <div class="viewport-context" id="viewport-context"></div>
             <div class="selection-hint" id="selection-hint"></div>
             <div class="colorbar" id="colorbar"></div>
             <div class="result-toolbar" id="result-toolbar"></div>
@@ -235,6 +293,10 @@ export class Shell {
     this.statusMsg = this.getId("status-msg");
     this.cursorItem = this.getId("status-cursor");
     this.selectionItem = this.getId("status-selection");
+    this.sketchStateItem = document.createElement("div");
+    this.sketchStateItem.className = "status-item sketch-state";
+    this.sketchStateItem.style.display = "none";
+    this.statusMsg.parentElement?.insertBefore(this.sketchStateItem, this.selectionItem);
     this.kernelItem = this.getId("status-kernel");
     this.kernelDot = this.getId("status-dot");
     this.badgeEl = this.getId("view-badge");
@@ -243,6 +305,13 @@ export class Shell {
     this.planesBtn = root.querySelector('[data-planes="toggle"]')!;
     this.colorbarEl = this.getId("colorbar");
     this.resultToolbarEl = this.getId("result-toolbar");
+    this.aiPanelEl = this.getId("ai-panel");
+    this.contextEl = this.getId("viewport-context");
+    this.shortcutEl = this.getId("shortcut-bar");
+    this.confirmationEl = this.getId("confirmation-corner");
+    this.measureEl = this.getId("measure-readout");
+    this.filterEl = this.getId("selection-filters");
+    this.spaceSelectorEl = this.getId("space-selector");
 
     this.commandManager = new CommandManager(
       root.querySelector(".cmd-tabs") as HTMLElement,
@@ -291,6 +360,26 @@ export class Shell {
         if (action === "undo") this.onUndo();
         else if (action === "redo") this.onRedo();
         else if (action === "save") this.onSave();
+        else if (action === "ai") this.onAssistantToggle();
+        else if (action === "language") this.onLanguageToggle();
+      });
+    });
+    this.filterEl.querySelectorAll<HTMLElement>("[data-pick-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.setPickFilter(btn.dataset.pickFilter ?? "all");
+        this.onPickFilter(btn.dataset.pickFilter ?? "all");
+      });
+    });
+    this.getId("snap-toggle").addEventListener("click", () => {
+      this.snapOn = !this.snapOn;
+      this.getId("snap-toggle").classList.toggle("active", this.snapOn);
+      this.onSnapToggle(this.snapOn);
+    });
+    this.spaceSelectorEl.querySelectorAll<HTMLElement>("[data-ss-view]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const name = btn.dataset.ssView;
+        this.spaceSelectorEl.classList.remove("visible");
+        if (name) this.onView(name as ViewName);
       });
     });
     this.root.querySelectorAll<HTMLElement>(".view-tools [data-view]").forEach((btn) => {
@@ -475,6 +564,15 @@ export class Shell {
                 <option value="0.3" ${d.quality === 0.3 ? "selected" : ""}>Coarse (fast)</option>
               </select>
             </div>
+            <div class="field"><label>Mouse scheme</label>
+              <select id="display-nav">
+                <option value="cad">SolidWorks / Fusion (MMB orbit, RMB pan)</option>
+                <option value="legacy">Legacy (LMB orbit)</option>
+              </select>
+            </div>
+            <label class="check-row"><input type="checkbox" id="display-snap-endpoint" checked /> Snap to endpoints, midpoints &amp; centres</label>
+            <label class="check-row"><input type="checkbox" id="display-snap-tangent" checked /> Perpendicular / tangent snaps</label>
+            <label class="check-row"><input type="checkbox" id="display-snap-grid" checked /> Grid &amp; alignment guides</label>
             <div class="hint">Higher quality increases triangle density and rebuild time.</div>
           </div>
         </div>
@@ -501,6 +599,25 @@ export class Shell {
       this.displayState.quality = Number((e.target as HTMLSelectElement).value);
       this.onMeshQuality(this.displayState.quality);
     });
+    this.panelBody.querySelector<HTMLSelectElement>("#display-nav")?.addEventListener("change", (e) => {
+      this.onNavScheme((e.target as HTMLSelectElement).value as "cad" | "legacy");
+    });
+    this.panelBody.querySelector<HTMLInputElement>("#display-snap-endpoint")?.addEventListener("change", (e) => {
+      this.onSnapSettings({
+        endpoint: (e.target as HTMLInputElement).checked,
+        midpoint: (e.target as HTMLInputElement).checked,
+        center: (e.target as HTMLInputElement).checked,
+        origin: (e.target as HTMLInputElement).checked,
+        quadrant: (e.target as HTMLInputElement).checked,
+        intersection: (e.target as HTMLInputElement).checked,
+      });
+    });
+    this.panelBody.querySelector<HTMLInputElement>("#display-snap-tangent")?.addEventListener("change", (e) => {
+      this.onSnapSettings({ perpendicular: (e.target as HTMLInputElement).checked, tangent: (e.target as HTMLInputElement).checked });
+    });
+    this.panelBody.querySelector<HTMLInputElement>("#display-snap-grid")?.addEventListener("change", (e) => {
+      this.onSnapSettings({ grid: (e.target as HTMLInputElement).checked });
+    });
   }
 
   setDisplayState(style: DisplayStyle, planes: boolean): void {
@@ -511,6 +628,167 @@ export class Shell {
     });
     this.planesBtn.classList.toggle("active", planes);
     if (this.activePanel === "display") this.renderDisplayPanel();
+  }
+
+  setPickFilter(filter: string): void {
+    this.filterEl.querySelectorAll<HTMLElement>("[data-pick-filter]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.pickFilter === filter);
+    });
+  }
+
+  setSnapOn(on: boolean): void {
+    this.snapOn = on;
+    this.getId("snap-toggle").classList.toggle("active", on);
+  }
+
+  toggleViewSelector(): boolean {
+    const visible = this.spaceSelectorEl.classList.toggle("visible");
+    return visible;
+  }
+
+  hideViewSelector(): void {
+    this.spaceSelectorEl.classList.remove("visible");
+  }
+
+  get viewSelectorOpen(): boolean {
+    return this.spaceSelectorEl.classList.contains("visible");
+  }
+
+  setSketchStatus(text: string | null, state: "under" | "full" | "over" | "empty" = "under"): void {
+    if (!text) {
+      this.sketchStateItem.style.display = "none";
+      this.sketchStateItem.textContent = "";
+      return;
+    }
+    this.sketchStateItem.style.display = "";
+    this.sketchStateItem.className = `status-item sketch-state ${state}`;
+    this.sketchStateItem.innerHTML = `<span class="state-dot"></span>${text}`;
+  }
+
+  showConfirmationCorner(onOk: () => void, onCancel: () => void): void {
+    this.confirmationEl.classList.add("visible");
+    this.confirmationEl.innerHTML = `
+      <button class="cc-btn ok" title="OK (Enter)">${icon("check")}</button>
+      <button class="cc-btn cancel" title="Cancel (Esc)">${icon("x")}</button>`;
+    hydrateIcons();
+    this.confirmationEl.querySelector(".cc-btn.ok")?.addEventListener("click", () => {
+      this.hideConfirmationCorner();
+      onOk();
+    });
+    this.confirmationEl.querySelector(".cc-btn.cancel")?.addEventListener("click", () => {
+      this.hideConfirmationCorner();
+      onCancel();
+    });
+  }
+
+  hideConfirmationCorner(): void {
+    this.confirmationEl.classList.remove("visible");
+    this.confirmationEl.innerHTML = "";
+  }
+
+  showShortcutBar(x: number, y: number, items: { action: string; label: string; icon: string }[]): void {
+    this.shortcutEl.innerHTML = items
+      .map((it) => `<button class="shortcut-btn" data-shortcut="${it.action}" title="${it.label}">${icon(it.icon)}<span>${it.label}</span></button>`)
+      .join("");
+    this.shortcutEl.classList.add("visible");
+    this.shortcutEl.style.left = `${Math.max(8, Math.min(x, window.innerWidth - 420))}px`;
+    this.shortcutEl.style.top = `${Math.max(90, Math.min(y, window.innerHeight - 280))}px`;
+    hydrateIcons();
+    this.shortcutEl.querySelectorAll<HTMLElement>("[data-shortcut]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.hideShortcutBar();
+        this.onShortcut(btn.dataset.shortcut ?? "");
+      });
+    });
+  }
+
+  hideShortcutBar(): void {
+    this.shortcutEl.classList.remove("visible");
+    this.shortcutEl.innerHTML = "";
+  }
+
+  showContextMenu(x: number, y: number, items: { label: string; icon?: string; run: () => void; danger?: boolean; disabled?: boolean }[]): void {
+    this.hideContextMenu();
+    this.contextEl.innerHTML = items
+      .map(
+        (it, i) =>
+          `<div class="ctx-item ${it.danger ? "danger" : ""} ${it.disabled ? "disabled" : ""}" data-ctx="${i}">${it.icon ? icon(it.icon) : ""}<span>${it.label}</span></div>`,
+      )
+      .join("");
+    this.contextEl.classList.add("visible");
+    this.contextEl.style.left = `${x}px`;
+    this.contextEl.style.top = `${y}px`;
+    hydrateIcons();
+    this.contextEl.querySelectorAll<HTMLElement>("[data-ctx]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const item = items[Number(el.dataset.ctx)];
+        this.hideContextMenu();
+        if (item && !item.disabled) item.run();
+      });
+    });
+    window.setTimeout(() => {
+      const close = (ev: MouseEvent) => {
+        if (!this.contextEl.contains(ev.target as Node)) {
+          this.hideContextMenu();
+          document.removeEventListener("pointerdown", close, true);
+        }
+      };
+      document.addEventListener("pointerdown", close, true);
+    }, 0);
+  }
+
+  hideContextMenu(): void {
+    this.contextEl.classList.remove("visible");
+    this.contextEl.innerHTML = "";
+  }
+
+  setLanguageButton(lang: "en" | "tr"): void {
+    const btn = this.root.querySelector<HTMLElement>('[data-title-action="language"]');
+    if (btn) btn.textContent = lang === "en" ? "EN" : "TR";
+  }
+
+  applyLanguage(lang: "en" | "tr"): void {
+    this.language = lang;
+    this.setLanguageButton(lang);
+    const tr: Record<string, string> = {
+      File: "Dosya",
+      Edit: "Düzen",
+      View: "Görünüm",
+      Insert: "Ekle",
+      Tools: "Araçlar",
+      Help: "Yardım",
+      Part: "Parça",
+      "FeatureManager": "Özellik Yöneticisi",
+      "PropertyManager": "Özellik Paneli",
+      "Static Structural": "Statik Yapısal",
+      "Mass Properties": "Kütle Özellikleri",
+      "Sections": "Kesitler",
+    };
+    const en: Record<string, string> = {
+      File: "File",
+      Edit: "Edit",
+      View: "View",
+      Insert: "Insert",
+      Tools: "Tools",
+      Help: "Help",
+      Part: "Part",
+      "FeatureManager": "FeatureManager",
+      "PropertyManager": "PropertyManager",
+      "Static Structural": "Static Structural",
+      "Mass Properties": "Mass Properties",
+    };
+    const map = lang === "tr" ? tr : en;
+    this.root.querySelectorAll<HTMLElement>("[data-menu]").forEach((button) => {
+      const key = button.dataset.menu ?? "";
+      const label = map[key.charAt(0).toUpperCase() + key.slice(1)];
+      if (label) button.textContent = label;
+    });
+    this.root.querySelector<HTMLElement>(".panel-tab[data-panel=tree]")!.textContent = map["FeatureManager"] ?? "FeatureManager";
+    this.root.querySelector<HTMLElement>(".panel-tab[data-panel=property]")!.textContent = map["PropertyManager"] ?? "PropertyManager";
+    const partTab = this.root.querySelector<HTMLElement>('[data-mode="part"]');
+    if (partTab) partTab.innerHTML = `${icon("box")} ${map.Part ?? "Part"}`;
+    this.badgeEl.textContent = `${this.mode === "part" ? (map.Part ?? "Part") : this.mode === "assembly" ? "Assembly" : map["Static Structural"] ?? "Static Structural"} · mm`;
+    hydrateIcons();
   }
 
   setMassRows(rows: MassRow[]): void {

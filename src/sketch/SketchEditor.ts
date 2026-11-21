@@ -4,8 +4,11 @@ import { dimensionLabel, planePoint, sampleArc, sampleCircle } from "./geometry"
 import { solveSketch } from "./solver";
 import { uid } from "../model/defaults";
 import type { Viewport } from "../viewport/Viewport";
+import { DEFAULT_SNAPS, alignmentGuides, bestSnap, snapSymbol, type SnapCandidate, type SnapSettings } from "./snap";
+import { SKETCH_COLORS, sketchStatus, type SketchStatus } from "./status";
+import { DynamicInput } from "./dynamicInput";
 
-export type SketchTool = "select" | "line" | "rectangle" | "circle" | "arc" | "dimension";
+export type SketchTool = "select" | "line" | "rectangle" | "circle" | "arc" | "dimension" | "trim" | "offset" | "convert";
 
 export interface SketchEditorCallbacks {
   onChange: (sketch: Sketch, committed: boolean) => void;
@@ -14,6 +17,10 @@ export interface SketchEditorCallbacks {
   onSelection: (points: number, entities: number) => void;
   onRequestDimensionEdit: (constraintId: string) => void;
   notify: (message: string, kind?: "info" | "warn" | "error") => void;
+  onStatus?: (status: SketchStatus) => void;
+  onSnap?: (snap: SnapCandidate | null) => void;
+  /** Resolve a 3D edge under the cursor into sketch-plane points (Convert Entities). */
+  onConvertPick?: (clientX: number, clientY: number) => Vec2[] | null;
 }
 
 interface SnapResult {
@@ -26,6 +33,8 @@ const BLUE = 0x1565c0;
 const PREVIEW = 0x4a90d9;
 const SELECT = 0xff9f1c;
 const HOVER = 0x2fa4e7;
+const RELATION = 0x1f8a4c;
+const GUIDE = 0x5fa8d6;
 
 export class SketchEditor {
   private viewport: Viewport;
@@ -33,12 +42,15 @@ export class SketchEditor {
   sketch: Sketch | null = null;
   tool: SketchTool = "select";
   snapStep = 1;
+  snaps: SnapSettings = { ...DEFAULT_SNAPS };
+  construction = false;
 
   private group = new THREE.Group();
   private previewGroup = new THREE.Group();
   private leaderGroup = new THREE.Group();
+  private guideGroup = new THREE.Group();
   private labelLayer: HTMLDivElement;
-  private labels = new Map<string, HTMLDivElement>();
+  private labels = new Map<string, HTMLElement>();
   private selectedPoints = new Set<string>();
   private selectedEntities = new Set<string>();
   private hoverPoint: string | null = null;
@@ -47,6 +59,14 @@ export class SketchEditor {
   private pending: { stage: number; points: Vec2[] } = { stage: 0, points: [] };
   private cursor: Vec2 | null = null;
   private enabled = false;
+  private snap: SnapCandidate | null = null;
+  private dynamic: DynamicInput;
+  private dynamicCommit = false;
+  private bandEl: HTMLDivElement;
+  private band: { x0: number; y0: number; x1: number; y1: number; additive: boolean; moved: boolean } | null = null;
+  private status: SketchStatus = { state: "empty", dof: 0, freePoints: 0, equations: 0, label: "Empty sketch", detail: "" };
+  private solved = true;
+  private conflict = false;
 
   constructor(viewport: Viewport, callbacks: SketchEditorCallbacks) {
     this.viewport = viewport;
@@ -54,11 +74,32 @@ export class SketchEditor {
     this.group.name = "sketch-overlay";
     this.previewGroup.name = "sketch-preview";
     this.leaderGroup.name = "sketch-leaders";
+    this.guideGroup.name = "sketch-guides";
     this.group.add(this.previewGroup);
     this.group.add(this.leaderGroup);
+    this.group.add(this.guideGroup);
     this.labelLayer = document.createElement("div");
     this.labelLayer.className = "sketch-labels";
     viewport.container.appendChild(this.labelLayer);
+    this.dynamic = new DynamicInput(viewport.container);
+    this.dynamic.setHandlers(
+      (values) => {
+        this.dynamicCommit = true;
+        this.applyDynamicInput(values);
+        this.dynamicCommit = false;
+      },
+      () => {
+        this.pending = { stage: 0, points: [] };
+        this.pendingPointId = null;
+        this.pendingSecondId = null;
+        this.stripPreview();
+        this.dynamic.hide();
+        this.render();
+      },
+    );
+    this.bandEl = document.createElement("div");
+    this.bandEl.className = "sketch-band";
+    document.body.appendChild(this.bandEl);
     this.labelLayer.addEventListener("dblclick", (e) => {
       const target = (e.target as HTMLElement).closest<HTMLElement>("[data-dimension]");
       if (target?.dataset.dimension) {
@@ -66,9 +107,17 @@ export class SketchEditor {
         this.callbacks.onRequestDimensionEdit(target.dataset.dimension);
       }
     });
+    // Clicking a relation badge removes that relation (SolidWorks behaviour).
+    this.labelLayer.addEventListener("click", (e) => {
+      const badge = (e.target as HTMLElement).closest<HTMLElement>("[data-relation]");
+      if (!badge?.dataset.relation) return;
+      e.stopPropagation();
+      this.removeConstraint(badge.dataset.relation);
+    });
     viewport.container.addEventListener("pointerdown", this.onPointerDown, true);
     viewport.container.addEventListener("pointermove", this.onPointerMove, true);
     viewport.container.addEventListener("pointerup", this.onPointerUp, true);
+    document.addEventListener("keydown", this.onKeyDown, true);
     this.viewport.onFrame = () => this.updateLabelPositions();
   }
 
@@ -84,6 +133,7 @@ export class SketchEditor {
     this.pending = { stage: 0, points: [] };
     this.hoverPoint = null;
     this.hoverEntity = null;
+    this.snap = null;
     this.tool = "select";
     this.viewport.scene.add(this.group);
     this.viewport.setSketchMode(sketch.plane);
@@ -98,6 +148,8 @@ export class SketchEditor {
     this.enabled = false;
     this.sketch = null;
     this.drag = null;
+    this.snap = null;
+    this.dynamic.hide();
     this.viewport.scene.remove(this.group);
     this.viewport.setSketchMode(null);
     this.labelLayer.classList.remove("visible");
@@ -105,7 +157,10 @@ export class SketchEditor {
     this.labels.clear();
     this.clearGroup(this.group);
     this.group.add(this.previewGroup);
+    this.group.add(this.leaderGroup);
+    this.group.add(this.guideGroup);
     this.callbacks.onCursor(null);
+    this.callbacks.onSnap?.(null);
   }
 
   setTool(tool: SketchTool): void {
@@ -113,13 +168,48 @@ export class SketchEditor {
     this.tool = tool;
     this.pending = { stage: 0, points: [] };
     this.hoverPoint = null;
+    this.dynamic.hide();
     this.stripPreview();
+    this.clearGuides();
     this.render();
     this.callbacks.onToolChange(tool);
   }
 
   setSnapStep(step: number): void {
     this.snapStep = Math.max(0.1, step);
+  }
+
+  setSnapSettings(settings: Partial<SnapSettings>): void {
+    this.snaps = { ...this.snaps, ...settings };
+  }
+
+  setConstructionMode(on: boolean): void {
+    this.construction = on;
+    if (!on) return;
+    // Turning the mode on also flags the current selection, matching the
+    // "For Construction" button in SolidWorks.
+    if (this.sketch && this.selectedEntities.size > 0) {
+      for (const e of this.sketch.entities) {
+        if (this.selectedEntities.has(e.id)) e.construction = true;
+      }
+      this.commit(false);
+      this.render();
+    }
+  }
+
+  toggleConstructionSelection(): boolean {
+    if (!this.sketch || this.selectedEntities.size === 0) return false;
+    const anySolid = this.sketch.entities.some((e) => this.selectedEntities.has(e.id) && !e.construction);
+    for (const e of this.sketch.entities) {
+      if (this.selectedEntities.has(e.id)) e.construction = anySolid;
+    }
+    this.commit(false);
+    this.render();
+    return true;
+  }
+
+  get definitionStatus(): SketchStatus {
+    return this.status;
   }
 
   private clearGroup(group: THREE.Group): void {
@@ -179,16 +269,90 @@ export class SketchEditor {
     }
   }
 
-  private addPolyline(pts: Vec2[], color: number, parent: THREE.Group = this.group, depthTest = false): void {
+  private addPolyline(pts: Vec2[], color: number, parent: THREE.Group = this.group, depthTest = false, dashed = false): void {
     if (pts.length < 2) return;
-    const verts = pts.map((p) => {
+    // Dashed construction geometry is emitted as short segments: Three's WebGPU
+    // backend has no LineDashedMaterial, so gaps are baked into the geometry.
+    const out: Vec2[] = [];
+    if (dashed) {
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i];
+        const b = pts[i + 1];
+        const len = Math.hypot(b.x - a.x, b.y - a.y);
+        const dash = Math.max(this.viewport.worldPerPixel() * 6, 1.2);
+        const n = Math.max(1, Math.round(len / (dash * 2)));
+        for (let k = 0; k < n; k++) {
+          const t0 = (k * 2) / (n * 2);
+          const t1 = Math.min(1, (k * 2 + 1) / (n * 2));
+          out.push({ x: a.x + (b.x - a.x) * t0, y: a.y + (b.y - a.y) * t0 });
+          out.push({ x: a.x + (b.x - a.x) * t1, y: a.y + (b.y - a.y) * t1 });
+        }
+      }
+    } else {
+      out.push(...pts);
+    }
+    const verts: THREE.Vector3[] = [];
+    if (dashed) {
+      for (let i = 0; i < out.length - 1; i += 2) {
+        const w0 = this.world(out[i]);
+        const w1 = this.world(out[i + 1]);
+        verts.push(new THREE.Vector3(...w0), new THREE.Vector3(...w1));
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(verts);
+      const line = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color, depthTest, transparent: depthTest }));
+      line.renderOrder = 31;
+      parent.add(line);
+      return;
+    }
+    verts.push(...out.map((p) => {
       const w = this.world(p);
       return new THREE.Vector3(w[0], w[1], w[2]);
-    });
+    }));
     const geo = new THREE.BufferGeometry().setFromPoints(verts);
     const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, depthTest, transparent: depthTest }));
     line.renderOrder = 31;
     parent.add(line);
+  }
+
+  private clearGuides(): void {
+    for (const child of [...this.guideGroup.children]) {
+      this.guideGroup.remove(child);
+      if (child instanceof THREE.Line || child instanceof THREE.LineSegments) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+    }
+  }
+
+  /** Dashed horizontal/vertical tracking lines from alignment points. */
+  private drawGuides(cursor: Vec2, guides: { axis: "h" | "v"; at: number; from: Vec2 }[]): void {
+    this.clearGuides();
+    for (const g of guides) {
+      if (g.axis === "h") {
+        this.addPolyline([{ x: g.from.x, y: g.at }, { x: cursor.x, y: g.at }], GUIDE, this.guideGroup, true, true);
+      } else {
+        this.addPolyline([{ x: g.at, y: g.from.y }, { x: g.at, y: cursor.y }], GUIDE, this.guideGroup, true, true);
+      }
+    }
+  }
+
+  /** Snap marker + label drawn in HTML so it stays crisp at any zoom. */
+  private renderSnapMarker(): void {
+    let marker = this.labelLayer.querySelector<HTMLElement>(".snap-marker");
+    if (!this.snap || this.snap.type === "grid" || this.dynamic.isDirty) {
+      marker?.remove();
+      return;
+    }
+    if (!marker) {
+      marker = document.createElement("div");
+      marker.className = "snap-marker";
+      this.labelLayer.appendChild(marker);
+    }
+    const world = this.world({ x: this.snap.x, y: this.snap.y });
+    const screen = this.viewport.projectToScreen(world);
+    marker.style.transform = `translate(-50%, -50%) translate(${screen.x}px, ${screen.y}px)`;
+    marker.innerHTML = `<span class="snap-symbol">${snapSymbol(this.snap.type)}</span><span class="snap-text">${this.snap.label}</span>`;
+    marker.style.display = screen.visible ? "" : "none";
   }
 
   private addPoints(points: { p: Vec2; id?: string; selected?: boolean; fixed?: boolean }[]): void {
@@ -279,7 +443,7 @@ export class SketchEditor {
 
   private render(): void {
     if (!this.sketch) return;
-    const keep = new Set<THREE.Object3D>([this.previewGroup, this.leaderGroup]);
+    const keep = new Set<THREE.Object3D>([this.previewGroup, this.leaderGroup, this.guideGroup]);
     for (const child of [...this.group.children]) {
       if (keep.has(child)) continue;
       this.group.remove(child);
@@ -300,13 +464,16 @@ export class SketchEditor {
       }
     }
 
-    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    // Definition colour: under-defined blue, fully defined black, over-defined amber/red.
+    const state = this.status.state;
+    const baseColor = state === "full" ? SKETCH_COLORS.full : state === "over" ? (this.conflict ? SKETCH_COLORS.overSevere : SKETCH_COLORS.over) : SKETCH_COLORS.under;
     for (const e of this.sketch.entities) {
       const pts = this.entitySample(e.id);
       if (!pts) continue;
       const selected = this.selectedEntities.has(e.id);
       const hovered = this.hoverEntity === e.id;
-      this.addPolyline(pts, selected ? SELECT : hovered ? HOVER : e.construction ? 0x8a97a3 : BLUE);
+      const color = selected ? SELECT : hovered ? HOVER : e.construction ? SKETCH_COLORS.construction : baseColor;
+      this.addPolyline(pts, color, this.group, false, e.construction);
     }
 
     this.addPoints(
@@ -320,22 +487,79 @@ export class SketchEditor {
 
     // Dimension leaders and labels.
     for (const c of this.sketch.constraints) {
-      if (c.type !== "distance" && c.type !== "radius") continue;
+      if (c.type !== "distance" && c.type !== "radius" && c.type !== "angle") continue;
       const label = dimensionLabel(this.sketch, c.id);
       if (!label) continue;
       const el = document.createElement("div");
       el.className = "sketch-dimension" + (this.selectedEntities.has(c.entity ?? "") ? " selected" : "");
       el.dataset.dimension = c.id;
-      el.textContent = label.text;
+      el.textContent = c.type === "angle" ? `${Number(c.value ?? 0).toFixed(1)}°` : label.text;
       el.title = "Double-click to edit";
       this.labelLayer.appendChild(el);
       this.labels.set(c.id, el);
-      this.drawDimensionLeader(c.id);
+      if (c.type !== "angle") this.drawDimensionLeader(c.id);
     }
-    void pm;
+
+    // Relation badges (green, clickable to delete).
+    for (const c of this.sketch.constraints) {
+      if (c.type !== "horizontal" && c.type !== "vertical" && c.type !== "perpendicular" && c.type !== "coincident") continue;
+      const anchor = this.constraintAnchor(c);
+      if (!anchor) continue;
+      const el = document.createElement("button");
+      el.className = "relation-badge";
+      el.dataset.relation = c.id;
+      el.title = `${c.type} relation — click to delete`;
+      el.textContent =
+        c.type === "horizontal" ? "H" : c.type === "vertical" ? "V" : c.type === "perpendicular" ? "⊥" : "●";
+      el.style.transform = `translate(-50%, -50%) translate(${anchor.screen.x}px, ${anchor.screen.y}px)`;
+      el.style.display = anchor.screen.visible ? "" : "none";
+      this.labelLayer.appendChild(el);
+      this.labels.set(`rel:${c.id}`, el);
+    }
+
     this.renderPreview();
     this.updateLabelPositions();
     this.emitSelection();
+    this.reportStatus();
+  }
+
+  /** Screen anchor for a relation badge. */
+  private constraintAnchor(c: SketchConstraint): { screen: { x: number; y: number; visible: boolean } } | null {
+    if (!this.sketch) return null;
+    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    let anchor: Vec2 | null = null;
+    if (c.type === "coincident" && c.a) {
+      const p = pm.get(c.a);
+      if (p) anchor = { x: p.x, y: p.y };
+    } else if (c.entity) {
+      const e = this.sketch.entities.find((q) => q.id === c.entity);
+      if (e?.kind === "line") {
+        const a = pm.get(e.p1);
+        const b = pm.get(e.p2);
+        if (a && b) anchor = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      }
+    } else if (c.a && c.b) {
+      const a = pm.get(c.a);
+      const b = pm.get(c.b);
+      if (a && b) anchor = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    }
+    if (!anchor) return null;
+    const world = this.world(anchor);
+    const screen = this.viewport.projectToScreen(world);
+    // Offset the badge off the entity so it never covers a dimension label.
+    if (c.type === "horizontal") screen.y -= 14;
+    else if (c.type === "vertical") screen.x += 14;
+    else {
+      screen.x += 11;
+      screen.y -= 11;
+    }
+    return { screen };
+  }
+
+  private reportStatus(): void {
+    if (!this.sketch) return;
+    this.status = sketchStatus(this.sketch, this.solved, this.conflict);
+    this.callbacks.onStatus?.(this.status);
   }
 
   private drawDimensionLeader(id: string): void {
@@ -481,18 +705,16 @@ export class SketchEditor {
     return p ? { x: p[0], y: p[1] } : null;
   }
 
-  private snap(p: Vec2, exclude?: string): SnapResult {
-    if (!this.sketch) return { ...p };
-    const tol = this.viewport.worldPerPixel() * 9;
-    let best: { id: string; d: number; x: number; y: number } | null = null;
-    for (const q of this.sketch.points) {
-      if (q.id === exclude) continue;
-      const d = Math.hypot(q.x - p.x, q.y - p.y);
-      if (d < tol && (!best || d < best.d)) best = { id: q.id, d, x: q.x, y: q.y };
-    }
-    if (best) return { x: best.x, y: best.y, pointId: best.id };
-    const step = this.snapStep;
-    return { x: Math.round(p.x / step) * step, y: Math.round(p.y / step) * step };
+  private snapCandidate(p: Vec2, exclude?: string): SnapCandidate {
+    if (!this.sketch) return { x: p.x, y: p.y, type: "grid", label: "Grid" };
+    const tol = this.viewport.worldPerPixel() * 12;
+    const current = this.pending.stage === 1 ? this.pending.points[0] : undefined;
+    return bestSnap(this.sketch, p, tol, this.snaps, this.snapStep, { currentPoint: current, excludePoint: exclude });
+  }
+
+  private resolveSnap(p: Vec2, exclude?: string): SnapResult {
+    const c = this.snapCandidate(p, exclude);
+    return { x: c.x, y: c.y, pointId: c.pointId };
   }
 
   private ensurePoint(p: Vec2, existingId?: string): string {
@@ -570,12 +792,18 @@ export class SketchEditor {
 
   private onPointerDown = (e: PointerEvent): void => {
     if (!this.enabled || !this.sketch || e.button !== 0) return;
+    // Labels and relation badges are interactive HTML overlays; do not treat
+    // clicks on them as sketch picks (otherwise the label is re-rendered
+    // before its double-click handler can run).
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".sketch-labels, .dyn-input")) return;
     const raw = this.eventPoint(e);
     if (!raw) return;
     e.stopPropagation();
     e.preventDefault();
-    const snap = this.snap(raw);
+    const snap = this.resolveSnap(raw);
     const p = { x: snap.x, y: snap.y };
+    this.cursor = p;
 
     if (this.tool === "select") {
       const pointId = this.hitPoint(raw);
@@ -605,6 +833,14 @@ export class SketchEditor {
         this.selectedPoints.clear();
         this.selectedEntities.clear();
       }
+      // Empty area: start a window (left→right) / crossing (right→left) band.
+      this.band = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY, additive: e.shiftKey, moved: false };
+      this.bandEl.style.display = "block";
+      this.bandEl.style.left = `${e.clientX}px`;
+      this.bandEl.style.top = `${e.clientY}px`;
+      this.bandEl.style.width = "0px";
+      this.bandEl.style.height = "0px";
+      this.bandEl.classList.remove("crossing");
       this.render();
       return;
     }
@@ -640,35 +876,13 @@ export class SketchEditor {
     if (this.tool === "line") {
       if (this.pending.stage === 0) {
         this.pending = { stage: 1, points: [p] };
-        this.pending.points[0] = p;
         this.pendingPointId = snap.pointId ?? null;
       } else {
         const start = this.pending.points[0];
         if (Math.hypot(p.x - start.x, p.y - start.y) < this.viewport.worldPerPixel() * 3) return;
-        let end = p;
-        let infer: "horizontal" | "vertical" | null = null;
-        const dx = Math.abs(p.x - start.x);
-        const dy = Math.abs(p.y - start.y);
-        const tol = Math.max(0.6, this.viewport.worldPerPixel() * 12);
-        if (dy < tol) {
-          end = { x: p.x, y: start.y };
-          infer = "horizontal";
-        } else if (dx < tol) {
-          end = { x: start.x, y: p.y };
-          infer = "vertical";
-        }
-        const endId = this.ensurePoint(end, snap.pointId ?? undefined);
-        const startId = this.ensurePoint(start, this.pendingPointId ?? undefined);
-        const id = uid("ln");
-        this.sketch.entities.push({ id, kind: "line", p1: startId, p2: endId });
-        if (infer) {
-          this.sketch.constraints.push({ id: uid("c"), type: infer, entity: id });
-        }
-        this.commit(false);
-        const solved = this.sketch.points.find((q) => q.id === endId);
-        this.pending = { stage: 1, points: [solved ? { x: solved.x, y: solved.y } : end] };
-        this.pendingPointId = endId;
+        this.finishLine(start, p, this.pendingPointId ?? undefined, snap.pointId ?? undefined, "pointer");
       }
+      this.updateDynamicInput(e);
       this.render();
       return;
     }
@@ -677,6 +891,7 @@ export class SketchEditor {
       if (this.pending.stage === 0) {
         this.pending = { stage: 1, points: [p] };
         this.pendingPointId = snap.pointId ?? null;
+        this.updateDynamicInput(e);
         this.render();
         return;
       }
@@ -684,6 +899,7 @@ export class SketchEditor {
       this.pending = { stage: 0, points: [] };
       this.pendingPointId = null;
       this.commit(false);
+      this.updateDynamicInput(e);
       this.render();
       return;
     }
@@ -692,6 +908,7 @@ export class SketchEditor {
       if (this.pending.stage === 0) {
         this.pending = { stage: 1, points: [p] };
         this.pendingPointId = snap.pointId ?? null;
+        this.updateDynamicInput(e);
         this.render();
         return;
       }
@@ -700,11 +917,12 @@ export class SketchEditor {
       if (radius < 0.05) return;
       const centerId = this.ensurePoint(center, this.pendingPointId ?? undefined);
       const id = uid("ci");
-      this.sketch.entities.push({ id, kind: "circle", center: centerId, radius });
+      this.sketch.entities.push({ id, kind: "circle", center: centerId, radius, construction: this.construction || undefined });
       this.sketch.constraints.push({ id: uid("c"), type: "radius", entity: id, value: radius });
       this.pending = { stage: 0, points: [] };
       this.pendingPointId = null;
       this.commit(false);
+      this.updateDynamicInput(e);
       this.render();
       return;
     }
@@ -736,6 +954,7 @@ export class SketchEditor {
           end: endId,
           radius: circle.radius,
           ccw: isCcw(a, p, b),
+          construction: this.construction || undefined,
         });
         this.sketch.constraints.push({ id: uid("c"), type: "radius", entity: id, value: circle.radius });
         this.pending = { stage: 0, points: [] };
@@ -743,35 +962,290 @@ export class SketchEditor {
         this.pendingSecondId = null;
         this.commit(false);
       }
+      this.updateDynamicInput(e);
+      this.render();
+      return;
+    }
+
+    if (this.tool === "trim") {
+      const entityId = this.hitEntity(raw);
+      if (!entityId) return;
+      this.trimAt(entityId, raw);
+      this.commit(false);
+      this.render();
+      return;
+    }
+
+    if (this.tool === "convert") {
+      const projected = this.callbacks.onConvertPick?.(e.clientX, e.clientY);
+      if (!projected || projected.length < 2) {
+        this.callbacks.notify("Click a 3D edge or face edge to project it into the sketch.", "warn");
+        return;
+      }
+      this.addProjectedPolyline(projected);
+      this.commit(false);
       this.render();
       return;
     }
   };
+
+  /** Add a chain of line entities from projected 3D points. */
+  addProjectedPolyline(points: Vec2[]): void {
+    if (!this.sketch || points.length < 2) return;
+    let prev = this.ensurePoint(points[0]);
+    for (let i = 1; i < points.length; i++) {
+      const next = this.ensurePoint(points[i]);
+      this.sketch.entities.push({
+        id: uid("ln"),
+        kind: "line",
+        p1: prev,
+        p2: next,
+        construction: this.construction || undefined,
+      });
+      prev = next;
+    }
+  }
+
+  /** Trim the picked portion of an entity at its nearest intersections. */
+  trimAt(entityId: string, pick: Vec2): boolean {
+    if (!this.sketch) return false;
+    const e = this.sketch.entities.find((q) => q.id === entityId);
+    if (!e) return false;
+    if (e.kind !== "line") {
+      // Curves are removed whole: splitting an arc at an intersection is beyond
+      // what a student sketch needs, and deleting is the expected fallback.
+      this.sketch.entities = this.sketch.entities.filter((q) => q.id !== entityId);
+      return true;
+    }
+    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    const a = pm.get(e.p1);
+    const b = pm.get(e.p2);
+    if (!a || !b) return false;
+    const hits: { t: number; p: Vec2 }[] = [];
+    for (const other of this.sketch.entities) {
+      if (other.id === entityId) continue;
+      if (other.kind === "line") {
+        const oa = pm.get(other.p1);
+        const ob = pm.get(other.p2);
+        if (!oa || !ob) continue;
+        const hit = lineHit(a, b, oa, ob);
+        if (hit) hits.push(hit);
+      } else {
+        const c = pm.get(other.center);
+        if (!c) continue;
+        const r = other.kind === "circle" ? other.radius : Math.hypot((pm.get(other.start)?.x ?? 0) - c.x, (pm.get(other.start)?.y ?? 0) - c.y);
+        for (const p of lineCircleHits(a, b, c, r)) hits.push(p);
+      }
+    }
+    const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    const tPick = Math.max(0, Math.min(1, ((pick.x - a.x) * (b.x - a.x) + (pick.y - a.y) * (b.y - a.y)) / (len * len)));
+    const ts = [0, ...hits.map((h) => h.t).filter((t) => t > 1e-4 && t < 1 - 1e-4), 1].sort((x, y) => x - y);
+    let lo = 0;
+    let hi = 1;
+    for (let i = 0; i < ts.length - 1; i++) {
+      if (tPick >= ts[i] && tPick <= ts[i + 1]) {
+        lo = ts[i];
+        hi = ts[i + 1];
+        break;
+      }
+    }
+    // Keep both outer pieces when the trim happens in the middle of the line.
+    const segments: [number, number][] = [];
+    if (lo > 1e-4) segments.push([0, lo]);
+    if (hi < 1 - 1e-4) segments.push([hi, 1]);
+    if (segments.length === 0) {
+      this.sketch.entities = this.sketch.entities.filter((q) => q.id !== entityId);
+      return true;
+    }
+    this.sketch.entities = this.sketch.entities.filter((q) => q.id !== entityId);
+    for (const [t0, t1] of segments) {
+      const p0 = { x: a.x + (b.x - a.x) * t0, y: a.y + (b.y - a.y) * t0 };
+      const p1 = { x: a.x + (b.x - a.x) * t1, y: a.y + (b.y - a.y) * t1 };
+      const id0 = t0 === 0 ? e.p1 : this.ensurePoint(p0);
+      const id1 = t1 === 1 ? e.p2 : this.ensurePoint(p1);
+      this.sketch.entities.push({ id: uid("ln"), kind: "line", p1: id0, p2: id1, construction: e.construction });
+    }
+    return true;
+  }
+
+  /** Offset the current selection (or every entity) by a signed distance. */
+  offsetSelection(distance: number): boolean {
+    if (!this.sketch) return false;
+    const targets =
+      this.selectedEntities.size > 0
+        ? this.sketch.entities.filter((e) => this.selectedEntities.has(e.id))
+        : this.sketch.entities;
+    if (targets.length === 0) return false;
+    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    for (const e of targets) {
+      if (e.kind === "line") {
+        const a = pm.get(e.p1);
+        const b = pm.get(e.p2);
+        if (!a || !b) continue;
+        const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+        const nx = -(b.y - a.y) / len;
+        const ny = (b.x - a.x) / len;
+        const p1 = this.ensurePoint({ x: a.x + nx * distance, y: a.y + ny * distance });
+        const p2 = this.ensurePoint({ x: b.x + nx * distance, y: b.y + ny * distance });
+        this.sketch.entities.push({ id: uid("ln"), kind: "line", p1, p2, construction: this.construction || undefined });
+      } else {
+        const c = pm.get(e.center);
+        if (!c) continue;
+        const r = e.kind === "circle" ? e.radius : Math.hypot((pm.get(e.start)?.x ?? 0) - c.x, (pm.get(e.start)?.y ?? 0) - c.y);
+        const nr = Math.max(0.05, r + distance);
+        const centerId = this.ensurePoint({ x: c.x, y: c.y });
+        if (e.kind === "circle") {
+          const id = uid("ci");
+          this.sketch.entities.push({ id, kind: "circle", center: centerId, radius: nr, construction: this.construction || undefined });
+          this.sketch.constraints.push({ id: uid("c"), type: "radius", entity: id, value: nr });
+        } else {
+          const s = pm.get(e.start);
+          const en = pm.get(e.end);
+          if (!s || !en) continue;
+          const dir = { x: (s.x - c.x) / (r || 1), y: (s.y - c.y) / (r || 1) };
+          const dir2 = { x: (en.x - c.x) / (r || 1), y: (en.y - c.y) / (r || 1) };
+          const startId = this.ensurePoint({ x: c.x + dir.x * nr, y: c.y + dir.y * nr });
+          const endId = this.ensurePoint({ x: c.x + dir2.x * nr, y: c.y + dir2.y * nr });
+          const id = uid("ar");
+          this.sketch.entities.push({ id, kind: "arc", center: centerId, start: startId, end: endId, radius: nr, ccw: e.ccw, construction: this.construction || undefined });
+          this.sketch.constraints.push({ id: uid("c"), type: "radius", entity: id, value: nr });
+        }
+      }
+    }
+    this.commit(false);
+    this.render();
+    return true;
+  }
+
+  /** Remove a relation; clickable badges call this. */
+  removeConstraint(id: string): boolean {
+    if (!this.sketch) return false;
+    const before = this.sketch.constraints.length;
+    this.sketch.constraints = this.sketch.constraints.filter((c) => c.id !== id);
+    if (this.sketch.constraints.length === before) return false;
+    this.commit(false);
+    this.render();
+    return true;
+  }
+  private finishLine(start: Vec2, end: Vec2, startId?: string, endId?: string, source: "pointer" | "typed" = "pointer"): void {
+    if (!this.sketch) return;
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-4) return;
+    let e = end;
+    let infer: "horizontal" | "vertical" | null = null;
+    if (source === "pointer") {
+      const tol = Math.max(0.6, this.viewport.worldPerPixel() * 12);
+      if (Math.abs(dy) < tol) {
+        e = { x: end.x, y: start.y };
+        infer = "horizontal";
+      } else if (Math.abs(dx) < tol) {
+        e = { x: start.x, y: end.y };
+        infer = "vertical";
+      }
+    }
+    const startPointId = this.ensurePoint(start, startId);
+    const endPointId = this.ensurePoint(e, endId);
+    const id = uid("ln");
+    this.sketch.entities.push({ id, kind: "line", p1: startPointId, p2: endPointId, construction: this.construction || undefined });
+    if (infer) this.sketch.constraints.push({ id: uid("c"), type: infer, entity: id });
+
+    if (source === "typed") {
+      const angle = (Math.atan2(e.y - start.y, e.x - start.x) * 180) / Math.PI;
+      this.sketch.constraints.push({ id: uid("c"), type: "distance", entity: id, value: len, labelOffset: { x: 9, y: 0 } });
+      this.sketch.constraints.push({ id: uid("c"), type: "angle", entity: id, value: Math.round(angle * 100) / 100 });
+    }
+
+    // Perpendicular inference when the new line starts on an existing line
+    // (endpoint, midpoint or intersection) and meets it at ~90°.
+    if (source === "pointer") {
+      const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+      const tol2 = Math.max(0.6, this.viewport.worldPerPixel() * 12);
+      for (const shared of this.sketch.entities) {
+        if (shared.kind !== "line" || shared.id === id) continue;
+        if (this.distanceToEntity(shared.id, start) > Math.max(0.05, tol2 * 0.4)) continue;
+        const a = pm.get(shared.p1);
+        const b = pm.get(shared.p2);
+        if (!a || !b) continue;
+        const v1 = {
+          x: (b.x - a.x) / (Math.hypot(b.x - a.x, b.y - a.y) || 1),
+          y: (b.y - a.y) / (Math.hypot(b.x - a.x, b.y - a.y) || 1),
+        };
+        const v2 = { x: (e.x - start.x) / len, y: (e.y - start.y) / len };
+        const dotAbs = Math.abs(v1.x * v2.x + v1.y * v2.y);
+        const exists = this.sketch.constraints.some(
+          (c) => c.type === "perpendicular" && ((c.a === shared.id && c.b === id) || (c.a === id && c.b === shared.id)),
+        );
+        if (dotAbs < 0.035 && !exists) {
+          this.sketch.constraints.push({ id: uid("c"), type: "perpendicular", a: shared.id, b: id });
+        }
+        break;
+      }
+    }
+
+    this.commit(false);
+    const solved = this.sketch.points.find((q) => q.id === endPointId);
+    this.pending = { stage: 1, points: [solved ? { x: solved.x, y: solved.y } : e] };
+    this.pendingPointId = endPointId;
+  }
 
   private pendingPointId: string | null = null;
   private pendingSecondId: string | null = null;
 
   private onPointerMove = (e: PointerEvent): void => {
     if (!this.enabled || !this.sketch) return;
+    if (this.band) {
+      this.updateBand(e);
+      return;
+    }
     const raw = this.eventPoint(e);
     if (!raw) {
       this.callbacks.onCursor(null);
+      this.dynamic.hide();
+      this.renderSnapMarker();
       return;
     }
-    const snap = this.snap(raw);
-    this.cursor = { x: snap.x, y: snap.y };
+    const candidate = this.snapCandidate(raw);
+    this.snap = candidate;
+    this.cursor = { x: candidate.x, y: candidate.y };
     this.callbacks.onCursor(this.cursor);
+    this.callbacks.onSnap?.(candidate);
+
+    // Alignment guides + snapping to the guide line.
+    const tol = this.viewport.worldPerPixel() * 7;
+    if (this.pending.stage > 0) {
+      const guides = alignmentGuides(this.sketch, raw, tol);
+      if (candidate.type === "grid" && guides.length > 0) {
+        let x = this.cursor.x;
+        let y = this.cursor.y;
+        for (const g of guides) {
+          if (g.axis === "h") y = g.at;
+          else x = g.at;
+        }
+        this.cursor = { x, y };
+        this.callbacks.onCursor(this.cursor);
+      }
+      this.drawGuides(this.cursor, guides);
+    } else {
+      this.clearGuides();
+    }
+
     if (this.drag) {
+      this.dynamic.hide();
       const p = this.sketch.points.find((q) => q.id === this.drag!.pointId);
       if (p) {
-        p.x = snap.x;
-        p.y = snap.y;
+        p.x = candidate.x;
+        p.y = candidate.y;
         this.drag.moved = true;
         this.solve(false);
         this.render();
       }
       return;
     }
+
+    this.updateDynamicInput(e);
+
     const hoverPoint = this.hitPoint(raw);
     const hoverEntity = hoverPoint ? null : this.hitEntity(raw);
     if (hoverPoint !== this.hoverPoint || hoverEntity !== this.hoverEntity) {
@@ -780,11 +1254,132 @@ export class SketchEditor {
       this.render();
     } else if (this.pending.stage > 0 || this.tool === "line") {
       this.renderPreview();
+      this.renderSnapMarker();
+    } else {
+      this.renderSnapMarker();
     }
   };
 
-  private onPointerUp = (): void => {
+  /** Live numeric boxes next to the cursor while a drawing tool is armed. */
+  private updateDynamicInput(e: PointerEvent): void {
+    if (!this.cursor || this.pending.stage !== 1) {
+      this.dynamic.hide();
+      this.renderSnapMarker();
+      return;
+    }
+    const a = this.pending.points[0];
+    const p = this.cursor;
+    const dx = p.x - a.x;
+    const dy = p.y - a.y;
+    const fields =
+      this.tool === "line"
+        ? [
+            { key: "length", label: "L", unit: "mm", value: Math.hypot(dx, dy), digits: 2 },
+            { key: "angle", label: "∠", unit: "°", value: (Math.atan2(dy, dx) * 180) / Math.PI, digits: 1 },
+          ]
+        : this.tool === "rectangle"
+          ? [
+              { key: "width", label: "W", unit: "mm", value: Math.abs(dx), digits: 2 },
+              { key: "height", label: "H", unit: "mm", value: Math.abs(dy), digits: 2 },
+            ]
+          : this.tool === "circle"
+            ? [{ key: "diameter", label: "Ø", unit: "mm", value: Math.hypot(dx, dy) * 2, digits: 2 }]
+            : this.tool === "arc" && this.pending.points.length === 2
+              ? [{ key: "radius", label: "R", unit: "mm", value: Math.hypot(dx, dy), digits: 2 }]
+              : [];
+    if (fields.length === 0) {
+      this.dynamic.hide();
+      this.renderSnapMarker();
+      return;
+    }
+    this.dynamic.show(e.clientX + 20, e.clientY + 22, fields);
+    this.renderSnapMarker();
+  }
+
+  private onKeyDown = (event: KeyboardEvent): void => {
+    if (!this.enabled || !this.sketch) return;
+    const target = event.target as HTMLElement | null;
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable) return;
+    if (this.dynamic.handleKey(event)) {
+      event.stopImmediatePropagation();
+      return;
+    }
+    if (event.key === "Tab" && this.tool === "select") return;
+  };
+
+  /** Enter pressed in the dynamic boxes: draw exactly the typed geometry. */
+  private applyDynamicInput(values: Record<string, number>): void {
+    if (!this.sketch || this.pending.stage !== 1) return;
+    const a = this.pending.points[0];
+    if (this.tool === "line") {
+      const length = Math.max(0.01, values.length ?? 0);
+      const angle = ((values.angle ?? 0) * Math.PI) / 180;
+      const b = { x: a.x + Math.cos(angle) * length, y: a.y + Math.sin(angle) * length };
+      this.finishLine(a, b, undefined, undefined, "typed");
+    } else if (this.tool === "rectangle") {
+      const sx = this.cursor && this.cursor.x >= a.x ? 1 : -1;
+      const sy = this.cursor && this.cursor.y >= a.y ? 1 : -1;
+      const w = Math.max(0.01, values.width ?? 0);
+      const h = Math.max(0.01, values.height ?? 0);
+      this.createRectangle(a, { x: a.x + sx * w, y: a.y + sy * h }, this.pendingPointId ?? undefined, undefined);
+      this.pending = { stage: 0, points: [] };
+      this.pendingPointId = null;
+      this.commit(false);
+    } else if (this.tool === "circle") {
+      const radius = Math.max(0.01, (values.diameter ?? 0) / 2);
+      const centerId = this.ensurePoint(a, this.pendingPointId ?? undefined);
+      const id = uid("ci");
+      this.sketch.entities.push({ id, kind: "circle", center: centerId, radius, construction: this.construction || undefined });
+      this.sketch.constraints.push({ id: uid("c"), type: "radius", entity: id, value: radius });
+      this.pending = { stage: 0, points: [] };
+      this.pendingPointId = null;
+      this.commit(false);
+    } else if (this.tool === "arc" && this.pending.points.length === 2) {
+      // Move the third point so the circumcircle radius matches the typed value.
+      const [p1, p2] = this.pending.points;
+      const targetR = Math.max(0.01, values.radius ?? 0);
+      const circle = circumcircleWithRadius(p1, p2, targetR);
+      if (circle) {
+        const startId = this.ensurePoint(p1, this.pendingPointId ?? undefined);
+        const endId = this.ensurePoint(p2, this.pendingSecondId ?? undefined);
+        const centerId = this.ensurePoint(circle.center);
+        const id = uid("ar");
+        this.sketch.entities.push({
+          id,
+          kind: "arc",
+          center: centerId,
+          start: startId,
+          end: endId,
+          radius: targetR,
+          ccw: circle.ccw,
+          construction: this.construction || undefined,
+        });
+        this.sketch.constraints.push({ id: uid("c"), type: "radius", entity: id, value: targetR });
+        this.pending = { stage: 0, points: [] };
+        this.pendingPointId = null;
+        this.pendingSecondId = null;
+        this.commit(false);
+      }
+    }
+    this.dynamic.hide();
+    this.clearGuides();
+    this.render();
+  }
+
+  private onPointerUp = (e: PointerEvent): void => {
     if (!this.enabled) return;
+    if (this.band) {
+      const band = this.band;
+      this.band = null;
+      this.bandEl.style.display = "none";
+      if (band.moved) this.applyBandSelection(band);
+      else if (!band.additive) {
+        this.selectedPoints.clear();
+        this.selectedEntities.clear();
+      }
+      this.render();
+      return;
+    }
     if (this.drag?.moved) {
       this.drag = null;
       this.commit(false);
@@ -793,12 +1388,93 @@ export class SketchEditor {
     }
   };
 
+  private updateBand(e: PointerEvent): void {
+    if (!this.band) return;
+    this.band.x1 = e.clientX;
+    this.band.y1 = e.clientY;
+    if (Math.abs(this.band.x1 - this.band.x0) > 4 || Math.abs(this.band.y1 - this.band.y0) > 4) this.band.moved = true;
+    const x = Math.min(this.band.x0, this.band.x1);
+    const y = Math.min(this.band.y0, this.band.y1);
+    this.bandEl.style.left = `${x}px`;
+    this.bandEl.style.top = `${y}px`;
+    this.bandEl.style.width = `${Math.abs(this.band.x1 - this.band.x0)}px`;
+    this.bandEl.style.height = `${Math.abs(this.band.y1 - this.band.y0)}px`;
+    // Right→left is a crossing (touching) selection, drawn dashed.
+    this.bandEl.classList.toggle("crossing", this.band.x1 < this.band.x0);
+  }
+
+  /** Window = every sampled point inside; crossing = any sampled point inside. */
+  private applyBandSelection(band: { x0: number; y0: number; x1: number; y1: number; additive: boolean }): void {
+    if (!this.sketch) return;
+    const window = band.x1 >= band.x0;
+    const rect = this.viewport.renderer.domElement.getBoundingClientRect();
+    const x1 = Math.min(band.x0, band.x1);
+    const x2 = Math.max(band.x0, band.x1);
+    const y1 = Math.min(band.y0, band.y1);
+    const y2 = Math.max(band.y0, band.y1);
+    const screen = (p: Vec2) => {
+      const s = this.viewport.projectToScreen(this.world(p));
+      return { x: rect.left + s.x, y: rect.top + s.y, visible: s.visible };
+    };
+    const inside = (p: Vec2) => {
+      const s = screen(p);
+      return s.visible && s.x >= x1 && s.x <= x2 && s.y >= y1 && s.y <= y2;
+    };
+    if (!band.additive) {
+      this.selectedPoints.clear();
+      this.selectedEntities.clear();
+    }
+    for (const p of this.sketch.points) {
+      if (inside(p)) this.selectedPoints.add(p.id);
+    }
+    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    for (const entity of this.sketch.entities) {
+      const samples: Vec2[] = [];
+      if (entity.kind === "line") {
+        const a = pm.get(entity.p1);
+        const b = pm.get(entity.p2);
+        if (!a || !b) continue;
+        for (let i = 0; i <= 8; i++) {
+          samples.push({ x: a.x + ((b.x - a.x) * i) / 8, y: a.y + ((b.y - a.y) * i) / 8 });
+        }
+      } else {
+        const c = pm.get(entity.center);
+        if (!c) continue;
+        if (entity.kind === "circle") {
+          for (let i = 0; i < 32; i++) {
+            const a = (i / 32) * Math.PI * 2;
+            samples.push({ x: c.x + Math.cos(a) * entity.radius, y: c.y + Math.sin(a) * entity.radius });
+          }
+        } else {
+          const start = pm.get(entity.start);
+          const end = pm.get(entity.end);
+          if (!start || !end) continue;
+          let a0 = Math.atan2(start.y - c.y, start.x - c.x);
+          let a1 = Math.atan2(end.y - c.y, end.x - c.x);
+          if (entity.ccw) {
+            while (a1 <= a0) a1 += Math.PI * 2;
+          } else {
+            while (a1 >= a0) a1 -= Math.PI * 2;
+          }
+          for (let i = 0; i <= 24; i++) {
+            const a = a0 + ((a1 - a0) * i) / 24;
+            samples.push({ x: c.x + Math.cos(a) * entity.radius, y: c.y + Math.sin(a) * entity.radius });
+          }
+        }
+      }
+      const hit = window ? samples.every(inside) : samples.some(inside);
+      if (hit) this.selectedEntities.add(entity.id);
+    }
+  }
+
   private solve(commit = false): void {
     if (!this.sketch) return;
     const result = solveSketch(this.sketch, { maxIterations: 80 });
     this.sketch.points = result.sketch.points;
     this.sketch.entities = result.sketch.entities;
     this.sketch.constraints = result.sketch.constraints;
+    this.solved = result.converged;
+    this.conflict = result.conflict.length > 0;
     if (!result.converged || result.conflict.length) {
       this.callbacks.notify(result.conflict[0] ?? "The sketch solver could not satisfy all constraints.", "warn");
     }
@@ -833,10 +1509,10 @@ export class SketchEditor {
     const l3 = uid("ln");
     const l4 = uid("ln");
     this.sketch.entities.push(
-      { id: l1, kind: "line", p1: ids[0], p2: ids[1] },
-      { id: l2, kind: "line", p1: ids[1], p2: ids[2] },
-      { id: l3, kind: "line", p1: ids[2], p2: ids[3] },
-      { id: l4, kind: "line", p1: ids[3], p2: ids[0] },
+      { id: l1, kind: "line", p1: ids[0], p2: ids[1], construction: this.construction || undefined },
+      { id: l2, kind: "line", p1: ids[1], p2: ids[2], construction: this.construction || undefined },
+      { id: l3, kind: "line", p1: ids[2], p2: ids[3], construction: this.construction || undefined },
+      { id: l4, kind: "line", p1: ids[3], p2: ids[0], construction: this.construction || undefined },
     );
     this.sketch.constraints.push(
       { id: uid("c"), type: "horizontal", entity: l1 },
@@ -934,7 +1610,7 @@ export class SketchEditor {
   // --------------------------------------------------------------- commands
 
   /** Apply a geometric relation to the current sketch selection. */
-  applyConstraint(type: "horizontal" | "vertical" | "coincident" | "tangent" | "fix" | "equal"): boolean {
+  applyConstraint(type: "horizontal" | "vertical" | "coincident" | "tangent" | "fix" | "equal" | "perpendicular"): boolean {
     if (!this.sketch) return false;
     const sp = [...this.selectedPoints];
     const se = [...this.selectedEntities];
@@ -1001,6 +1677,13 @@ export class SketchEditor {
         return false;
       }
       add({ id: uid("c"), type, a: line.id, entity: curve.id });
+    } else if (type === "perpendicular") {
+      const entities = se.map((id) => this.sketch!.entities.find((e) => e.id === id)).filter((e) => !!e);
+      if (entities.length !== 2 || !entities.every((e) => e!.kind === "line")) {
+        this.callbacks.notify("Select two lines for a perpendicular relation.", "warn");
+        return false;
+      }
+      add({ id: uid("c"), type, a: entities[0]!.id, b: entities[1]!.id });
     } else if (type === "equal") {
       const entities = se.map((id) => this.sketch!.entities.find((e) => e.id === id)).filter((e) => !!e);
       if (entities.length !== 2) {
@@ -1060,6 +1743,11 @@ export class SketchEditor {
   }
 
   cancel(): boolean {
+    if (this.band) {
+      this.band = null;
+      this.bandEl.style.display = "none";
+      return true;
+    }
     if (this.pending.stage > 0) {
       this.pending = { stage: 0, points: [] };
       this.pendingPointId = null;
@@ -1118,6 +1806,54 @@ function circumcircle(a: Vec2, b: Vec2, c: Vec2): { center: Vec2; radius: number
 
 function isCcw(a: Vec2, mid: Vec2, b: Vec2): boolean {
   return (mid.x - a.x) * (b.y - mid.y) - (mid.y - a.y) * (b.x - mid.x) > 0;
+}
+
+/** Circle centre that passes through a and b with the requested radius. */
+function circumcircleWithRadius(a: Vec2, b: Vec2, r: number): { center: Vec2; ccw: boolean } | null {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 1e-6 || d > 2 * r) return null;
+  const mx = (a.x + b.x) / 2;
+  const my = (a.y + b.y) / 2;
+  const h = Math.sqrt(Math.max(0, r * r - (d / 2) * (d / 2)));
+  const nx = -dy / d;
+  const ny = dx / d;
+  // The centre on the left of a→b produces a counter-clockwise sweep.
+  const center = { x: mx + nx * h, y: my + ny * h };
+  return { center, ccw: true };
+}
+
+function lineHit(a: Vec2, b: Vec2, c: Vec2, d: Vec2): { t: number; p: Vec2 } | null {
+  const d1x = b.x - a.x;
+  const d1y = b.y - a.y;
+  const d2x = d.x - c.x;
+  const d2y = d.y - c.y;
+  const den = d1x * d2y - d1y * d2x;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((c.x - a.x) * d2y - (c.y - a.y) * d2x) / den;
+  const u = ((c.x - a.x) * d1y - (c.y - a.y) * d1x) / den;
+  if (t < 1e-6 || t > 1 - 1e-6 || u < -1e-6 || u > 1 + 1e-6) return null;
+  return { t, p: { x: a.x + t * d1x, y: a.y + t * d1y } };
+}
+
+function lineCircleHits(a: Vec2, b: Vec2, c: Vec2, r: number): { t: number; p: Vec2 }[] {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const fx = a.x - c.x;
+  const fy = a.y - c.y;
+  const A = dx * dx + dy * dy;
+  if (A < 1e-12) return [];
+  const B = 2 * (fx * dx + fy * dy);
+  const C = fx * fx + fy * fy - r * r;
+  const disc = B * B - 4 * A * C;
+  if (disc < 0) return [];
+  const sq = Math.sqrt(disc);
+  const out: { t: number; p: Vec2 }[] = [];
+  for (const t of [(-B - sq) / (2 * A), (-B + sq) / (2 * A)]) {
+    if (t > 1e-6 && t < 1 - 1e-6) out.push({ t, p: { x: a.x + t * dx, y: a.y + t * dy } });
+  }
+  return out;
 }
 
 export type { SketchPlane };

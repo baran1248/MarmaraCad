@@ -13,7 +13,7 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] OCCT WASM loads inside a dedicated Web Worker
 - [x] STEP export + re-import verified (volume preserved)
 - [x] GitHub repository `Baran1248/MarmaraCad`
-- [ ] GitHub Actions → GitHub Pages deployment pipeline (workflow committed, first deploy pending)
+- [x] GitHub Actions → GitHub Pages deployment pipeline (deploy run `44844692126` green, live URL verified)
 - [x] Application shell (SolidWorks-style title bar, CommandManager, tree, viewport, status bar)
 - [x] Design tokens, icons, responsive layout, onboarding/loading screen
 
@@ -80,7 +80,48 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] Solve in Web Worker (UI stays responsive)
 - [x] FEA verification tests against analytical benchmarks
 
-## Quality gates
+## Phase 2B — Interaction, AI & engineering deliverables
+
+### Selection & viewport
+- [x] Ctrl/Shift+click additive selection (face, edge, vertex, tree); clicking a selected item removes it
+- [x] Fillet, Chamfer, Measure and FEA boundary conditions consume the multi-selection
+- [x] Window selection (left→right, full containment) and crossing selection (right→left, touch) in sketches and 3D
+- [x] `All / Faces / Edges / Vertices` pick filters
+- [x] `Select Loop` and `Select Tangency` in the right-click menu
+- [x] Right-click `Sketch on Face`, `Normal To`, `Hide / Show`, `Edit`, `Delete`
+- [x] Zoom towards the cursor; SolidWorks/Fusion (MMB orbit, RMB pan) and legacy mouse schemes
+
+### Sketch interaction
+- [x] Dynamic input boxes next to the cursor for Line, Rectangle, Circle and 3-Point Arc
+- [x] Type value → `Tab` → value → `Enter` draws exact geometry and adds driving dimensions/constraints
+- [x] Object snaps: Endpoint, Midpoint, Center, Origin, Quadrant, Intersection, Perpendicular, Tangent,
+      with symbol + label and dashed alignment guides
+- [x] Automatic Horizontal / Vertical / Perpendicular relations; green badges are clickable to delete
+- [x] Snap on/off toggle in the status bar
+- [x] `For Construction` (dashed), Trim, Offset Entities, Convert Entities
+- [x] Under Defined blue / Fully Defined black / Over Defined amber-red state colours + status text
+- [x] `Esc`, `Delete`, `F`, `N`/`Ctrl+8`, `S` shortcut bar at the cursor, `Ctrl+Z/Y`
+
+### Features, materials & evaluation
+- [x] Shell, Mirror, Linear Pattern
+- [x] Draggable FeatureManager rollback bar (rebuild up to a feature; drop on itself to clear)
+- [x] `Material <not specified>` / `Edit Material` row, library + custom overrides flowing into mass and FEA
+- [x] Mass Properties with volume, area, mass and centre of mass X/Y/Z; Measure
+- [x] Spacebar transparent 3D View Selector cube (6 directions + isometric), Confirmation Corner
+- [x] Section View with capped CPU cut (works on WebGL2 and WebGPU)
+- [x] Assembly Interference Detection (AABB + ~1 mm parity sampling)
+- [x] Toolbox parametric M4–M12 hex bolts, nuts and washers
+- [x] Parametric variables (`L = 100`, `W = L / 2`) bound to dimensions, with live re-solve
+- [x] Technical drawing: front/top/right/isometric views, overall dimensions, title block, SVG + PDF
+- [x] `?` shortcut guide, TR/EN switch, templates (Cantilever Beam, L-Bracket, Box + Lid Assembly)
+
+### Gemini assistant
+- [x] Slide-out panel; key stored in localStorage + first-party cookie; `Clear API Key`; no relay server
+- [x] Automatic model listing; visible default `hydrogen` alias + `mid` thinking
+- [x] System prompt teaches the JSON command schema; replies validated against an action whitelist
+- [x] One-click apply inside the normal undo/redo transaction
+
+
 - [x] `npm run build` clean
 - [x] Unit tests (sketch solver, profile builder, hex element, FEA mesh/solver) — 12/12
 - [x] Playwright end-to-end: boot, WASM cache, WebGPU/WebGL2 fallback
@@ -92,11 +133,47 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] Playwright end-to-end: Coincident + Concentric mates with independently recomputed residuals
 - [x] Playwright end-to-end: fillet, undo/redo, autosave restore
 - [x] Playwright end-to-end: analysis solve, result rendering and analytical beam benchmark
+- [x] Playwright end-to-end: Ctrl+click multi-selection → bulk fillet, Measure, window/crossing box
+      selection, pick filters (`e2e-multiselect.mjs`)
+- [x] Playwright end-to-end: dynamic input `100` + `Tab` + `0` + `Enter` → exact 100 mm line with
+      driving dimensions; typed rectangle 40 × 25 and R12 circle (`e2e-dynamic-input.mjs`)
+- [x] Playwright end-to-end: midpoint/endpoint/origin snap markers, alignment guides, inferred
+      horizontal/vertical/perpendicular relations, clickable badge deletion, snap toggle
+      (`e2e-snap.mjs`)
+- [x] Playwright end-to-end: Box + Lid template (shell 15,552 mm³, lid 8,448 mm³, placement,
+      zero interference, 24,000 mm³ mass) (`e2e-template-boxlid.mjs`)
+- [x] Playwright end-to-end: material assignment, drawing views + title block, real PDF download,
+      capped Section View, rollback drag, Toolbox M8 bolt, TR/EN, view selector, confirmation
+      corner, `S` bar and `?` guide (`e2e-faz2.mjs`)
+- [x] Playwright end-to-end: Gemini assistant against a mocked API — local key, model listing,
+      `hydrogen`/`mid`, validated commands, apply + undo, `Clear API Key` (`e2e-ai.mjs`)
 - [x] Visual QA pass with screenshot review
 - [x] Live GitHub Pages verification (desktop)
 - [x] README with architecture, usage, verification and license notes
 
 ## Verification log
+- Phase-2 verification (local dev server, headless Chrome, all measured from the live document):
+  - Ctrl+click builds a 3-edge selection that Fillet consumes (`3 EDGE(S)`), volume 19,935.62 mm³
+    against the analytical three-R2-corner value; Ctrl+click on a selected edge removes it and adds
+    it back (3 → 2 → 3); Measure lists the same three edges.
+  - Dynamic input: `100` + `Tab` + `0` + `Enter` produces a 100.000 mm / 0.000° line with
+    `distance` and `angle` constraints; typed rectangle 40 × 25 and Ø24 circle (R12) match exactly.
+  - Snaps: `△ Midpoint`, `□ Endpoint`, `⊕ Origin`; two dashed alignment guides while tracking; a
+    line started on a snapped midpoint shares that point and infers `vertical` + `perpendicular`.
+  - Box + Lid template: shelled box 15,552 mm³, lid 8,448 mm³, lid at y = 30 mm, no interference,
+    assembly mass 0.1889 kg from AISI 1020 (7,850 kg/m³).
+  - Drawing: 5 paths / 6 lines / 19 texts, views FRONT/TOP/RIGHT/ISOMETRIC, title block carries
+    part name, 6061-T6, scale 1:1 and `UNITS mm`; the downloaded PDF is 93,235 bytes with a
+    `%PDF-` header.
+  - Section View: cut at X = −14.9 mm, body bbox min X = −14.9 mm, 826 triangles (from 924, caps
+    included), picking disabled; turning it off restores 924 triangles and the full −60…60 extent.
+  - Rollback: dropping the bar on the second feature rebuilds 2 of 3 features (volume changes,
+    one row suppressed); dropping it back on itself restores the full tree.
+  - Toolbox: M8 × 20 hex bolt, 1,795 mm³, 13 mm across flats (analytic OBJ body).
+  - Gemini (mocked): key stored in localStorage + cookie and sent only to
+    `generativelanguage.googleapis.com`; models listed automatically; `hydrogen` resolves to
+    `gemini-2.5-flash` with `thinkingLevel: medium`; 2 of 3 commands applied (unknown action
+    rejected); Ctrl+Z removes the AI edits; `Clear API Key` empties storage and the cookie.
 - OCCT 7.x WASM bootstrap: ~0.8 s (local), box 20×30×10 volume = 6000 mm³ exact.
 - STEP AP214 round-trip: 15,416 bytes, re-imported volume = 6000 mm³.
 - Fillet and chamfer operators verified on box topology.

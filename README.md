@@ -15,12 +15,27 @@ visualisation — executes on the user's own CPU/GPU.
 - SolidWorks-inspired CommandManager, FeatureManager design tree and ViewCube.
 - Parametric sketches with dimensions and geometric relations, solved with a
   Levenberg–Marquardt constraint solver.
-- Extrude Boss/Base, Extruded Cut, Revolve, Fillet and Chamfer as an editable feature history.
+- Extrude Boss/Base, Extruded Cut, Revolve, Fillet, Chamfer, Shell, Mirror and Linear Pattern
+  as an editable feature history.
+- Multi-select with Ctrl/Shift-click, window (left→right) and crossing (right→left) selection,
+  All / Faces / Edges / Vertices pick filters, and loop / tangency selection from the context menu.
+- SolidWorks-style dynamic input while drawing (type length/angle, `Tab`, `Enter`) and object snaps
+  (Endpoint, Midpoint, Center, Origin, Quadrant, Intersection, Perpendicular, Tangent) with
+  automatic Horizontal / Vertical / Perpendicular relations shown as clickable green badges.
+- Construction geometry, Trim, Offset Entities and Convert Entities in the sketch environment.
+- Material row above the feature tree (AISI 1020, 6061-T6, 304 SS, Ti-6Al-4V, ABS, Brass and
+  custom), feeding mass properties and every analysis study.
+- Evaluate tools: Mass Properties (volume, area, mass, centre of mass X/Y/Z), Measure, Section View,
+  Interference Detection, technical drawing (3 orthographic + isometric views) and PDF export.
+- Toolbox fasteners (M4–M12 hex bolts, nuts, washers), equations/variables, rollback bar,
+  TR/EN interface, document templates (`Cantilever Beam`, `L-Bracket`, `Box + Lid Assembly`).
+- Gemini CAD assistant: the API key is stored only in this browser; Turkish or English requests are
+  translated to a validated command list and applied inside the normal undo/redo history.
 - Multi-part assemblies with Coincident, Concentric and Distance mates.
 - STEP (AP214), IGES, STL and OBJ import/export; `.mcad.json` projects; IndexedDB autosave.
 - Ansys-inspired structural analysis: material library, conforming hexahedral (8-node brick)
   mesh, fixed supports, forces/pressures, linear static solve, total deformation and Von Mises
-  stress.
+  stress with Geometry/Material/Mesh/Loads/Results status indicators.
 - WebGPU renderer with an automatic WebGL2 fallback (`?renderer=webgl2` forces the fallback).
 
 ## Development
@@ -30,10 +45,22 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # Playwright end-to-end suite (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 18 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
+
+Any end-to-end suite can target a deployed build instead of the dev server:
+
+```bash
+MARMARACAD_URL=https://baran1248.github.io/MarmaraCad/ npm run test:e2e
+```
+
+The phase-2 suites cover Ctrl+click multi-selection into a bulk fillet, dynamic input
+(`100`, `Tab`, `0`, `Enter`), midpoint/endpoint/origin snaps and alignment guides, window vs
+crossing selection, the Box + Lid template (shell volume, placement, zero interference, mass),
+technical drawing + PDF, Section View, rollback, Toolbox, TR/EN, the view selector, the `?` guide,
+and the Gemini assistant with a mocked API.
 
 CI runs `npm test` and `npm run build` on every push to `main`, then publishes `dist` to GitHub
 Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow` scope
@@ -54,10 +81,12 @@ a new deployment invalidates the entry automatically (Tools → Clear Cached Ker
 | --- | --- |
 | `src/kernel/cad.worker.ts` | OCCT B-Rep operations, tessellation, topological metadata, STEP/IGES |
 | `src/kernel/fea.worker.ts` | voxel hexahedral meshing, CSR assembly, PCG solve, stress recovery |
-| `src/viewport/` | Three.js scene, picking, sketch rendering, result visualisation |
-| `src/sketch/` | 2D constraint solver, profile extraction, snapping |
-| `src/model/` | project document model, feature history, mates, materials |
-| `src/ui/` | CommandManager, FeatureManager, PropertyManager, dialogs, colorbar |
+| `src/viewport/` | Three.js scene, picking, sketch rendering, CPU section cut, result visualisation |
+| `src/sketch/` | 2D constraint solver, profile extraction, snapping, dynamic input |
+| `src/model/` | project document model, feature history, mates, materials, expressions, toolbox |
+| `src/analysis/` | material library, FEA study model, solver and result helpers |
+| `src/drawing/` | orthographic/isometric SVG drawing generator and PDF export |
+| `src/ui/` | CommandManager, FeatureManager, PropertyManager, dialogs, colorbar, Gemini assistant |
 
 ## Licensing
 

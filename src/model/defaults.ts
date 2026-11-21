@@ -99,7 +99,7 @@ export function createPart(name = "Part1", colorIndex = 0): Part {
     visible: true,
     sketches: [],
     features: [],
-    materialId: "steel",
+    materialId: undefined,
   };
 }
 

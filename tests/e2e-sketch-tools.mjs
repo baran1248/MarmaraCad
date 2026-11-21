@@ -41,12 +41,13 @@ record({
 });
 
 // Smart Dimension on the bottom edge: click it, fill the dialog, confirm.
+// The dialog also accepts expressions (`L`, `L / 2`), so the input is #dim-value.
 await setTool(page, "dimension");
 await sketchClick(page, -5, -12);
-await page.waitForSelector("#prompt-value", { timeout: 15000 });
-const dimensionDefault = await page.inputValue("#prompt-value");
-await page.fill("#prompt-value", "30");
-await page.click(".modal-foot .btn.primary");
+await page.waitForSelector("#dim-value", { timeout: 15000 });
+const dimensionDefault = await page.inputValue("#dim-value");
+await page.fill("#dim-value", "30");
+await page.click(".modal .btn.primary");
 await page.waitForTimeout(350);
 state = await sketchState(page);
 const lengthOf = (s, id) => {

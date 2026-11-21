@@ -58,7 +58,9 @@ export type ConstraintType =
   | "radius"
   | "tangent"
   | "fix"
-  | "equal";
+  | "equal"
+  | "perpendicular"
+  | "angle";
 
 export interface SketchConstraint {
   id: string;
@@ -67,6 +69,8 @@ export interface SketchConstraint {
   b?: string;
   entity?: string;
   value?: number;
+  /** Expression such as "L / 2"; when set it overrides `value` at rebuild time. */
+  expression?: string;
   labelOffset?: Vec2;
 }
 
@@ -86,6 +90,9 @@ export type FeatureType =
   | "revolve"
   | "fillet"
   | "chamfer"
+  | "shell"
+  | "mirror"
+  | "pattern"
   | "imported";
 
 export type BooleanOp = "new" | "join" | "cut";
@@ -100,11 +107,23 @@ export interface FeatureParams {
   radius?: number;
   distance?: number;
   edgeIndices?: number[];
+  faceIndices?: number[];
   operation?: BooleanOp;
   format?: "step" | "iges" | "stl" | "obj";
   sourceName?: string;
   draftAngle?: number;
   throughAll?: boolean;
+  /** Shell wall thickness (mm). */
+  thickness?: number;
+  /** Mirror plane for the mirror feature. */
+  mirrorPlane?: "front" | "top" | "right";
+  /** Linear pattern settings. */
+  patternAxis?: "x" | "y" | "z";
+  patternCount?: number;
+  patternSpacing?: number;
+  /** Expression evaluated at rebuild time, e.g. "L / 2". */
+  depthExpression?: string;
+  radiusExpression?: string;
 }
 
 export interface Feature {
@@ -135,6 +154,16 @@ export interface Part {
   asset?: ImportedAsset;
   meshOnly?: boolean;
   materialId?: string;
+  /** Overrides for the library material (Edit Material → custom values). */
+  materialOverride?: {
+    name?: string;
+    E?: number;
+    nu?: number;
+    yield?: number;
+    density?: number;
+  };
+  /** Features at or below this index rebuild; the rest are rolled back. */
+  rollbackIndex?: number;
 }
 
 export interface Component {
@@ -207,7 +236,18 @@ export interface AnalysisStudy {
   status: AnalysisStatus;
   meshStats?: { nodes: number; elements: number };
   error?: string;
+  /** Geometry or material changed after the solve; results need a re-run. */
+  stale?: boolean;
 }
+
+export interface Variable {
+  id: string;
+  name: string;
+  expression: string;
+  value: number;
+}
+
+export type Language = "en" | "tr";
 
 export type WorkspaceMode = "part" | "assembly" | "analysis";
 
@@ -224,6 +264,8 @@ export interface ProjectDocument {
   mode: WorkspaceMode;
   createdAt: number;
   updatedAt: number;
+  variables?: Variable[];
+  language?: Language;
 }
 
 export interface MeshData {
@@ -265,6 +307,7 @@ export interface RebuildPart {
   assetBase64?: string;
   assetFormat?: ImportedAsset["format"];
   assetRev?: string;
+  rollbackIndex?: number;
 }
 
 export interface AssemblyTransform {

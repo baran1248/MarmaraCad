@@ -26,7 +26,18 @@ import {
   uid,
 } from "./model/defaults";
 import { Shell } from "./ui/Shell";
-import { Viewport, type DisplayStyle, type EdgePick, type FacePick, type SceneBody, type ViewName } from "./viewport/Viewport";
+import {
+  Viewport,
+  type BoxSelection,
+  type DisplayStyle,
+  type EdgePick,
+  type FacePick,
+  type PickFilter,
+  type SceneBody,
+  type SectionState,
+  type VertexPick,
+  type ViewName,
+} from "./viewport/Viewport";
 import { SketchEditor, type SketchTool } from "./sketch/SketchEditor";
 import { profileSummary } from "./sketch/geometry";
 import { dimensionValue } from "./sketch/solver";
@@ -35,9 +46,14 @@ import { cloneDocument, parseProject, serializeProject } from "./io/project";
 import { addRecent, clearAll, listRecent, loadAutosave, saveAutosave, type RecentEntry } from "./io/storage";
 import { meshMass, parseOBJ, parseSTL, writeOBJ, writeSTL } from "./io/meshio";
 import { transformMeshData } from "./viewport/geometry";
+import { sectionMesh } from "./viewport/section";
 import { componentMatrix, matrixArray } from "./viewport/math";
 import { faceRefFromPick, solveMates } from "./assembly/mates";
-import { MATERIALS, materialById } from "./analysis/materials";
+import { MATERIALS, materialById, partMaterial } from "./analysis/materials";
+import { applyVariables, evaluateExpression, makeVariable, standardVariables, variableValues } from "./model/variables";
+import { createFastenerPart, METRIC_SIZES } from "./model/toolbox";
+import { buildDrawingSvg, downloadDrawingPdf } from "./drawing/technicalDrawing";
+import { Assistant, type AiCommand } from "./ui/Assistant";
 import { alertDialog, confirmDialog, openModal, promptNumber, toast } from "./ui/Modal";
 import { icon } from "./ui/icons";
 import { materialOptions, type SketchInfo } from "./ui/FeatureTree";
@@ -60,11 +76,13 @@ import { createBestRenderer, type RendererChoice } from "./viewport/renderer";
 import { clearKernelCache, kernelCacheSize } from "./kernel/wasmCache";
 
 type Selection = { kind: string; id: string };
+type PickMods = { ctrl: boolean; shift: boolean; additive: boolean };
 
 interface ActiveCommand {
   kind: string;
-  onFace?: (pick: FacePick) => void;
-  onEdge?: (pick: EdgePick) => void;
+  onFace?: (pick: FacePick, mods: PickMods) => void;
+  onEdge?: (pick: EdgePick, mods: PickMods) => void;
+  onVertex?: (pick: VertexPick, mods: PickMods) => void;
   cancel?: () => void;
 }
 
@@ -141,6 +159,16 @@ export class App {
   private redos: ProjectDocument[] = [];
   private selection: Selection | null = null;
   private selectedFace: FacePick | null = null;
+  private selFaces: FacePick[] = [];
+  private selEdges: EdgePick[] = [];
+  private selVertices: VertexPick[] = [];
+  private pickMods: PickMods = { ctrl: false, shift: false, additive: false };
+  private sectionState: SectionState = { enabled: false, axis: "z", offset: 0, flipped: false };
+  private navScheme: "cad" | "legacy" = "cad";
+  private language: "en" | "tr" = "en";
+  private assistant: Assistant;
+  private measurePicks: { kind: "face" | "edge" | "vertex"; label: string; point: Vec3; normal?: Vec3; length?: number }[] = [];
+  private lastPointer = { x: 0, y: 0 };
   private expanded = new Set<string>(["origin"]);
   private planesVisible = false;
   private displayStyle: DisplayStyle = "shaded-edges";
@@ -177,6 +205,21 @@ export class App {
         void this.editDimension(id);
       },
       notify: (message, kind) => toast(message, kind === "warn" ? "warn" : kind === "error" ? "error" : "info"),
+      onStatus: (status) => this.shell.setSketchStatus(status.state === "empty" ? null : `${status.label} · ${status.dof} DOF`, status.state),
+      onConvertPick: (clientX, clientY) => {
+        const plane = this.editor.sketch?.plane;
+        const pick = this.viewport.raycastEdgeAt(clientX, clientY);
+        if (!plane || !pick) return null;
+        return pick.edge.points.map((p) => {
+          const d: Vec3 = [p[0] - plane.origin[0], p[1] - plane.origin[1], p[2] - plane.origin[2]];
+          return { x: d[0] * plane.u[0] + d[1] * plane.u[1] + d[2] * plane.u[2], y: d[0] * plane.v[0] + d[1] * plane.v[1] + d[2] * plane.v[2] };
+        });
+      },
+    });
+
+    this.assistant = new Assistant(this.shell.aiPanelEl, {
+      onCommands: (commands, message) => void this.applyAiCommands(commands, message),
+      onStatus: (text) => this.shell.setStatus(text),
     });
 
     this.bindShell();
@@ -230,6 +273,12 @@ export class App {
       setBoot("Building the model…", 78);
       this.shell.setDocument(this.doc);
       this.shell.setMode(this.doc.mode);
+      this.language = this.doc.language ?? "en";
+      this.shell.applyLanguage(this.language);
+      this.shell.commandManager.setLanguage(this.language);
+      this.shell.setLanguageButton(this.language);
+      this.shell.setPickFilter("all");
+      this.viewport.setPickFilter("all");
       this.shell.setCommandTab(this.doc.mode === "assembly" ? "assembly" : this.doc.mode === "analysis" ? "analysis" : "features");
       this.refreshTree();
       this.updateMassCard();
@@ -248,6 +297,8 @@ export class App {
         doc: () => this.doc,
         meshes: () => this.meshes,
         app: this,
+        assistant: this.assistant,
+        selections: () => ({ faces: this.selFaces, edges: this.selEdges, vertices: this.selVertices }),
         renderer: () => this.graphics.backend,
         kernel: () => ({
           bootMs: this.bootMs,
@@ -291,14 +342,53 @@ export class App {
     this.shell.onTreeOpen = (kind, id) => void this.treeOpen(kind, id);
     this.shell.onTreeContext = (kind, id, x, y) => this.treeContext(kind, id, x, y);
     this.shell.onTreeAction = (action, kind, id) => void this.runTreeAction(action, kind, id);
+    this.shell.onPickFilter = (filter) => this.setPickFilter(filter as PickFilter);
+    this.shell.onSnapToggle = (on) => {
+      this.editor.snaps = on
+        ? { endpoint: true, midpoint: true, center: true, origin: true, quadrant: true, intersection: true, perpendicular: true, tangent: true, grid: true }
+        : { endpoint: false, midpoint: false, center: false, origin: false, quadrant: false, intersection: false, perpendicular: false, tangent: false, grid: false };
+      this.shell.setStatus(on ? "Object snap on" : "Object snap off · free cursor");
+    };
+    this.shell.onSnapSettings = (settings) => this.editor.setSnapSettings(settings);
+    this.shell.onAssistantToggle = () => this.assistant.toggle();
+    this.shell.onLanguageToggle = () => this.toggleLanguage();
+    this.shell.onShortcut = (action) => void this.runAction(action);
+    this.shell.onNavScheme = (scheme) => {
+      this.navScheme = scheme;
+      this.viewport.setNavScheme(scheme);
+      toast(scheme === "cad" ? "SolidWorks / Fusion mouse scheme active." : "Legacy mouse scheme active (left-drag orbits).", "info");
+    };
     this.viewport.onCameraChange = () => this.shell.setViewCubeSynced(this.viewport.camera);
   }
 
   private bindViewport(): void {
     this.viewport.onPickFace = (pick) => this.handleFacePick(pick);
     this.viewport.onPickEdge = (pick) => this.handleEdgePick(pick);
+    this.viewport.onPickVertex = (pick) => this.handleVertexPick(pick);
+    this.viewport.onBoxSelect = (selection) => this.applyBoxSelection(selection);
+    this.viewport.onContextPick = (x, y, pick) => this.openViewportContext(x, y, pick);
+    this.viewport.onPickFilterChanged = (filter) => this.shell.setPickFilter(filter);
     this.viewport.onHoverFace = () => undefined;
     this.viewport.onHoverEdge = () => undefined;
+    // Capture modifier state before the viewport consumes the pointer event.
+    document.addEventListener(
+      "pointerdown",
+      (event) => {
+        this.pickMods = {
+          ctrl: event.ctrlKey || event.metaKey,
+          shift: event.shiftKey,
+          additive: event.ctrlKey || event.metaKey || event.shiftKey,
+        };
+      },
+      true,
+    );
+    this.viewport.container.addEventListener("contextmenu", (event) => {
+      // The viewport opens its own context menu; keep the browser menu away.
+      event.preventDefault();
+    });
+    this.viewport.container.addEventListener("pointermove", (event) => {
+      this.lastPointer = { x: event.clientX, y: event.clientY };
+    });
   }
 
   private bindKeys(): void {
@@ -310,6 +400,9 @@ export class App {
         target instanceof HTMLTextAreaElement ||
         target?.isContentEditable === true;
       if (event.key === "Escape") {
+        this.shell.hideContextMenu();
+        this.shell.hideShortcutBar();
+        this.shell.hideViewSelector();
         if (this.editor.isActive) {
           if (!this.editor.cancel()) this.editor.setTool("select");
           return;
@@ -319,7 +412,27 @@ export class App {
         return;
       }
       if (typing) return;
+      if (event.key === " " && !this.editor.isActive) {
+        event.preventDefault();
+        this.shell.toggleViewSelector();
+        return;
+      }
+      if (event.key === "?" || (event.shiftKey && event.key === "/")) {
+        event.preventDefault();
+        this.showShortcuts();
+        return;
+      }
+      if (event.key === "Enter" && this.command && this.panelRoot) {
+        event.preventDefault();
+        this.panelRoot.querySelector<HTMLElement>("[data-pm-ok]")?.click();
+        return;
+      }
       const ctrl = event.ctrlKey || event.metaKey;
+      if (ctrl && event.key === "8") {
+        event.preventDefault();
+        this.normalToSelected();
+        return;
+      }
       if (ctrl && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) this.redo();
@@ -368,6 +481,16 @@ export class App {
         }
         return;
       }
+      if (event.key.toLowerCase() === "n" && !ctrl) {
+        event.preventDefault();
+        this.normalToSelected();
+        return;
+      }
+      if (event.key.toLowerCase() === "s" && !ctrl && !this.editor.isActive) {
+        event.preventDefault();
+        this.openShortcutBar();
+        return;
+      }
       if (this.editor.isActive) {
         const map: Record<string, SketchTool> = {
           l: "line",
@@ -376,6 +499,9 @@ export class App {
           a: "arc",
           d: "dimension",
           s: "select",
+          t: "trim",
+          o: "offset",
+          x: "convert",
         };
         const tool = map[event.key.toLowerCase()];
         if (tool) this.setSketchTool(tool);
@@ -394,7 +520,44 @@ export class App {
     if (this.undos.length > 60) this.undos.shift();
     this.redos.length = 0;
     this.shell.setUndoRedo(true, false);
+    this.markStaleStudies(before);
     this.touchDocument();
+  }
+
+  /** Geometry or material edits keep solved results on screen but flag them stale. */
+  private markStaleStudies(before: ProjectDocument): void {
+    const signature = (doc: ProjectDocument) =>
+      JSON.stringify({
+        parts: doc.parts.map((p) => ({
+          id: p.id,
+          material: p.materialId,
+          override: p.materialOverride,
+          sketches: p.sketches.map((s) => ({ p: s.points, e: s.entities, c: s.constraints })),
+          features: p.features.map((f) => ({ t: f.type, p: f.params, s: f.suppressed })),
+          rollback: p.rollbackIndex,
+        })),
+        studies: doc.analyses.map((s) => ({
+          id: s.id,
+          part: s.partId,
+          material: s.materialId,
+          mesh: s.meshSize,
+          supports: s.supports,
+          loads: s.loads,
+        })),
+      });
+    if (signature(before) === signature(this.doc)) return;
+    for (const study of this.doc.analyses) {
+      if (study.status === "solved") {
+        study.stale = true;
+        this.feaResults.delete(study.id);
+        if (this.doc.activeStudyId === study.id) {
+          this.activeResult = null;
+          this.resultView.clear();
+          this.shell.showColorbar(null);
+          this.shell.showResultToolbar(null);
+        }
+      }
+    }
   }
 
   private touchDocument(): void {
@@ -453,14 +616,22 @@ export class App {
     this.sketchStartDoc = null;
     this.selection = null;
     this.selectedFace = null;
+    this.selFaces = [];
+    this.selEdges = [];
+    this.selVertices = [];
+    this.sectionState = { ...this.sectionState, enabled: false };
     this.toolbarMode = null;
     this.activeResult = null;
     this.shell.setSketching(false);
+    this.shell.setSketchStatus(null);
     this.shell.setActiveCommand(null);
     this.shell.setHint(null);
-    this.viewport.setPickFilter("face");
+    this.shell.hideConfirmationCorner();
+    this.viewport.setPickFilter("all");
+    this.shell.setPickFilter("all");
     this.viewport.setSelectedFaces([]);
     this.viewport.setSelectedEdges([]);
+    this.viewport.setSelectedVertices([]);
 
     if (options.clearResults) this.feaResults.clear();
     if (!options.history) {
@@ -477,6 +648,9 @@ export class App {
 
     this.shell.setDocument(this.doc);
     this.shell.setMode(this.doc.mode);
+    this.language = this.doc.language ?? this.language;
+    this.shell.applyLanguage(this.language);
+    this.shell.commandManager.setLanguage(this.language);
     this.shell.setCommandTab(this.doc.mode === "assembly" ? "assembly" : this.doc.mode === "analysis" ? "analysis" : "features");
     this.shell.setDisplayState(this.displayStyle, this.planesVisible);
     this.viewport.setPlanesVisible(this.planesVisible);
@@ -559,6 +733,12 @@ export class App {
     return this.doc.parts.find((p) => p.id === this.doc.activePartId) ?? this.doc.parts[0];
   }
 
+  /** Study material with per-part overrides applied. */
+  private materialForStudy(study: AnalysisStudy | undefined): ReturnType<typeof partMaterial> {
+    const part = study ? this.doc.parts.find((p) => p.id === study.partId) : undefined;
+    return part ? partMaterial(part) : materialById(study?.materialId);
+  }
+
   private activeStudy(): AnalysisStudy | undefined {
     return this.doc.analyses.find((s) => s.id === this.doc.activeStudyId) ?? this.doc.analyses[0];
   }
@@ -610,6 +790,7 @@ export class App {
         assetBase64: part.asset?.dataBase64,
         assetFormat: part.asset?.format,
         assetRev: part.asset?.rev,
+        rollbackIndex: part.rollbackIndex,
       }));
     if (cadParts.length === 0) {
       this.refreshScene();
@@ -654,20 +835,36 @@ export class App {
   private refreshScene(): void {
     const bodies: SceneBody[] = [];
     const activePart = this.activePart();
+    // The section cut is done on the CPU (Sutherland–Hodgman + capped loops) so
+    // it behaves the same on the WebGL2 and WebGPU backends. Picking is disabled
+    // while the cut is active, so rebuilding the topology here is safe.
+    const cut = this.sectionState;
+    const sectionActive = cut.enabled && this.doc.mode !== "analysis";
+    const cutMesh = (mesh: MeshData): MeshData =>
+      sectionActive ? sectionMesh(mesh, { enabled: true, axis: cut.axis, offset: cut.offset, flipped: cut.flipped }) : mesh;
     if (this.doc.mode === "assembly") {
       for (const component of this.doc.components) {
         const part = this.doc.parts.find((p) => p.id === component.partId);
         if (!part) continue;
         const mesh = this.meshForPart(part.id);
         if (!mesh || mesh.positions.length === 0) continue;
+        let bodyMesh = mesh;
+        let position = component.position;
+        let rotation = component.rotation;
+        if (sectionActive) {
+          // Cut in world space, then place the already-transformed body at the origin.
+          bodyMesh = cutMesh(transformMeshData(mesh, componentMatrix(component.position, component.rotation)));
+          position = [0, 0, 0];
+          rotation = [0, 0, 0];
+        }
         bodies.push({
           partId: part.id,
           componentId: component.id,
-          mesh,
+          mesh: bodyMesh,
           color: component.color ?? part.color,
           visible: component.visible && part.visible,
-          position: component.position,
-          rotation: component.rotation,
+          position,
+          rotation,
         });
       }
     } else if (activePart) {
@@ -676,7 +873,7 @@ export class App {
         bodies.push({
           partId: activePart.id,
           componentId: null,
-          mesh,
+          mesh: cutMesh(mesh),
           color: activePart.color,
           visible: activePart.visible && !this.resultIsVisible(),
           position: [0, 0, 0],
@@ -685,6 +882,7 @@ export class App {
       }
     }
     this.viewport.setBodies(bodies);
+    this.viewport.setSectionState(this.sectionState);
     this.viewport.setActiveComponent(this.doc.mode === "assembly" ? this.doc.activeComponentId : null);
     if (this.doc.mode === "analysis") this.syncResultView();
     else {
@@ -707,6 +905,9 @@ export class App {
       let area = 0;
       let grams = 0;
       let count = 0;
+      let cx = 0;
+      let cy = 0;
+      let cz = 0;
       for (const component of this.doc.components) {
         if (!component.visible) continue;
         const part = this.doc.parts.find((p) => p.id === component.partId);
@@ -714,7 +915,11 @@ export class App {
         if (!part || !mesh || mesh.positions.length === 0) continue;
         volume += mesh.volume;
         area += mesh.area;
-        grams += mesh.volume * materialById(part.materialId).density * 1e-6;
+        grams += mesh.volume * (part.materialId ? partMaterial(part).density : 0) * 1e-6;
+        const centroid = meshMass(mesh).centroid;
+        cx += centroid[0] * mesh.volume;
+        cy += centroid[1] * mesh.volume;
+        cz += centroid[2] * mesh.volume;
         count++;
       }
       if (count === 0) {
@@ -725,6 +930,9 @@ export class App {
         { label: "Volume", value: `${fmt(volume, 0)} mm³` },
         { label: "Mass", value: grams >= 1000 ? `${fmt(grams / 1000, 3)} kg` : `${fmt(grams, 1)} g` },
         { label: "Area", value: `${fmt(area, 0)} mm²` },
+        { label: "CoM X", value: `${fmt(cx / volume, 2)} mm` },
+        { label: "CoM Y", value: `${fmt(cy / volume, 2)} mm` },
+        { label: "CoM Z", value: `${fmt(cz / volume, 2)} mm` },
         { label: "Components", value: `${count} visible` },
       ]);
       return;
@@ -735,11 +943,15 @@ export class App {
       this.shell.setMassRows([{ label: "Volume", value: "—" }, { label: "Mass", value: "—" }, { label: "Area", value: "—" }]);
       return;
     }
-    const material = materialById(part.materialId);
+    const material = part.materialId ? partMaterial(part) : undefined;
+    const centroid = meshMass(mesh).centroid;
     this.shell.setMassRows([
       { label: "Volume", value: `${fmt(mesh.volume, 0)} mm³` },
-      { label: "Mass", value: formatMass(mesh.volume, material.density) },
+      { label: "Mass", value: material ? formatMass(mesh.volume, material.density) : "no material" },
       { label: "Area", value: `${fmt(mesh.area, 0)} mm²` },
+      { label: "CoM X", value: `${fmt(centroid[0], 2)} mm` },
+      { label: "CoM Y", value: `${fmt(centroid[1], 2)} mm` },
+      { label: "CoM Z", value: `${fmt(centroid[2], 2)} mm` },
     ]);
   }
 
@@ -937,6 +1149,8 @@ export class App {
       items.push({ label: "Delete Feature", icon: "trash-2", run: () => void this.deleteSelected(), danger: true });
     }
     if (kind === "part") {
+      items.push({ label: "Edit Material…", icon: "layers", run: () => this.openMaterialDialog(id) });
+      items.push({ label: "Clear Rollback", icon: "refresh-cw", run: () => void this.runTreeAction("rollback-clear", "part", id) });
       items.push({ label: "Rename…", icon: "pencil", run: () => void this.renameSelected() });
       items.push({ label: "Delete Part", icon: "trash-2", run: () => void this.deleteSelected(), danger: true });
     }
@@ -1016,6 +1230,35 @@ export class App {
       await this.newStudy();
       return;
     }
+    if (action === "edit-material") {
+      this.openMaterialDialog(id);
+      return;
+    }
+    if (action === "rollback") {
+      const [partId, featureId] = (id ?? "").split("|");
+      const part = this.doc.parts.find((p) => p.id === partId);
+      const index = part?.features.findIndex((f) => f.id === featureId) ?? -1;
+      if (part && index >= 0) {
+        const before = this.capture();
+        part.rollbackIndex = index + 1;
+        this.commit(before);
+        this.refreshTree();
+        void this.rebuild();
+        toast(`Rolled back after ${part.features[index].name}.`, "info");
+      }
+      return;
+    }
+    if (action === "rollback-clear") {
+      const part = this.doc.parts.find((p) => p.id === id) ?? this.activePart();
+      if (part?.rollbackIndex !== undefined) {
+        const before = this.capture();
+        part.rollbackIndex = undefined;
+        this.commit(before);
+        this.refreshTree();
+        void this.rebuild();
+      }
+      return;
+    }
     if (action === "delete") {
       await this.deleteSelected();
       return;
@@ -1027,37 +1270,1031 @@ export class App {
 
   private handleFacePick(pick: FacePick | null): void {
     if (this.command?.onFace) {
-      if (pick) this.command.onFace(pick);
+      if (pick) this.command.onFace(pick, this.pickMods);
       return;
     }
     if (!pick) {
-      this.selectedFace = null;
-      this.viewport.setSelectedFaces([]);
-      this.shell.setSelection(null);
-      this.shell.setStatus("Ready");
+      if (!this.pickMods.additive) this.clearSelection();
       return;
     }
-    this.selectedFace = pick;
-    this.viewport.setSelectedFaces([{ componentId: pick.componentId, faceIndex: pick.faceIndex }]);
-    const materialName = pick.face.surface[0].toUpperCase() + pick.face.surface.slice(1);
-    this.shell.setSelection(`Face ${pick.faceIndex + 1} · ${materialName}`);
-    this.shell.setStatus(
-      `${componentName(this.doc, pick.componentId)} · face ${pick.faceIndex + 1} (${pick.face.surface}) selected`,
-    );
+    if (this.pickMods.additive) {
+      const i = this.selFaces.findIndex((f) => f.componentId === pick.componentId && f.faceIndex === pick.faceIndex);
+      if (i >= 0) this.selFaces.splice(i, 1);
+      else this.selFaces.push(pick);
+    } else {
+      this.selFaces = [pick];
+      this.selEdges = [];
+      this.selVertices = [];
+    }
+    this.selectedFace = this.selFaces[this.selFaces.length - 1] ?? null;
+    this.syncSelection();
   }
 
   private handleEdgePick(pick: EdgePick | null): void {
     if (this.command?.onEdge) {
-      if (pick) this.command.onEdge(pick);
+      if (pick) this.command.onEdge(pick, this.pickMods);
       return;
     }
     if (!pick) {
-      this.viewport.setSelectedEdges([]);
+      if (!this.pickMods.additive) this.clearSelection();
       return;
     }
-    this.viewport.setSelectedEdges([{ componentId: pick.componentId, edgeIndex: pick.edgeIndex }]);
-    this.shell.setSelection(`Edge ${pick.edgeIndex + 1} · ${fmt(pick.edge.length, 2)} mm`);
-    this.shell.setStatus(`Edge ${pick.edgeIndex + 1} selected`);
+    if (this.pickMods.additive) {
+      const i = this.selEdges.findIndex((e) => e.componentId === pick.componentId && e.edgeIndex === pick.edgeIndex);
+      if (i >= 0) this.selEdges.splice(i, 1);
+      else this.selEdges.push(pick);
+    } else {
+      this.selEdges = [pick];
+      this.selFaces = [];
+      this.selVertices = [];
+    }
+    this.syncSelection();
+  }
+
+  private handleVertexPick(pick: VertexPick | null): void {
+    if (this.command?.onVertex) {
+      if (pick) this.command.onVertex(pick, this.pickMods);
+      return;
+    }
+    if (!pick) {
+      if (!this.pickMods.additive) this.clearSelection();
+      return;
+    }
+    if (this.pickMods.additive) {
+      const key = pick.point.map((v) => Math.round(v * 100)).join(",");
+      const i = this.selVertices.findIndex((v) => v.point.map((q) => Math.round(q * 100)).join(",") === key);
+      if (i >= 0) this.selVertices.splice(i, 1);
+      else this.selVertices.push(pick);
+    } else {
+      this.selVertices = [pick];
+      this.selFaces = [];
+      this.selEdges = [];
+    }
+    this.syncSelection();
+  }
+
+  private clearSelection(): void {
+    this.selectedFace = null;
+    this.selFaces = [];
+    this.selEdges = [];
+    this.selVertices = [];
+    this.viewport.setSelectedFaces([]);
+    this.viewport.setSelectedEdges([]);
+    this.viewport.setSelectedVertices([]);
+    this.shell.setSelection(null);
+    this.shell.setStatus("Ready");
+  }
+
+  private syncSelection(): void {
+    this.viewport.setSelectedFaces(this.selFaces.map((p) => ({ componentId: p.componentId, faceIndex: p.faceIndex })));
+    this.viewport.setSelectedEdges(this.selEdges.map((p) => ({ componentId: p.componentId, edgeIndex: p.edgeIndex })));
+    this.viewport.setSelectedVertices(this.selVertices.map((p) => ({ componentId: p.componentId, point: p.point })));
+    const labels: string[] = [];
+    if (this.selFaces.length === 1) {
+      const f = this.selFaces[0];
+      labels.push(`Face ${f.faceIndex + 1} · ${f.face.surface}`);
+    } else if (this.selFaces.length > 1) labels.push(`${this.selFaces.length} faces`);
+    if (this.selEdges.length === 1) {
+      const e = this.selEdges[0];
+      labels.push(`Edge ${e.edgeIndex + 1} · ${fmt(e.edge.length, 2)} mm`);
+    } else if (this.selEdges.length > 1) {
+      const total = this.selEdges.reduce((sum, e) => sum + e.edge.length, 0);
+      labels.push(`${this.selEdges.length} edges · ${fmt(total, 1)} mm`);
+    }
+    if (this.selVertices.length === 1) labels.push(`Vertex (${this.selVertices[0].point.map((v) => fmt(v, 1)).join(", ")})`);
+    else if (this.selVertices.length > 1) labels.push(`${this.selVertices.length} vertices`);
+    this.shell.setSelection(labels.length ? labels.join("  ·  ") : null);
+    this.shell.setStatus(
+      labels.length
+        ? `${labels.join(" · ")} selected${this.selFaces.length + this.selEdges.length + this.selVertices.length > 1 ? " · Ctrl/Shift+click to add or remove" : ""}`
+        : "Ready",
+    );
+  }
+
+  private applyBoxSelection(selection: BoxSelection): void {
+    const filter = this.viewport.getPickFilter();
+    const additive = this.pickMods.additive;
+    const faces = filter === "face" || filter === "all" ? selection.faces : [];
+    const edges = filter === "edge" ? selection.edges : [];
+    const vertices = filter === "vertex" ? selection.vertices : [];
+    if (!additive) {
+      this.selFaces = [];
+      this.selEdges = [];
+      this.selVertices = [];
+    }
+    const faceKeys = new Set(this.selFaces.map((f) => `${f.componentId}:${f.faceIndex}`));
+    for (const f of faces) {
+      const key = `${f.componentId}:${f.faceIndex}`;
+      if (!faceKeys.has(key)) {
+        faceKeys.add(key);
+        this.selFaces.push(f);
+      }
+    }
+    const edgeKeys = new Set(this.selEdges.map((e) => `${e.componentId}:${e.edgeIndex}`));
+    for (const e of edges) {
+      const key = `${e.componentId}:${e.edgeIndex}`;
+      if (!edgeKeys.has(key)) {
+        edgeKeys.add(key);
+        this.selEdges.push(e);
+      }
+    }
+    const vKeys = new Set(this.selVertices.map((v) => v.point.map((q) => Math.round(q * 100)).join(",")));
+    for (const v of vertices) {
+      const key = v.point.map((q) => Math.round(q * 100)).join(",");
+      if (!vKeys.has(key)) {
+        vKeys.add(key);
+        this.selVertices.push(v);
+      }
+    }
+    this.syncSelection();
+    this.shell.setStatus(
+      `${selection.crossing ? "Crossing" : "Window"} selection · ${this.selFaces.length + this.selEdges.length + this.selVertices.length} object(s)`,
+    );
+  }
+
+  private setPickFilter(filter: PickFilter): void {
+    this.viewport.setPickFilter(filter);
+    this.shell.setPickFilter(filter);
+    if (filter === "edge") this.shell.setHint("Edge filter active · drag a window or Ctrl+click edges");
+    else if (filter === "vertex") this.shell.setHint("Vertex filter active · Ctrl+click to collect vertices");
+    else if (filter === "face") this.shell.setHint("Face filter active · Ctrl+click to collect faces");
+    else this.shell.setHint(null);
+  }
+
+  private openViewportContext(x: number, y: number, pick: { face?: FacePick; edge?: EdgePick; vertex?: VertexPick }): void {
+    const items: { label: string; icon?: string; run: () => void; danger?: boolean }[] = [];
+    if (pick.edge) {
+      const edge = pick.edge;
+      items.push({
+        label: "Select Loop",
+        icon: "refresh-cw",
+        run: () => {
+          const loop = this.viewport.edgeLoop(edge, false);
+          this.selEdges = loop;
+          this.syncSelection();
+          toast(`${loop.length} edge(s) in the loop.`, "info");
+        },
+      });
+      items.push({
+        label: "Select Tangency",
+        icon: "link",
+        run: () => {
+          const loop = this.viewport.edgeLoop(edge, true);
+          this.selEdges = loop;
+          this.syncSelection();
+          toast(`${loop.length} tangent edge(s).`, "info");
+        },
+      });
+      items.push({
+        label: "Measure Edge",
+        icon: "ruler",
+        run: () => {
+          this.selEdges = [edge];
+          this.syncSelection();
+          this.openMeasure();
+        },
+      });
+    } else if (pick.face) {
+      const face = pick.face;
+      items.push({
+        label: "Sketch on Face",
+        icon: "drafting-compass",
+        run: () => {
+          this.selFaces = [face];
+          this.selectedFace = face;
+          this.syncSelection();
+          void this.newSketchCommand();
+        },
+      });
+      items.push({
+        label: "Normal To",
+        icon: "camera",
+        run: () => {
+          this.selFaces = [face];
+          this.selectedFace = face;
+          this.syncSelection();
+          this.viewport.normalTo(face.face.point, face.face.normal);
+        },
+      });
+      items.push({
+        label: "Measure Face",
+        icon: "ruler",
+        run: () => {
+          this.selFaces = [face];
+          this.selectedFace = face;
+          this.syncSelection();
+          this.openMeasure();
+        },
+      });
+    } else if (pick.vertex) {
+      const vertex = pick.vertex;
+      items.push({
+        label: "Measure Vertex",
+        icon: "ruler",
+        run: () => {
+          this.selVertices = [vertex];
+          this.syncSelection();
+          this.openMeasure();
+        },
+      });
+    }
+    if (items.length) items.push({ label: "—", run: () => undefined });
+    const pickedPartId = pick.face?.partId ?? pick.edge?.partId ?? pick.vertex?.partId;
+    const pickedComponentId = pick.face?.componentId ?? pick.edge?.componentId ?? pick.vertex?.componentId;
+    items.push({
+      label: "Hide / Show",
+      icon: "eye",
+      run: () => {
+        const before = this.capture();
+        if (pickedComponentId) {
+          const component = this.doc.components.find((c) => c.id === pickedComponentId);
+          if (component) component.visible = !component.visible;
+        } else if (pickedPartId) {
+          const part = this.doc.parts.find((p) => p.id === pickedPartId);
+          if (part) part.visible = !part.visible;
+        }
+        this.commit(before);
+        this.refreshScene();
+        this.refreshTree();
+        toast("Visibility toggled.", "info");
+      },
+    });
+    const selected = this.selection;
+    if (selected) {
+      items.push({
+        label: `Edit ${selected.kind}`,
+        icon: "pencil",
+        run: () => void this.treeOpen(selected.kind, selected.id),
+      });
+      items.push({
+        label: `Delete ${selected.kind}`,
+        icon: "trash-2",
+        danger: true,
+        run: () => void this.deleteSelected(),
+      });
+    }
+    items.push({
+      label: "Zoom Fit",
+      icon: "maximize",
+      run: () => this.viewport.zoomFit(),
+    });
+    items.push({
+      label: "Isometric",
+      icon: "box",
+      run: () => this.viewport.setView("iso"),
+    });
+    items.push({
+      label: "Section View",
+      icon: "scan",
+      run: () => this.openSection(),
+    });
+    items.push({
+      label: "Clear Selection",
+      icon: "x",
+      run: () => this.clearSelection(),
+    });
+    const viewArea = this.shell.root.querySelector<HTMLElement>(".view-area");
+    const rect = viewArea?.getBoundingClientRect();
+    this.shell.showContextMenu(
+      Math.min(x - (rect?.left ?? 0), (rect?.width ?? 400) - 210),
+      Math.min(y - (rect?.top ?? 0), (rect?.height ?? 300) - 240),
+      items.filter((item) => item.label !== "—"),
+    );
+  }
+
+  private normalToSelected(): void {
+    const face = this.selFaces[this.selFaces.length - 1] ?? this.selectedFace;
+    if (face) {
+      this.viewport.normalTo(face.face.point, face.face.normal);
+      this.shell.setStatus(`Normal to face ${face.faceIndex + 1}`);
+      return;
+    }
+    this.viewport.setView("front");
+    this.shell.setStatus("Normal to front plane");
+  }
+
+  private openShortcutBar(): void {
+    const x = this.lastPointer.x || window.innerWidth / 2;
+    const y = this.lastPointer.y || window.innerHeight / 2;
+    const items = this.editor.isActive
+      ? [
+          { action: "tool-line", label: "Line", icon: "pencil" },
+          { action: "tool-rectangle", label: "Rectangle", icon: "rectangle-horizontal" },
+          { action: "tool-circle", label: "Circle", icon: "circle" },
+          { action: "tool-arc", label: "3-Pt Arc", icon: "circle-dot" },
+          { action: "tool-dimension", label: "Dimension", icon: "ruler" },
+          { action: "tool-trim", label: "Trim", icon: "split" },
+          { action: "sketch-offset", label: "Offset", icon: "arrow-right-left" },
+          { action: "tool-convert", label: "Convert", icon: "waypoints" },
+          { action: "sketch-construction", label: "Construction", icon: "ruler" },
+          { action: "exit-sketch", label: "Exit Sketch", icon: "check" },
+        ]
+      : [
+          { action: "new-sketch", label: "New Sketch", icon: "drafting-compass" },
+          { action: "extrude-boss", label: "Extrude", icon: "square" },
+          { action: "fillet", label: "Fillet", icon: "circle" },
+          { action: "shell", label: "Shell", icon: "box" },
+          { action: "measure", label: "Measure", icon: "ruler" },
+          { action: "section-view", label: "Section", icon: "scan" },
+          { action: "make-drawing", label: "Drawing", icon: "file-down" },
+          { action: "material-library", label: "Material", icon: "layers" },
+          { action: "equations", label: "Equations", icon: "equal" },
+          { action: "zoom-fit", label: "Zoom Fit", icon: "maximize" },
+        ];
+    this.shell.showShortcutBar(x, y, items);
+  }
+
+  private toggleLanguage(): void {
+    this.language = this.language === "en" ? "tr" : "en";
+    this.doc.language = this.language;
+    this.shell.setLanguageButton(this.language);
+    this.shell.applyLanguage(this.language);
+    this.shell.commandManager.setLanguage(this.language);
+    this.refreshTree();
+    this.touchDocument();
+    toast(this.language === "tr" ? "Arayüz dili: Türkçe" : "Interface language: English", "info");
+  }
+
+  // ---------------------------------------------------------------- measure
+
+  private openMeasure(): void {
+    if (this.command) this.cancelCommand();
+    // Seed from the current selection.
+    this.measurePicks = [
+      ...this.selEdges.map((e) => ({ kind: "edge" as const, label: `Edge ${e.edgeIndex + 1}`, point: e.edge.points[0] ?? [0, 0, 0], length: e.edge.length })),
+      ...this.selFaces.map((f) => ({ kind: "face" as const, label: `Face ${f.faceIndex + 1}`, point: f.face.point, normal: f.face.normal })),
+      ...this.selVertices.map((v) => ({ kind: "vertex" as const, label: "Vertex", point: v.point })),
+    ];
+    const addPick = (p: (typeof this.measurePicks)[number]) => {
+      if (this.measurePicks.length >= 2) this.measurePicks.shift();
+      this.measurePicks.push(p);
+      render();
+    };
+    this.command = {
+      kind: "measure",
+      onEdge: (pick, mods) => {
+        if (mods.additive && this.measurePicks.some((p) => p.kind === "edge" && p.label === `Edge ${pick.edgeIndex + 1}`)) {
+          this.measurePicks = this.measurePicks.filter((p) => p.label !== `Edge ${pick.edgeIndex + 1}`);
+          render();
+          return;
+        }
+        addPick({ kind: "edge", label: `Edge ${pick.edgeIndex + 1}`, point: pick.edge.points[0] ?? [0, 0, 0], length: pick.edge.length });
+      },
+      onFace: (pick, mods) => {
+        if (mods.additive && this.measurePicks.some((p) => p.kind === "face" && p.label === `Face ${pick.faceIndex + 1}`)) {
+          this.measurePicks = this.measurePicks.filter((p) => p.label !== `Face ${pick.faceIndex + 1}`);
+          render();
+          return;
+        }
+        addPick({ kind: "face", label: `Face ${pick.faceIndex + 1}`, point: pick.face.point, normal: pick.face.normal });
+      },
+      onVertex: (pick, mods) => {
+        if (mods.additive) {
+          this.measurePicks = this.measurePicks.filter((p) => p.point !== pick.point);
+          render();
+          return;
+        }
+        addPick({ kind: "vertex", label: "Vertex", point: pick.point });
+      },
+    };
+    const render = () => {
+      const host = this.panelRoot?.querySelector<HTMLElement>("#pm-measure");
+      if (host) host.innerHTML = this.measureHtml();
+      this.shell.setSelection(this.measurePicks.map((p) => `${p.label} ${p.length !== undefined ? fmt(p.length, 2) + " mm" : ""}`).join(" · ") || null);
+      this.showMeasureReadout();
+    };
+    this.viewport.setPickFilter("all");
+    this.shell.setPickFilter("all");
+    this.shell.setHint("Measure: click edges, faces or vertices. A second pick computes the distance/angle.");
+    this.showPanel({
+      icon: "ruler",
+      title: "Measure",
+      sub: "Distance · angle · length",
+      okTitle: "Done",
+      body: pmSection("Selections", "ruler", `<div id="pm-measure">${this.measureHtml()}</div><div class="hint" style="margin-top:6px">Ctrl+click a listed item to remove it. Edge length, face-to-face distance/angle and point-to-point distance are supported.</div>`),
+      onMount: () => {
+        render();
+      },
+      onOk: () => {
+        this.shell.measureEl.classList.remove("visible");
+        this.finishCommand();
+      },
+      onCancel: () => {
+        this.shell.measureEl.classList.remove("visible");
+        this.cancelCommand();
+      },
+    });
+    this.showMeasureReadout();
+  }
+
+  private measureHtml(): string {
+    const picks = this.measurePicks;
+    if (picks.length === 0) return `<div class="hint">Nothing selected yet.</div>`;
+    const rows = picks.map(
+      (p, i) =>
+        `<div class="measure-row"><span>${escapeHtml(p.label)}</span><span class="diff">${
+          p.kind === "edge" ? `${fmt(p.length ?? 0, 2)} mm` : p.kind === "face" ? "planar" : `(${p.point.map((v) => fmt(v, 1)).join(", ")})`
+        }</span><button class="x" data-measure-remove="${i}">${icon("x")}</button></div>`,
+    );
+    let result = "";
+    if (picks.length === 2) {
+      const [a, b] = picks;
+      if (a.kind === "vertex" && b.kind === "vertex") {
+        result = `Distance <b>${fmt(Math.hypot(a.point[0] - b.point[0], a.point[1] - b.point[1], a.point[2] - b.point[2]), 3)} mm</b>`;
+      } else if (a.kind === "face" && b.kind === "face" && a.normal && b.normal) {
+        const dx = b.point[0] - a.point[0];
+        const dy = b.point[1] - a.point[1];
+        const dz = b.point[2] - a.point[2];
+        const dist = Math.abs(dx * a.normal[0] + dy * a.normal[1] + dz * a.normal[2]);
+        const dot = a.normal[0] * b.normal[0] + a.normal[1] * b.normal[1] + a.normal[2] * b.normal[2];
+        const angle = (Math.acos(Math.max(-1, Math.min(1, Math.abs(dot)))) * 180) / Math.PI;
+        result = `Distance <b>${fmt(dist, 3)} mm</b> · Angle <b>${fmt(angle, 2)}°</b>`;
+      } else if (a.kind === "edge" && b.kind === "edge") {
+        const dist = Math.hypot(a.point[0] - b.point[0], a.point[1] - b.point[1], a.point[2] - b.point[2]);
+        result = `Midpoint distance <b>${fmt(dist, 3)} mm</b>`;
+      } else {
+        result = `Distance <b>${fmt(Math.hypot(a.point[0] - b.point[0], a.point[1] - b.point[1], a.point[2] - b.point[2]), 3)} mm</b>`;
+      }
+    } else if (picks.length === 1) {
+      result = picks[0].kind === "edge" ? `Length <b>${fmt(picks[0].length ?? 0, 3)} mm</b>` : picks[0].kind === "face" ? `Surface <b>${picks[0].normal ? "planar" : "face"}</b>` : `Point <b>(${picks[0].point.map((v) => fmt(v, 2)).join(", ")})</b>`;
+    }
+    const html = rows.join("") + (result ? `<div class="measure-row" style="border-top:1px solid #ccd9e5;margin-top:4px;padding-top:6px"><span>Result</span><span class="val">${result}</span></div>` : "");
+    window.setTimeout(() => {
+      this.panelRoot?.querySelectorAll<HTMLElement>("[data-measure-remove]").forEach((button) => {
+        button.onclick = () => {
+          this.measurePicks.splice(Number(button.dataset.measureRemove), 1);
+          const host = this.panelRoot?.querySelector<HTMLElement>("#pm-measure");
+          if (host) host.innerHTML = this.measureHtml();
+          this.showMeasureReadout();
+        };
+      });
+    }, 0);
+    return html;
+  }
+
+  private showMeasureReadout(): void {
+    const el = this.shell.measureEl;
+    if (this.measurePicks.length === 2) {
+      el.innerHTML = this.measureHtml().match(/Result<\/span><span class="val">([\s\S]*?)<\/span>/)?.[1] ?? "";
+      el.classList.toggle("visible", el.innerHTML.length > 0);
+    } else if (this.measurePicks.length === 1 && this.measurePicks[0].kind === "edge") {
+      el.innerHTML = `Edge length <b>${fmt(this.measurePicks[0].length ?? 0, 3)} mm</b>`;
+      el.classList.add("visible");
+    } else {
+      el.classList.remove("visible");
+      el.innerHTML = "";
+    }
+  }
+
+  // ---------------------------------------------------------------- section
+
+  private openSection(): void {
+    const part = this.activePart();
+    const mesh = part ? this.meshForPart(part.id) : undefined;
+    if (!mesh) {
+      toast("Create a body before using Section View.", "warn");
+      return;
+    }
+    const bbox = mesh.bbox;
+    const axisRange = (axis: "x" | "y" | "z") => {
+      const i = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+      return { min: bbox.min[i], max: bbox.max[i] };
+    };
+    const state = { ...this.sectionState };
+    let slider: HTMLInputElement | null = null;
+    let rangeEl: HTMLElement | null = null;
+    const sync = () => {
+      this.sectionState = { ...state };
+      this.shell.measureEl.classList.remove("visible");
+      this.viewport.setSelectedFaces([]);
+      this.viewport.setSelectedEdges([]);
+      this.viewport.setSelectedVertices([]);
+      this.viewport.setPickFilter(state.enabled ? "none" : this.viewport.getPickFilter());
+      this.refreshScene();
+      if (slider && rangeEl) rangeEl.textContent = `${state.axis.toUpperCase()} = ${fmt(state.offset, 2)} mm`;
+    };
+    const body =
+      pmSection(
+        "Section Settings",
+        "scan",
+        `<label class="check-row"><input type="checkbox" id="pm-section-enabled" ${state.enabled ? "checked" : ""} /> Enable section view</label>
+        ${pmField("Axis", `<select id="pm-section-axis"><option value="x" ${state.axis === "x" ? "selected" : ""}>X</option><option value="y" ${state.axis === "y" ? "selected" : ""}>Y</option><option value="z" ${state.axis === "z" ? "selected" : ""}>Z</option></select>`)}
+        <div class="field"><label>Offset <span class="section-legend" id="pm-section-offset-label"></span></label><input class="section-slider" id="pm-section-offset" type="range" min="-100" max="100" step="0.1" value="0" /></div>
+        <label class="check-row"><input type="checkbox" id="pm-section-flip" ${state.flipped ? "checked" : ""} /> Flip side</label>`,
+      ) +
+      `<div class="hint">The cut is a live triangle-clipped section with capped faces. Picking is disabled while the section is active.</div>`;
+    this.showPanel({
+      icon: "scan",
+      title: "Section View",
+      sub: `${state.axis.toUpperCase()} plane`,
+      body,
+      onMount: (root) => {
+        const axisSel = root.querySelector<HTMLSelectElement>("#pm-section-axis");
+        const enabled = root.querySelector<HTMLInputElement>("#pm-section-enabled");
+        const flip = root.querySelector<HTMLInputElement>("#pm-section-flip");
+        slider = root.querySelector<HTMLInputElement>("#pm-section-offset");
+        rangeEl = root.querySelector<HTMLElement>("#pm-section-offset-label");
+        const updateRange = () => {
+          if (!slider) return;
+          const r = axisRange(state.axis);
+          const pad = Math.max(1, (r.max - r.min) * 0.12);
+          slider.min = String(r.min - pad);
+          slider.max = String(r.max + pad);
+          slider.value = String((r.min + r.max) / 2);
+          state.offset = (r.min + r.max) / 2;
+        };
+        updateRange();
+        sync();
+        enabled?.addEventListener("change", () => {
+          state.enabled = enabled.checked;
+          state.offset = Number(slider?.value ?? 0);
+          sync();
+        });
+        axisSel?.addEventListener("change", () => {
+          state.axis = axisSel.value as "x" | "y" | "z";
+          updateRange();
+          state.enabled = true;
+          if (enabled) enabled.checked = true;
+          sync();
+        });
+        slider?.addEventListener("input", () => {
+          state.offset = Number(slider?.value ?? 0);
+          sync();
+        });
+        flip?.addEventListener("change", () => {
+          state.flipped = flip.checked;
+          sync();
+        });
+      },
+      onOk: () => {
+        this.sectionState = { ...state };
+        this.refreshScene();
+        this.finishCommand();
+        if (state.enabled) {
+          this.viewport.setPickFilter("none");
+          this.shell.setPickFilter("none");
+          toast("Section view active — reopen Section View to change or turn it off.", "info");
+        } else {
+          this.setPickFilter("all");
+          toast("Section view closed.", "info");
+        }
+      },
+      onCancel: () => {
+        this.sectionState = { enabled: false, axis: this.sectionState.axis, offset: this.sectionState.offset, flipped: this.sectionState.flipped };
+        this.refreshScene();
+        this.setPickFilter("all");
+        this.cancelCommand();
+      },
+    });
+  }
+
+  // --------------------------------------------------------------- drawing
+
+  private async makeDrawing(): Promise<void> {
+    const part = this.activePart();
+    const mesh = part ? this.meshForPart(part.id) : undefined;
+    if (!part || !mesh) {
+      toast("Create a part before generating a drawing.", "warn");
+      return;
+    }
+    const materialName = part.materialId ? partMaterial(part).name : "Material <not specified>";
+    const svg = buildDrawingSvg(mesh, {
+      partName: part.name,
+      material: materialName,
+      scale: "1:1",
+      units: "mm",
+      document: this.doc.name,
+    });
+    const body = document.createElement("div");
+    body.innerHTML = `<div class="drawing-preview">${svg}</div>
+      <div class="hint" style="margin-top:8px">A4 landscape · 3 orthographic views + isometric · overall width/height dimensions · title block (part, material, scale, units).</div>`;
+    const result = await openModal({
+      title: "Technical Drawing",
+      icon: "file-down",
+      body,
+      width: 840,
+      actions: [
+        { label: "Close", value: "close", kind: "plain" },
+        { label: "Download SVG", value: "svg", kind: "plain" },
+        { label: "Download PDF", value: "pdf", kind: "primary" },
+      ],
+    });
+    if (result === "svg") {
+      downloadText(svg, `${safeFilename(part.name)}.svg`, "image/svg+xml");
+      toast("Drawing exported as SVG.", "success");
+    } else if (result === "pdf") {
+      try {
+        await downloadDrawingPdf(svg, `${part.name}-drawing.pdf`);
+        toast("Drawing exported as PDF.", "success");
+      } catch (error) {
+        toast(`PDF export failed: ${messageOf(error)}`, "error");
+      }
+    }
+  }
+
+  // ---------------------------------------------------------- interference
+
+  private runInterference(): void {
+    if (this.doc.components.length < 2) {
+      toast("Interference detection needs at least two components.", "warn");
+      return;
+    }
+    const entries = this.doc.components
+      .map((c) => {
+        const part = this.doc.parts.find((p) => p.id === c.partId);
+        const mesh = part ? this.meshForPart(part.id) : undefined;
+        if (!part || !mesh) return null;
+        return { component: c, part, mesh: transformMeshData(mesh, componentMatrix(c.position, c.rotation)) };
+      })
+      .filter((e): e is NonNullable<typeof e> => !!e);
+    const results: { a: string; b: string; volume: number; points: number }[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = i + 1; j < entries.length; j++) {
+        const A = entries[i];
+        const B = entries[j];
+        const minA = A.mesh.bbox.min;
+        const maxA = A.mesh.bbox.max;
+        const minB = B.mesh.bbox.min;
+        const maxB = B.mesh.bbox.max;
+        const lo: Vec3 = [Math.max(minA[0], minB[0]), Math.max(minA[1], minB[1]), Math.max(minA[2], minB[2])];
+        const hi: Vec3 = [Math.min(maxA[0], maxB[0]), Math.min(maxA[1], maxB[1]), Math.min(maxA[2], maxB[2])];
+        if (hi[0] <= lo[0] || hi[1] <= lo[1] || hi[2] <= lo[2]) continue;
+        const step = Math.max(0.6, Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 14);
+        let inside = 0;
+        for (let x = lo[0] + step / 2; x < hi[0]; x += step) {
+          for (let y = lo[1] + step / 2; y < hi[1]; y += step) {
+            for (let z = lo[2] + step / 2; z < hi[2]; z += step) {
+              const p: Vec3 = [x, y, z];
+              if (pointInMesh(p, A.mesh) && pointInMesh(p, B.mesh)) inside++;
+            }
+          }
+        }
+        if (inside > 0) results.push({ a: A.component.name, b: B.component.name, volume: inside * step ** 3, points: inside });
+      }
+    }
+    const body = results.length
+      ? `<div class="study-stats">
+          ${results.map((r) => `<span>${escapeHtml(r.a)} ↔ ${escapeHtml(r.b)}</span><span style="color:#b03a2e;font-weight:600">interference · ≈ ${fmt(r.volume, 1)} mm³</span>`).join("")}
+        </div><div class="hint" style="margin-top:8px">Sampled at ~${fmt(1, 1)} mm grid resolution. Move one component (Assembly → Transform) to clear the overlap.</div>`
+      : `<p style="color:#2e7d5b"><b>No interference detected.</b></p><p>All pairwise component volumes are disjoint at the sampling resolution.</p>`;
+    void openModal({
+      title: "Interference Detection",
+      icon: "boxes",
+      body,
+      width: 520,
+      actions: [{ label: "Close", value: "close", kind: "primary" }],
+    });
+  }
+
+  // --------------------------------------------------------------- toolbox
+
+  private async openToolbox(kind: "bolt" | "nut" | "washer"): Promise<void> {
+    const body = document.createElement("div");
+    body.innerHTML = `
+      <div class="field"><label>Size</label><select id="tb-size">${METRIC_SIZES.map((s) => `<option value="${s.size}">${s.size} · across flats ${s.acrossFlats} mm</option>`).join("")}</select></div>
+      ${kind === "bolt" ? `<div class="field"><label>Length</label><div class="input-wrap"><input id="tb-length" type="number" min="4" step="1" value="20" /><span class="unit">mm</span></div></div>` : ""}
+      <label class="check-row"><input type="checkbox" id="tb-assembly" ${this.doc.mode === "assembly" ? "checked" : ""} /> Add as an assembly component</label>
+      <div class="hint">ISO 4014 hex bolt, ISO 4032 hex nut and ISO 7089 washer. AISI 1020 steel.</div>`;
+    const result = await openModal({
+      title: kind === "bolt" ? "Toolbox · Hex Bolt" : kind === "nut" ? "Toolbox · Hex Nut" : "Toolbox · Washer",
+      icon: "wrench",
+      body,
+      width: 430,
+      actions: [
+        { label: "Cancel", value: "cancel", kind: "plain" },
+        { label: "Create", value: "create", kind: "primary" },
+      ],
+    });
+    if (result !== "create") return;
+    const sizeEl = body.querySelector<HTMLSelectElement>("#tb-size");
+    const lengthEl = body.querySelector<HTMLInputElement>("#tb-length");
+    const addEl = body.querySelector<HTMLInputElement>("#tb-assembly");
+    const size = sizeEl?.value ?? "M6";
+    const length = lengthEl ? Number(lengthEl.value) || 20 : undefined;
+    const before = this.capture();
+    const part = createFastenerPart({ kind, size, length }, this.doc.parts.length);
+    const index = this.doc.parts.length;
+    this.doc.parts.push(part);
+    this.doc.activePartId = part.id;
+    if (this.doc.mode === "assembly" && addEl?.checked) {
+      const comp: Component = {
+        id: uid("comp"),
+        name: `${part.name}${index}`,
+        partId: part.id,
+        position: [index * 18, 0, 0],
+        rotation: [0, 0, 0],
+        visible: true,
+        fixed: false,
+      };
+      this.doc.components.push(comp);
+      this.doc.activeComponentId = comp.id;
+      this.solveMatesAndRefresh();
+    }
+    this.commit(before);
+    this.refreshTree();
+    await this.rebuild();
+    this.updateMassCard();
+    toast(`${part.name} created.`, "success");
+  }
+
+  private solveMatesAndRefresh(): void {
+    if (this.doc.mates.length) solveMates(this.doc);
+    this.refreshScene();
+  }
+
+  // ------------------------------------------------------------- equations
+
+  private openEquations(): void {
+    const body = document.createElement("div");
+    const render = () => {
+      const vars = this.doc.variables ?? [];
+      body.innerHTML = `
+        <div class="eq-list">
+          ${
+            vars
+              .map(
+                (v) => `<div class="eq-row">
+                  <code>${escapeHtml(v.name)}</code><span>=</span>
+                  <input class="eq-input" data-var-expr="${escapeHtml(v.id)}" value="${escapeHtml(v.expression)}" spellcheck="false" />
+                  <span class="eq-value" data-var-value="${escapeHtml(v.id)}">${fmt(v.value, 3)} mm</span>
+                  <button class="eq-del" data-var-del="${escapeHtml(v.id)}" title="Delete variable">×</button>
+                </div>`,
+              )
+              .join("") || `<div class="hint" style="padding:4px 0">No variables yet.</div>`
+          }
+        </div>
+        <div class="eq-add-row">
+          <div class="field"><label>Name</label><input id="eq-name" placeholder="L" /></div>
+          <div class="field"><label>Expression</label><input id="eq-expr" placeholder="100 or L / 2" /></div>
+          <button class="btn" id="eq-add">${icon("plus")} Add Variable</button>
+        </div>
+        <div class="hint" style="margin-top:8px">Dimensions can use these names: double-click a dimension and type <code>L</code> or <code>W</code>. Expressions are evaluated in declaration order (MMGS / NMM · mm).</div>`;
+      const refreshValues = () => {
+        const values: Record<string, number> = {};
+        for (const v of this.doc.variables ?? []) {
+          v.value = evaluateExpression(v.expression, values);
+          values[v.name] = v.value;
+          const cell = body.querySelector<HTMLElement>(`[data-var-value="${v.id}"]`);
+          if (cell) cell.textContent = `${fmt(v.value, 3)} mm`;
+        }
+      };
+      body.querySelectorAll<HTMLInputElement>("[data-var-expr]").forEach((input) => {
+        input.addEventListener("input", () => {
+          const variable = (this.doc.variables ?? []).find((v) => v.id === input.dataset.varExpr);
+          if (!variable) return;
+          variable.expression = input.value;
+          refreshValues();
+        });
+      });
+      body.querySelectorAll<HTMLElement>("[data-var-del]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const before = this.capture();
+          this.doc.variables = (this.doc.variables ?? []).filter((v) => v.id !== button.dataset.varDel);
+          applyVariables(this.doc);
+          this.commit(before);
+          this.refreshTree();
+          render();
+        });
+      });
+      body.querySelector("#eq-add")?.addEventListener("click", () => {
+        const name = body.querySelector<HTMLInputElement>("#eq-name")?.value.trim();
+        const expr = body.querySelector<HTMLInputElement>("#eq-expr")?.value.trim();
+        if (!name || !expr) {
+          toast("Enter a variable name and an expression.", "warn");
+          return;
+        }
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+          toast("Variable names must start with a letter or underscore.", "warn");
+          return;
+        }
+        const existing = (this.doc.variables ?? []).find((v) => v.name === name);
+        const before = this.capture();
+        if (existing) existing.expression = expr;
+        else {
+          if (!this.doc.variables) this.doc.variables = [];
+          this.doc.variables.push(makeVariable(name, expr));
+        }
+        applyVariables(this.doc);
+        this.commit(before);
+        this.refreshTree();
+        render();
+        toast(`${name} = ${expr} ${existing ? "updated" : "added"}.`, "success");
+      });
+    };
+    render();
+    void openModal({
+      title: "Equations / Variables",
+      icon: "equal",
+      body,
+      width: 560,
+      actions: [
+        { label: "Close", value: "close", kind: "plain" },
+        { label: "Apply", value: "apply", kind: "primary" },
+      ],
+    }).then((result) => {
+      if (result === "apply") {
+        const before = this.capture();
+        applyVariables(this.doc);
+        this.commit(before);
+        this.refreshTree();
+        this.updateMassCard();
+        void this.rebuild();
+        const values = variableValues(this.doc);
+        const text = Object.entries(values).map(([k, v]) => `${k}=${fmt(v, 2)}`).join(", ");
+        toast(`Variables applied${text ? `: ${text}` : " (none defined)"}.`, "success");
+      }
+    });
+  }
+
+  // ------------------------------------------------------------- AI bridge
+
+  private async applyAiCommands(commands: AiCommand[], message: string): Promise<void> {
+    if (this.command) this.cancelCommand();
+    const before = this.capture();
+    let applied = 0;
+    for (const command of commands) {
+      try {
+        const ok = await this.applyAiCommand(command);
+        if (ok) applied++;
+      } catch (error) {
+        toast(`AI command "${command.action}" failed: ${messageOf(error)}`, "warn", 6000);
+      }
+    }
+    if (applied > 0) {
+      this.commit(before);
+      this.refreshTree();
+      this.updateMassCard();
+      await this.rebuild();
+      this.touchDocument();
+    }
+    toast(`AI: ${applied}/${commands.length} command(s) applied. ${message}`, applied ? "success" : "info", 6500);
+  }
+
+  private async applyAiCommand(command: AiCommand): Promise<boolean> {
+    const params = command.params ?? {};
+    const num = (key: string, fallback = 0) => {
+      const value = Number(params[key]);
+      return Number.isFinite(value) ? value : fallback;
+    };
+    const text = (key: string, fallback = "") => String(params[key] ?? fallback);
+    const active = this.activePart();
+    switch (command.action) {
+      case "box":
+        this.createBoxPart(num("length", 80), num("width", 40), num("height", 20));
+        return true;
+      case "cylinder":
+        this.createCylinderPart(num("diameter", 30), num("height", 40));
+        return true;
+      case "extrude": {
+        if (!active) return false;
+        const sketch = active.sketches.find((s) => s.name === text("sketch") || s.id === text("sketch")) ?? this.defaultSketchForFeature(active);
+        if (!sketch) return false;
+        active.features.push({
+          id: uid("feat"),
+          type: "extrude",
+          name: nextFeatureName("extrude", active.features),
+          sketchId: sketch.id,
+          params: { depth: Math.max(0.1, num("depth", 10)), direction: params.direction === -1 ? -1 : 1, operation: "join" },
+        });
+        return true;
+      }
+      case "fillet":
+      case "chamfer": {
+        if (!active) return false;
+        const mesh = this.meshForPart(active.id);
+        if (!mesh) return false;
+        const indices = text("edges") === "all" || !params.edges ? mesh.edges.map((e) => e.index) : (params.edges as number[]);
+        active.features.push({
+          id: uid("feat"),
+          type: command.action,
+          name: nextFeatureName(command.action, active.features),
+          params: command.action === "fillet" ? { radius: Math.max(0.01, num("radius", 2)), edgeIndices: indices } : { distance: Math.max(0.01, num("distance", 1)), edgeIndices: indices },
+        });
+        return true;
+      }
+      case "shell":
+        if (!active) return false;
+        active.features.push({ id: uid("feat"), type: "shell", name: nextFeatureName("shell", active.features), params: { thickness: Math.max(0.05, num("thickness", 2)) } });
+        return true;
+      case "material": {
+        const id = text("id", "aisi1020");
+        if (!MATERIALS.some((m) => m.id === id)) return false;
+        this.assignMaterial(id);
+        return true;
+      }
+      case "variable": {
+        if (!this.doc.variables) this.doc.variables = [];
+        this.doc.variables.push(makeVariable(text("name", "L"), text("expression", "100")));
+        applyVariables(this.doc);
+        return true;
+      }
+      case "variable-normal": {
+        this.doc.variables = standardVariables((params.variables as [string, string][]) ?? []);
+        applyVariables(this.doc);
+        return true;
+      }
+      case "measure":
+        this.openMeasure();
+        return true;
+      case "view": {
+        const name = text("name", "iso") as ViewName;
+        this.viewport.setView(["front", "back", "top", "bottom", "right", "left", "iso"].includes(name) ? name : "iso");
+        return true;
+      }
+      case "section":
+        this.sectionState = { enabled: true, axis: (text("axis", "z") as "x" | "y" | "z"), offset: num("offset", 0), flipped: params.flipped === true };
+        this.refreshScene();
+        return true;
+      case "drawing":
+        await this.makeDrawing();
+        return true;
+      case "fea":
+        this.setupFeaFromAi(params);
+        return true;
+      case "action":
+        await this.runAction(text("name"));
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private createBoxPart(length: number, width: number, height: number): Part | null {
+    const part = createPart(`Box ${this.doc.parts.length + 1}`, this.doc.parts.length);
+    const plane = basePlane("top");
+    const sketch: Sketch = { id: uid("sk"), name: "Sketch1", plane, points: [], entities: [], constraints: [], visible: false };
+    const x = Math.max(1, length) / 2;
+    const z = Math.max(1, width) / 2;
+    const pts: [number, number][] = [
+      [-x, -z],
+      [x, -z],
+      [x, z],
+      [-x, z],
+    ];
+    for (const [a, b] of pts) sketch.points.push({ id: uid("pt"), x: a, y: b });
+    for (let i = 0; i < 4; i++) sketch.entities.push({ id: uid("ln"), kind: "line", p1: sketch.points[i].id, p2: sketch.points[(i + 1) % 4].id });
+    part.sketches.push(sketch);
+    part.features.push({ id: uid("feat"), type: "extrude", name: "Boss-Extrude1", sketchId: sketch.id, params: { depth: Math.max(0.2, height), direction: 1, operation: "new" } });
+    this.doc.parts.push(part);
+    this.doc.activePartId = part.id;
+    this.selection = { kind: "feature", id: part.features[0].id };
+    return part;
+  }
+
+  private createCylinderPart(diameter: number, height: number): Part | null {
+    const part = createPart(`Cylinder ${this.doc.parts.length + 1}`, this.doc.parts.length);
+    const plane = basePlane("top");
+    const sketch: Sketch = { id: uid("sk"), name: "Sketch1", plane, points: [], entities: [], constraints: [], visible: false };
+    const center = { id: uid("pt"), x: 0, y: 0 };
+    sketch.points.push(center);
+    sketch.entities.push({ id: uid("ci"), kind: "circle", center: center.id, radius: Math.max(0.5, diameter / 2) });
+    sketch.constraints.push({ id: uid("c"), type: "radius", entity: sketch.entities[0].id, value: Math.max(0.5, diameter / 2) });
+    part.sketches.push(sketch);
+    part.features.push({ id: uid("feat"), type: "extrude", name: "Boss-Extrude1", sketchId: sketch.id, params: { depth: Math.max(0.2, height), direction: 1, operation: "new" } });
+    this.doc.parts.push(part);
+    this.doc.activePartId = part.id;
+    return part;
+  }
+
+  private assignMaterial(id: string): void {
+    const part = this.activePart();
+    if (!part) return;
+    part.materialId = id;
+    part.materialOverride = undefined;
+    for (const study of this.doc.analyses) if (study.partId === part.id) {
+      study.materialId = id;
+      study.stale = study.status === "solved";
+    }
+    this.updateMassCard();
+    this.refreshTree();
+  }
+
+  private setupFeaFromAi(params: Record<string, unknown>): void {
+    const part = this.activePart();
+    if (!part) return;
+    if (this.doc.mode !== "analysis") {
+      this.doc.mode = "analysis";
+      this.shell.setMode("analysis");
+      this.shell.setCommandTab("analysis");
+    }
+    let study = this.doc.analyses.find((s) => s.partId === part.id);
+    if (!study) {
+      study = {
+        id: uid("study"),
+        name: `Static ${this.doc.analyses.length + 1}`,
+        partId: part.id,
+        materialId: part.materialId ?? "aisi1020",
+        meshSize: Number(params.meshSize) || Math.max(0.5, Math.round((part ? this.meshForPart(part.id)?.bbox.max[0] ?? 80 : 80) / 20)),
+        supports: [],
+        loads: [],
+        status: "draft",
+      };
+      this.doc.analyses.push(study);
+      this.doc.activeStudyId = study.id;
+    }
+    if (typeof params.material === "string" && MATERIALS.some((m) => m.id === params.material)) study.materialId = params.material;
+    this.refreshTree();
+    this.openStudyPanel();
   }
 
   private cancelCommand(): void {
@@ -1071,10 +2308,12 @@ export class App {
       }
     }
     if (!this.editor.isActive) {
-      this.viewport.setPickFilter("face");
+      this.viewport.setPickFilter("all");
       this.viewport.setSelectedFaces([]);
       this.viewport.setSelectedEdges([]);
+      this.viewport.setSelectedVertices([]);
     }
+    this.shell.hideConfirmationCorner();
     this.shell.setActiveCommand(null);
     this.shell.setHint(null);
     this.panelRoot = null;
@@ -1085,9 +2324,11 @@ export class App {
   private finishCommand(): void {
     this.command = null;
     this.panelRoot = null;
-    this.viewport.setPickFilter("face");
+    this.viewport.setPickFilter("all");
     this.viewport.setSelectedFaces([]);
     this.viewport.setSelectedEdges([]);
+    this.viewport.setSelectedVertices([]);
+    this.shell.hideConfirmationCorner();
     this.shell.setActiveCommand(null);
     this.shell.setHint(null);
     this.shell.clearProperty();
@@ -1119,6 +2360,10 @@ export class App {
       else this.cancelCommand();
     });
     options.onMount?.(root);
+    this.shell.showConfirmationCorner(
+      () => root.querySelector<HTMLElement>("[data-pm-ok]")?.click(),
+      () => root.querySelector<HTMLElement>("[data-pm-cancel]")?.click(),
+    );
     return root;
   }
 
@@ -1369,6 +2614,9 @@ export class App {
       circle: "Circle: click the centre, then drag or click to set the radius.",
       arc: "3-point arc: click the start point, the end point, then a point on the arc.",
       dimension: "Smart Dimension: click a line, then place the dimension. Double-click the label to change it.",
+      trim: "Trim: click the part of an entity to cut away between its intersections.",
+      offset: "Offset Entities: select entities, then choose Offset and enter the distance.",
+      convert: "Convert Entities: click a 3D edge to project it into the active sketch.",
     };
     this.shell.setHint(hints[tool]);
     this.shell.setActiveCommand(`tool-${tool}`);
@@ -1387,15 +2635,48 @@ export class App {
     const constraint = sketch.constraints.find((c) => c.id === constraintId);
     if (!constraint || (constraint.type !== "distance" && constraint.type !== "radius")) return;
     const current = constraint.value ?? dimensionValue(sketch, constraint.a, constraint.b, constraint.entity);
-    const value = await promptNumber({
+    const values = variableValues(this.doc);
+    const variableHint =
+      Object.entries(values)
+        .map(([name, value]) => `${name}=${fmt(value, 2)}`)
+        .join(", ") || "none yet (Tools → Equations / Variables)";
+    const body = document.createElement("div");
+    body.innerHTML = `
+      <label style="display:block;font-size:11px;color:#5a6c7e;margin-bottom:5px;">${constraint.type === "radius" ? "Radius" : "Length"} or expression</label>
+      <input id="dim-value" type="text" value="${escapeHtml(constraint.expression ?? String(Math.max(0.01, current)))}" style="font-family:var(--mono);font-size:15px;height:34px;width:100%" />
+      <div class="hint" id="dim-preview" style="margin-top:8px;"></div>
+      <div class="hint">Variables: ${escapeHtml(variableHint)}. Try <code>L</code>, <code>L / 2</code> or <code>40 + 5</code>.</div>`;
+    const input = body.querySelector<HTMLInputElement>("#dim-value");
+    const preview = body.querySelector<HTMLElement>("#dim-preview");
+    const update = () => {
+      if (!input || !preview) return;
+      const text = input.value.trim();
+      const numeric = Number(text);
+      const value = Number.isFinite(numeric) ? numeric : evaluateExpression(text, values);
+      preview.textContent = Number.isFinite(value) && value > 0 ? `= ${fmt(value, 3)} mm${constraint.expression ? " (driven by a variable)" : ""}` : "Enter a positive number or a valid expression.";
+    };
+    input?.addEventListener("input", update);
+    update();
+    const result = await openModal({
       title: constraint.type === "radius" ? "Edit Radius" : "Edit Dimension",
-      label: constraint.type === "radius" ? "Radius" : "Length",
-      value: Math.max(0.01, current),
-      unit: "mm",
-      min: 0.01,
-      step: 0.5,
+      icon: "ruler",
+      body,
+      width: 420,
+      actions: [
+        { label: "Cancel", value: "cancel", kind: "plain" },
+        { label: "OK", value: "ok", kind: "primary" },
+      ],
     });
-    if (value === null) return;
+    if (result !== "ok") return;
+    const text = (input?.value ?? "").trim();
+    if (!text) return;
+    const numeric = Number(text);
+    const value = Number.isFinite(numeric) ? numeric : evaluateExpression(text, values);
+    if (!Number.isFinite(value) || value <= 0) {
+      toast("Enter a positive number or a valid expression.", "warn");
+      return;
+    }
+    constraint.expression = Number.isFinite(numeric) ? undefined : text;
     this.editor.setDimensionValue(constraintId, value);
     this.sketchDirty = true;
     this.updateSketchPanelInfo();
@@ -1411,6 +2692,7 @@ export class App {
     const part = sketch ? this.doc.parts.find((p) => p.sketches.some((s) => s.id === sketch.id)) : undefined;
     this.editor.end();
     this.shell.setSketching(false);
+    this.shell.setSketchStatus(null);
     this.shell.setActiveCommand(null);
     this.shell.setCursor(null);
     this.shell.setSelection(null);
@@ -1447,6 +2729,7 @@ export class App {
     const start = this.sketchStartDoc;
     this.editor.end();
     this.shell.setSketching(false);
+    this.shell.setSketchStatus(null);
     this.shell.setActiveCommand(null);
     this.shell.setCursor(null);
     this.shell.setSelection(null);
@@ -1459,7 +2742,7 @@ export class App {
     if (start) this.doc = cloneDocument(start);
     this.shell.clearProperty();
     this.shell.showTree();
-    this.viewport.setPickFilter("face");
+    this.viewport.setPickFilter("all");
     this.refreshTree();
     this.touchDocument();
     toast("Sketch changes discarded.", "info");
@@ -1693,7 +2976,7 @@ export class App {
       return;
     }
     if (this.command) this.cancelCommand();
-    const picked = new Set<number>(existing?.params.edgeIndices ?? []);
+    const picked = new Set<number>(existing?.params.edgeIndices ?? this.selEdges.map((e) => e.edgeIndex));
     const isFillet = type === "fillet";
     const size = isFillet ? Math.abs(existing?.params.radius ?? 2) : Math.abs(existing?.params.distance ?? 1);
     this.command = {
@@ -1721,7 +3004,7 @@ export class App {
     };
     this.viewport.setPickFilter("edge");
     this.shell.setHint(`Click edges in the viewport to ${existing ? "edit" : "add"} the ${isFillet ? "fillet" : "chamfer"}.`);
-    this.showPanel({
+        this.showPanel({
       icon: isFillet ? "circle" : "triangle",
       title: existing ? `Edit ${existing.name}` : isFillet ? "Fillet" : "Chamfer",
       sub: `${picked.size} edge(s)`,
@@ -1768,6 +3051,134 @@ export class App {
         this.refreshTree();
         void this.rebuild();
         toast(`${isFillet ? "Fillet" : "Chamfer"} applied to ${picked.size} edge(s).`, "success");
+      },
+    });
+  }
+
+  private openShell(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to modify the part.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part || !this.meshForPart(part.id)) {
+      toast("Create a body before shelling it.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "box",
+      title: "Shell",
+      sub: "Constant wall thickness",
+      body:
+        pmSection("Parameters", "box", pmField("Thickness", numInput("pm-shell-thickness", 2, "mm", 0.05)) + `<div class="hint">The +Y-facing face is removed, producing an open enclosure. Wall thickness is applied on all remaining sides.</div>`),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const value = Math.max(0.05, readNumber(root, "pm-shell-thickness", 2));
+        const before = this.capture();
+        part.features.push({
+          id: uid("feat"),
+          type: "shell",
+          name: nextFeatureName("shell", part.features),
+          params: { thickness: value },
+        });
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: part.features[part.features.length - 1].id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+        toast(`Shell ${fmt(value, 2)} mm applied.`, "success");
+      },
+    });
+  }
+
+  private openMirror(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to modify the part.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part || !this.meshForPart(part.id)) {
+      toast("Create a body before mirroring it.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "arrow-right-left",
+      title: "Mirror",
+      sub: "Mirror the body about a base plane",
+      body: pmSection(
+        "Parameters",
+        "frame",
+        pmField(
+          "Mirror plane",
+          `<select id="pm-mirror-plane"><option value="right">Right Plane (YZ)</option><option value="front">Front Plane (XY)</option><option value="top">Top Plane (XZ)</option></select>`,
+        ) + `<div class="hint">The mirrored copy is fused to the original body.</div>`,
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const mirrorPlane = readText(root, "pm-mirror-plane", "right") as "front" | "top" | "right";
+        const before = this.capture();
+        part.features.push({
+          id: uid("feat"),
+          type: "mirror",
+          name: nextFeatureName("mirror", part.features),
+          params: { mirrorPlane },
+        });
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: part.features[part.features.length - 1].id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+        toast(`Mirror about the ${mirrorPlane} plane applied.`, "success");
+      },
+    });
+  }
+
+  private openPattern(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to modify the part.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part || !this.meshForPart(part.id)) {
+      toast("Create a body before patterning it.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "layout-grid",
+      title: "Linear Pattern",
+      sub: "Repeat the body along an axis",
+      body: pmSection(
+        "Parameters",
+        "layout-grid",
+        pmField("Axis", `<select id="pm-pattern-axis"><option value="x">X</option><option value="y">Y</option><option value="z">Z</option></select>`) +
+          pmField("Count", numInput("pm-pattern-count", 2, "", 2)) +
+          pmField("Spacing", numInput("pm-pattern-spacing", 20, "mm", 0.01)) +
+          `<div class="hint">Copies are fused into the same body, so the result is a single solid.</div>`,
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const patternAxis = readText(root, "pm-pattern-axis", "x") as "x" | "y" | "z";
+        const patternCount = Math.max(2, Math.round(readNumber(root, "pm-pattern-count", 2)));
+        const patternSpacing = Math.max(0.01, readNumber(root, "pm-pattern-spacing", 20));
+        const before = this.capture();
+        part.features.push({
+          id: uid("feat"),
+          type: "pattern",
+          name: nextFeatureName("pattern", part.features),
+          params: { patternAxis, patternCount, patternSpacing },
+        });
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: part.features[part.features.length - 1].id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+        toast(`Linear pattern ${patternCount} × ${fmt(patternSpacing, 1)} mm applied.`, "success");
       },
     });
   }
@@ -2251,7 +3662,7 @@ export class App {
     this.refreshTree();
 
     study = this.activeStudy() ?? study;
-    const material = materialById(study.materialId);
+    const material = this.materialForStudy(study);
     const mesh = this.meshForPart(study.partId);
     const result = this.feaResults.get(study.id);
     const triangleCount = mesh ? Math.round(mesh.indices.length / 3) : 0;
@@ -2320,7 +3731,7 @@ export class App {
           </div>
           ${resultStats}`,
         ) +
-        `<div class="hint">Units: mm, N, MPa. The solver uses 8-node hexahedra with a Jacobi-preconditioned conjugate-gradient iteration.</div>`,
+        `<div class="hint">Unit system: <b>MMGS / NMM</b> (mm, N, MPa). The solver uses 8-node hexahedra with a Jacobi-preconditioned conjugate-gradient iteration.</div>`,
       onMount: (root) => {
         this.refreshPickLists(study);
         this.bindPickListRemoval(study);
@@ -2669,7 +4080,7 @@ export class App {
       toast("The study part has no surface mesh. Rebuild the model first.", "warn");
       return;
     }
-    const material = materialById(study.materialId);
+    const material = this.materialForStudy(study);
     const loads: FeaLoadSpec[] = study.loads.map((load) => ({
       type: load.type,
       faceIndex: load.faceIndex,
@@ -2696,6 +4107,7 @@ export class App {
       );
       this.feaResults.set(study.id, outcome.result);
       study.status = "solved";
+      study.stale = false;
       study.meshStats = { nodes: outcome.nodes, elements: outcome.elements };
       study.error = undefined;
       this.resultScale = 1;
@@ -2756,7 +4168,7 @@ export class App {
       return;
     }
     this.activeResult = mode;
-    this.resultView.setResult(result, materialById(study.materialId).yield);
+    this.resultView.setResult(result, this.materialForStudy(study).yield);
     const display = this.renderResultUi(mode);
     if (!display) return;
     this.shell.showResultToolbar(this.resultToolbarHtml(mode));
@@ -2836,7 +4248,7 @@ export class App {
       this.toolbarMode = null;
       return;
     }
-    const yieldStrength = materialById(study.materialId).yield;
+    const yieldStrength = this.materialForStudy(study).yield;
     this.resultView.setResult(result, yieldStrength);
     this.renderResultUi(this.activeResult);
     if (this.toolbarMode !== this.activeResult) {
@@ -3327,7 +4739,7 @@ export class App {
         const part = this.doc.parts.find((p) => p.id === component.partId);
         const mesh = part ? this.meshForPart(part.id) : undefined;
         if (!part || !mesh) continue;
-        const material = materialById(part.materialId);
+        const material = partMaterial(part);
         const componentMass = mesh.volume * material.density * 1e-9;
         volume += mesh.volume;
         mass += componentMass;
@@ -3348,8 +4760,8 @@ export class App {
         toast("There is no body to measure.", "warn");
         return;
       }
-      const material = materialById(part.materialId);
-      const mass = mesh.volume * material.density * 1e-9;
+      const material = part.materialId ? partMaterial(part) : undefined;
+      const mass = mesh.volume * (material?.density ?? 0) * 1e-9;
       const centroid = meshMass(mesh).centroid;
       const size: Vec3 = [
         mesh.bbox.max[0] - mesh.bbox.min[0],
@@ -3358,13 +4770,15 @@ export class App {
       ];
       body.innerHTML = `<div class="study-stats">
         <span>Part</span><span>${escapeHtml(part.name)}</span>
-        <span>Material</span><span>${material.name}</span>
+        <span>Material</span><span>${material ? escapeHtml(material.name) : "Material &lt;not specified&gt;"}</span>
         <span>Volume</span><span>${fmt(mesh.volume, 2)} mm³</span>
-        <span>Mass</span><span>${fmt(mass, 5)} kg (${fmt(mass * 1000, 1)} g)</span>
+        <span>Mass</span><span>${material ? `${fmt(mass, 5)} kg (${fmt(mass * 1000, 1)} g)` : "— assign a material"}</span>
         <span>Surface area</span><span>${fmt(mesh.area, 2)} mm²</span>
         <span>Bounding box</span><span>${fmt(size[0], 2)} × ${fmt(size[1], 2)} × ${fmt(size[2], 2)} mm</span>
-        <span>Centroid</span><span>${fmt(centroid[0], 2)}, ${fmt(centroid[1], 2)}, ${fmt(centroid[2], 2)} mm</span>
-        <span>Density</span><span>${fmt(material.density, 0)} kg/m³</span>
+        <span>Center of mass X</span><span>${fmt(centroid[0], 2)} mm</span>
+        <span>Center of mass Y</span><span>${fmt(centroid[1], 2)} mm</span>
+        <span>Center of mass Z</span><span>${fmt(centroid[2], 2)} mm</span>
+        <span>Density</span><span>${material ? `${fmt(material.density, 0)} kg/m³` : "—"}</span>
         <span>Triangles</span><span>${Math.round(mesh.indices.length / 3).toLocaleString()}</span>
       </div>`;
     }
@@ -3375,6 +4789,247 @@ export class App {
       width: 500,
       actions: [{ label: "Close", value: "close", kind: "primary" }],
     });
+  }
+
+  private openMaterialDialog(partId?: string): void {
+    const part = this.doc.parts.find((p) => p.id === partId) ?? this.activePart();
+    if (!part) return;
+    const current = partMaterial(part);
+    const isCustom = part.materialId === "custom";
+    const body = document.createElement("div");
+    body.innerHTML = `
+      <div class="material-edit-preview">
+        <span class="swatch" id="mat-swatch" style="background:${current.color}"></span>
+        <div style="flex:1"><div style="font-weight:600" id="mat-preview-name">${escapeHtml(current.name)}</div>
+        <div class="hint" id="mat-preview-props">${escapeHtml(part.name)} · effective material</div></div>
+      </div>
+      <div class="field"><label>Library material</label>
+        <select id="mat-select">${MATERIALS.map((m) => `<option value="${m.id}" ${m.id === (part.materialId ?? "") ? "selected" : ""}>${escapeHtml(m.name)}</option>`).join("")}</select>
+      </div>
+      <div class="edit-material-grid">
+        <div class="field"><label>Name</label><input id="mat-name" value="${escapeHtml(current.name)}" /></div>
+        <div class="field"><label>Density ρ (kg/m³)</label><input id="mat-density" type="number" step="10" value="${current.density}" /></div>
+        <div class="field"><label>Young's modulus E (MPa)</label><input id="mat-E" type="number" step="1000" value="${current.E}" /></div>
+        <div class="field"><label>Poisson ν</label><input id="mat-nu" type="number" step="0.01" value="${current.nu}" /></div>
+        <div class="field"><label>Yield strength σy (MPa)</label><input id="mat-yield" type="number" step="1" value="${current.yield}" /></div>
+        <div class="field"><label>&nbsp;</label><button class="btn" id="mat-custom">Custom values</button></div>
+      </div>
+      <div class="hint">Density drives mass properties; E, ν and σy drive the static study. Editing values stores a per-part override.</div>`;
+    let dirty = false;
+    const fields = () => ({
+      name: body.querySelector<HTMLInputElement>("#mat-name")?.value.trim() || "Custom Material",
+      density: Number(body.querySelector<HTMLInputElement>("#mat-density")?.value) || 7850,
+      E: Number(body.querySelector<HTMLInputElement>("#mat-E")?.value) || 200000,
+      nu: Number(body.querySelector<HTMLInputElement>("#mat-nu")?.value) || 0.3,
+      yield: Number(body.querySelector<HTMLInputElement>("#mat-yield")?.value) || 250,
+    });
+    const syncPreview = () => {
+      const f = fields();
+      const sw = body.querySelector<HTMLElement>("#mat-swatch");
+      const name = body.querySelector<HTMLElement>("#mat-preview-name");
+      const props = body.querySelector<HTMLElement>("#mat-preview-props");
+      const lib = MATERIALS.find((m) => m.id === body.querySelector<HTMLSelectElement>("#mat-select")?.value);
+      if (sw && lib) sw.style.background = lib.color;
+      if (name) name.textContent = f.name;
+      if (props) props.textContent = `E ${fmt(f.E, 0)} MPa · ν ${fmt(f.nu, 2)} · σy ${fmt(f.yield, 0)} MPa · ρ ${fmt(f.density, 0)} kg/m³`;
+    };
+    body.querySelector("#mat-select")?.addEventListener("change", () => {
+      const id = body.querySelector<HTMLSelectElement>("#mat-select")?.value ?? "steel";
+      const m = MATERIALS.find((q) => q.id === id);
+      if (!m) return;
+      const set = (sel: string, value: number | string) => {
+        const el = body.querySelector<HTMLInputElement>(sel);
+        if (el) el.value = String(value);
+      };
+      set("#mat-name", m.name);
+      set("#mat-density", m.density);
+      set("#mat-E", m.E);
+      set("#mat-nu", m.nu);
+      set("#mat-yield", m.yield);
+      dirty = false;
+      syncPreview();
+    });
+    body.querySelector("#mat-custom")?.addEventListener("click", () => {
+      const sel = body.querySelector<HTMLSelectElement>("#mat-select");
+      if (sel) sel.value = "custom";
+      const nameInput = body.querySelector<HTMLInputElement>("#mat-name");
+      if (nameInput && nameInput.value === current.name) nameInput.value = "Custom Alloy";
+      dirty = true;
+      syncPreview();
+    });
+    body.querySelectorAll<HTMLInputElement>("input").forEach((input) => input.addEventListener("input", () => {
+      dirty = true;
+      syncPreview();
+    }));
+    void openModal({
+      title: "Edit Material",
+      icon: "layers",
+      body,
+      width: 560,
+      actions: [
+        { label: "Cancel", value: "cancel", kind: "plain" },
+        { label: "Apply", value: "apply", kind: "primary" },
+      ],
+    }).then((result) => {
+      if (result !== "apply") return;
+      const before = this.capture();
+      const selected = body.querySelector<HTMLSelectElement>("#mat-select")?.value ?? "custom";
+      if (selected === "custom" || dirty) {
+        const f = fields();
+        part.materialId = "custom";
+        part.materialOverride = f;
+      } else {
+        part.materialId = selected;
+        part.materialOverride = undefined;
+      }
+      for (const study of this.doc.analyses) {
+        if (study.partId !== part.id) continue;
+        study.materialId = part.materialId;
+        study.stale = study.status === "solved" || study.status === "meshed";
+      }
+      this.commit(before);
+      this.updateMassCard();
+      this.refreshTree();
+      this.updateMassCard();
+      toast(`Material for ${part.name}: ${partMaterial(part).name}.`, "success");
+    });
+  }
+
+  private async openTemplates(): Promise<void> {
+    const body = document.createElement("div");
+    body.innerHTML = `<div class="template-grid">
+      <button class="template-card" data-template="beam"><b>Cantilever Beam</b><span>120 × 20 × 12 mm beam, AISI 1020, static study ready for a tip load.</span></button>
+      <button class="template-card" data-template="bracket"><b>L-Bracket</b><span>60 × 40 × 30 mm angle bracket with 8 mm walls and a 30 mm extrusion.</span></button>
+      <button class="template-card" data-template="box-lid"><b>Box + Lid Assembly</b><span>60 × 40 × 30 mm shelled enclosure with a 64 × 44 mm lid component.</span></button>
+      <button class="template-card" data-template="blank"><b>Blank Part</b><span>Empty document with a single part and no material assigned.</span></button>
+    </div>
+    <div class="hint" style="margin-top:8px">Choosing a template replaces the current document. Each template is fully parametric and editable afterwards.</div>`;
+    const result = await openModal({
+      title: "New from Template",
+      icon: "layout-grid",
+      body,
+      width: 560,
+      actions: [
+        { label: "Cancel", value: "cancel", kind: "plain" },
+        { label: "Create", value: "create", kind: "primary" },
+      ],
+      onMount: (root) => {
+        root.querySelectorAll<HTMLElement>("[data-template]").forEach((card) => {
+          card.addEventListener("click", () => {
+            root.querySelectorAll(".template-card").forEach((el) => el.classList.remove("active"));
+            card.classList.add("active");
+          });
+        });
+        root.querySelector<HTMLElement>('[data-template="beam"]')?.classList.add("active");
+      },
+    });
+    if (result !== "create") return;
+    const active = body.querySelector<HTMLElement>(".template-card.active")?.dataset.template;
+    if (!active) return;
+    await this.buildTemplate(active);
+  }
+
+  private addRectSketch(part: Part, plane: "front" | "top" | "right", x0: number, y0: number, x1: number, y1: number, name = nextSketchName(part.sketches)): Sketch {
+    const sketch: Sketch = { id: uid("sk"), name, plane: basePlane(plane), points: [], entities: [], constraints: [], visible: false };
+    for (const [x, y] of [
+      [x0, y0],
+      [x1, y0],
+      [x1, y1],
+      [x0, y1],
+    ] as [number, number][]) {
+      sketch.points.push({ id: uid("pt"), x, y });
+    }
+    const lines: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const id = uid("ln");
+      lines.push(id);
+      sketch.entities.push({ id, kind: "line", p1: sketch.points[i].id, p2: sketch.points[(i + 1) % 4].id });
+    }
+    sketch.constraints.push({ id: uid("c"), type: "horizontal", entity: lines[0] });
+    sketch.constraints.push({ id: uid("c"), type: "horizontal", entity: lines[2] });
+    sketch.constraints.push({ id: uid("c"), type: "vertical", entity: lines[1] });
+    sketch.constraints.push({ id: uid("c"), type: "vertical", entity: lines[3] });
+    part.sketches.push(sketch);
+    return sketch;
+  }
+
+  private addExtrude(part: Part, sketchId: string, depth: number, operation: "new" | "join" | "cut" = "join"): Feature {
+    const feature: Feature = {
+      id: uid("feat"),
+      type: operation === "cut" ? "cut" : "extrude",
+      name: nextFeatureName(operation === "cut" ? "cut" : "extrude", part.features),
+      sketchId,
+      params: { depth, direction: 1, operation },
+    };
+    part.features.push(feature);
+    return feature;
+  }
+
+  private async buildTemplate(template: string): Promise<void> {
+    const doc = createDocument();
+    doc.variables = standardVariables([["L", "100"]]);
+    const base = doc.parts[0];
+    base.materialId = "aisi1020";
+    if (template === "blank") {
+      this.doc = doc;
+      this.applyDocumentState({ history: false, clearResults: true });
+      return;
+    }
+    if (template === "beam") {
+      doc.name = "Cantilever Beam";
+      base.name = "Beam";
+      const sketch = this.addRectSketch(base, "right", -30, -6, 90, 6, "Sketch1");
+      this.addExtrude(base, sketch.id, 12, "new");
+      const study: AnalysisStudy = {
+        id: uid("study"),
+        name: "Static 1",
+        partId: base.id,
+        materialId: "aisi1020",
+        meshSize: 2.5,
+        supports: [],
+        loads: [],
+        status: "draft",
+      };
+      doc.analyses.push(study);
+      doc.activeStudyId = study.id;
+    } else if (template === "bracket") {
+      doc.name = "L-Bracket";
+      base.name = "L-Bracket";
+      const sketch: Sketch = { id: uid("sk"), name: "Sketch1", plane: basePlane("front"), points: [], entities: [], constraints: [], visible: false };
+      const verts: [number, number][] = [
+        [0, 0],
+        [60, 0],
+        [60, 8],
+        [8, 8],
+        [8, 40],
+        [0, 40],
+      ];
+      for (const [x, y] of verts) sketch.points.push({ id: uid("pt"), x, y });
+      for (let i = 0; i < verts.length; i++) {
+        sketch.entities.push({ id: uid("ln"), kind: "line", p1: sketch.points[i].id, p2: sketch.points[(i + 1) % verts.length].id });
+      }
+      base.sketches.push(sketch);
+      this.addExtrude(base, sketch.id, 30, "new");
+    } else {
+      doc.name = "Box + Lid Assembly";
+      base.name = "Box";
+      const sketch = this.addRectSketch(base, "top", -30, -20, 30, 20, "Sketch1");
+      this.addExtrude(base, sketch.id, 30, "new");
+      base.features.push({ id: uid("feat"), type: "shell", name: "Shell1", params: { thickness: 2 } });
+      const lid = createPart("Lid", 1);
+      lid.materialId = "aisi1020";
+      const lidSketch = this.addRectSketch(lid, "top", -32, -22, 32, 22, "Sketch1");
+      this.addExtrude(lid, lidSketch.id, 3, "new");
+      doc.parts.push(lid);
+      doc.components.push(
+        { id: uid("comp"), name: "Box1", partId: base.id, position: [0, 0, 0], rotation: [0, 0, 0], visible: true, fixed: true },
+        { id: uid("comp"), name: "Lid1", partId: lid.id, position: [0, 30, 0], rotation: [0, 0, 0], visible: true },
+      );
+      doc.mode = "assembly";
+    }
+    this.doc = doc;
+    this.applyDocumentState({ history: false, clearResults: true });
+    toast(`${doc.name} template created.`, "success");
   }
 
   private materialLibrary(): void {
@@ -3462,8 +5117,14 @@ export class App {
       ["F2", "Rename selection"],
       ["F", "Zoom fit"],
       ["Esc", "Cancel current command / tool"],
+      ["Space", "3D View Selector cube"],
+      ["S", "Shortcut bar at the cursor"],
+      ["N / Ctrl+8", "Normal to the selected face"],
       ["L / R / C / A / D / S", "Line / Rectangle / Circle / Arc / Dimension / Select (sketch)"],
-      ["Left drag", "Orbit"],
+      ["T / O / X", "Trim / Offset / Convert Entities (sketch)"],
+      ["Ctrl + Click", "Add/remove a face, edge or vertex from the selection"],
+      ["Left drag", "Window (left→right) or crossing (right→left) selection"],
+      ["Middle drag", "Orbit (SolidWorks / Fusion scheme)"],
       ["Right drag", "Pan"],
       ["Wheel", "Zoom"],
     ];
@@ -3675,6 +5336,42 @@ export class App {
       case "tool-dimension":
         this.setSketchTool("dimension");
         break;
+      case "tool-trim":
+        this.setSketchTool("trim");
+        break;
+      case "tool-convert":
+        this.setSketchTool("convert");
+        break;
+      case "tool-offset":
+      case "sketch-offset":
+        if (!this.editor.isActive) {
+          toast("Open a sketch before offsetting entities.", "info");
+          break;
+        }
+        void promptNumber({ title: "Offset Entities", label: "Offset distance", value: 5, unit: "mm", step: 0.5 }).then((value) => {
+          if (value === null) return;
+          if (this.editor.offsetSelection(value)) {
+            this.sketchDirty = true;
+            this.updateSketchPanelInfo();
+            this.refreshTree();
+            toast(`Entities offset by ${fmt(value, 2)} mm.`, "success");
+          }
+        });
+        break;
+      case "sketch-construction":
+        if (!this.editor.isActive) {
+          toast("Open a sketch first.", "info");
+          break;
+        }
+        if (!this.editor.toggleConstructionSelection()) {
+          this.editor.setConstructionMode(!this.editor.construction);
+          this.shell.setStatus(this.editor.construction ? "For Construction mode on — new entities are dashed" : "For Construction mode off");
+        } else {
+          this.sketchDirty = true;
+          this.updateSketchPanelInfo();
+          this.refreshTree();
+        }
+        break;
       case "tool-select":
         this.setSketchTool("select");
         break;
@@ -3684,8 +5381,9 @@ export class App {
       case "rel-tangent":
       case "rel-equal":
       case "rel-fix":
+      case "rel-perpendicular":
         if (this.editor.isActive) {
-          const relation = action.slice(4) as "horizontal";
+          const relation = action.slice(4) as "horizontal" | "vertical" | "coincident" | "tangent" | "equal" | "fix" | "perpendicular";
           if (this.editor.applyConstraint(relation)) {
             this.sketchDirty = true;
             this.updateSketchPanelInfo();
@@ -3709,6 +5407,45 @@ export class App {
         break;
       case "chamfer":
         this.openFillet("chamfer");
+        break;
+      case "shell":
+        this.openShell();
+        break;
+      case "mirror":
+        this.openMirror();
+        break;
+      case "linear-pattern":
+        this.openPattern();
+        break;
+      case "section-view":
+        this.openSection();
+        break;
+      case "interference":
+        this.runInterference();
+        break;
+      case "make-drawing":
+        await this.makeDrawing();
+        break;
+      case "equations":
+        this.openEquations();
+        break;
+      case "measure":
+        this.openMeasure();
+        break;
+      case "toolbox-bolt":
+        await this.openToolbox("bolt");
+        break;
+      case "toolbox-nut":
+        await this.openToolbox("nut");
+        break;
+      case "toolbox-washer":
+        await this.openToolbox("washer");
+        break;
+      case "edit-material":
+        this.openMaterialDialog(this.selection?.kind === "part" ? this.selection.id : undefined);
+        break;
+      case "templates":
+        await this.openTemplates();
         break;
       case "edit-feature": {
         const feature = this.selection?.kind === "feature"
@@ -3908,4 +5645,36 @@ if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", startApplication, { once: true });
 } else {
   startApplication();
+}
+
+/** Parity ray test along +X for the interference sampler. */
+function pointInMesh(p: Vec3, mesh: MeshData): boolean {
+  let crossings = 0;
+  const pos = mesh.positions;
+  const idx = mesh.indices;
+  for (let t = 0; t + 2 < idx.length; t += 3) {
+    const ia = idx[t] * 3;
+    const ib = idx[t + 1] * 3;
+    const ic = idx[t + 2] * 3;
+    const ax = pos[ia];
+    const ay = pos[ia + 1];
+    const az = pos[ia + 2];
+    const ex = pos[ib] - ax;
+    const ey = pos[ib + 1] - ay;
+    const ez = pos[ib + 2] - az;
+    const fx = pos[ic] - ax;
+    const fy = pos[ic + 1] - ay;
+    const fz = pos[ic + 2] - az;
+    // Ray direction = +X: solve p + t*(1,0,0) = a + u*e + v*f.
+    const den = ey * fz - ez * fy;
+    if (Math.abs(den) < 1e-12) continue;
+    const py = p[1] - ay;
+    const pz = p[2] - az;
+    const u = (py * fz - pz * fy) / den;
+    const v = (ey * pz - ez * py) / den;
+    if (u < 0 || v < 0 || u + v > 1) continue;
+    const x = ax + u * ex + v * fx;
+    if (x > p[0]) crossings++;
+  }
+  return crossings % 2 === 1;
 }

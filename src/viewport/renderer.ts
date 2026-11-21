@@ -13,6 +13,7 @@ export interface RendererLike {
   outputColorSpace: string;
   toneMapping: number;
   toneMappingExposure: number;
+  localClippingEnabled?: boolean;
 }
 
 export type RendererBackend = "webgpu" | "webgl2";

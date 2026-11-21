@@ -140,8 +140,7 @@ function extrudeFeature(sketch: Sketch, feature: Feature, shape: any): any {
   return applyBoolean(shape, tool, cut);
 }
 
-function revolveFeature(sketch: Sketch, feature: Feature, shape: any): any {
-  const angleDeg = Math.abs(feature.params.angle ?? 360);
+function revolveFeature(sketch: Sketch, feature: Feature, shape: any): any {  const angleDeg = Math.abs(feature.params.angle ?? 360);
   if (angleDeg < 1e-3) throw new Error("Revolve angle must be greater than zero.");
   const angle = angleDeg >= 359.999 ? Math.PI * 2 : angleDeg * DEG;
   let axis: any;
@@ -171,6 +170,74 @@ function revolveFeature(sketch: Sketch, feature: Feature, shape: any): any {
   const tool = fuseShapes(tools);
   const cut = feature.type === "cut" || feature.params.operation === "cut";
   return applyBoolean(shape, tool, cut);
+}
+
+function makeBoxBetween(min: Vec3, max: Vec3): any {
+  const attempts: (() => any)[] = [
+    () => new oc.BRepPrimAPI_MakeBox_4(gpPnt(min), gpPnt(max)).Shape(),
+    () => new oc.BRepPrimAPI_MakeBox_3(gpPnt(min), gpPnt(max)).Shape(),
+    () => new oc.BRepPrimAPI_MakeBox_2(gpPnt(min), gpPnt(max)).Shape(),
+    () => new oc.BRepPrimAPI_MakeBox_1(max[0] - min[0], max[1] - min[1], max[2] - min[2]).Shape(),
+  ];
+  let last: unknown = null;
+  for (const make of attempts) {
+    try {
+      const shape = make();
+      if (shape && !shape.IsNull()) return shape;
+    } catch (error) {
+      last = error;
+    }
+  }
+  throw new Error(`OCCT could not build the shell tool${last ? `: ${String(last)}` : "."}`);
+}
+
+function bboxOf(shape: any): { min: Vec3; max: Vec3 } {
+  const box = new oc.Bnd_Box_1();
+  oc.BRepBndLib.Add(shape, box, true);
+  const pmin = box.CornerMin();
+  const pmax = box.CornerMax();
+  return {
+    min: [pmin.X(), pmin.Y(), pmin.Z()],
+    max: [pmax.X(), pmax.Y(), pmax.Z()],
+  };
+}
+
+/** Constant-wall shell. Uses a shrunken bounding box cut through the +Y face,
+ *  which is exact for the prismatic parts this course models (box, plate,
+ *  enclosure) and keeps the operation inside the OCCT bindings that are
+ *  available in opencascade.js. */
+function shellFeature(shape: any, feature: Feature): any {
+  const t = Math.abs(feature.params.thickness ?? 2);
+  if (t < 1e-3) throw new Error("Shell thickness must be greater than zero.");
+  const b = bboxOf(shape);
+  const min: Vec3 = [b.min[0] + t, b.min[1] + t, b.min[2] + t];
+  const max: Vec3 = [b.max[0] - t, b.max[1] + Math.max(1, t), b.max[2] - t];
+  if (max[0] <= min[0] || max[1] <= min[1] || max[2] <= min[2]) throw new Error("Shell thickness is too large for this body.");
+  const tool = makeBoxBetween(min, max);
+  return applyBoolean(shape, tool, true);
+}
+
+function mirrorFeature(shape: any, feature: Feature): any {
+  const plane = feature.params.mirrorPlane ?? "right";
+  const normal: Vec3 = plane === "top" ? [0, 1, 0] : plane === "front" ? [0, 0, 1] : [1, 0, 0];
+  const trsf = new oc.gp_Trsf_1();
+  trsf.SetMirror_3(new oc.gp_Ax2_3(gpPnt([0, 0, 0]), gpDir(normal)));
+  const copy = new oc.BRepBuilderAPI_Transform_2(shape, trsf, true).Shape();
+  return applyBoolean(shape, copy, false);
+}
+
+function patternFeature(shape: any, feature: Feature): any {
+  const count = Math.max(2, Math.round(feature.params.patternCount ?? 2));
+  const spacing = Number(feature.params.patternSpacing ?? 10);
+  const axis = feature.params.patternAxis ?? "x";
+  const dir: Vec3 = axis === "y" ? [0, spacing, 0] : axis === "z" ? [0, 0, spacing] : [spacing, 0, 0];
+  const copies: any[] = [shape];
+  for (let i = 1; i < count; i++) {
+    const trsf = new oc.gp_Trsf_1();
+    trsf.SetTranslation_1(gpVec([dir[0] * i, dir[1] * i, dir[2] * i]));
+    copies.push(new oc.BRepBuilderAPI_Transform_2(shape, trsf, true).Shape());
+  }
+  return fuseShapes(copies);
 }
 
 /** Unique topological edges of a shape.
@@ -586,7 +653,10 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
   }
   shape = baseImported;
 
-  for (const feature of part.features) {
+  const rollback = part.rollbackIndex ?? part.features.length;
+  for (let featureIndex = 0; featureIndex < part.features.length; featureIndex++) {
+    const feature = part.features[featureIndex];
+    if (featureIndex >= rollback) break;
     if (feature.suppressed) continue;
     try {
       if (feature.type === "imported") {
@@ -606,6 +676,15 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
       } else if (feature.type === "chamfer") {
         if (!shape) throw new Error("Chamfer needs an existing body.");
         shape = chamferFeature(shape, feature);
+      } else if (feature.type === "shell") {
+        if (!shape) throw new Error("Shell needs an existing body.");
+        shape = shellFeature(shape, feature);
+      } else if (feature.type === "mirror") {
+        if (!shape) throw new Error("Mirror needs an existing body.");
+        shape = mirrorFeature(shape, feature);
+      } else if (feature.type === "pattern") {
+        if (!shape) throw new Error("Linear pattern needs an existing body.");
+        shape = patternFeature(shape, feature);
       }
     } catch (e) {
       errors[feature.id] = e instanceof Error ? e.message : String(e);

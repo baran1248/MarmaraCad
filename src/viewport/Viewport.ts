@@ -6,6 +6,30 @@ import type { RendererBackend, RendererLike } from "./renderer";
 
 export type ViewName = "front" | "back" | "top" | "bottom" | "right" | "left" | "iso";
 export type DisplayStyle = "shaded-edges" | "shaded" | "wireframe";
+export type PickFilter = "face" | "edge" | "vertex" | "all" | "none";
+export type NavScheme = "cad" | "legacy";
+export type SectionAxis = "x" | "y" | "z";
+
+export interface SectionState {
+  enabled: boolean;
+  axis: SectionAxis;
+  offset: number;
+  flipped: boolean;
+}
+
+export interface VertexPick {
+  componentId: string | null;
+  partId: string;
+  point: Vec3;
+  edgeIndex: number;
+}
+
+export interface BoxSelection {
+  faces: FacePick[];
+  edges: EdgePick[];
+  vertices: VertexPick[];
+  crossing: boolean;
+}
 
 export interface SceneBody {
   partId: string;
@@ -84,10 +108,14 @@ export class Viewport {
 
   onPickFace: ((pick: FacePick | null) => void) | null = null;
   onPickEdge: ((pick: EdgePick | null) => void) | null = null;
+  onPickVertex: ((pick: VertexPick | null) => void) | null = null;
+  onBoxSelect: ((selection: BoxSelection) => void) | null = null;
+  onContextPick: ((x: number, y: number, pick: { face?: FacePick; edge?: EdgePick; vertex?: VertexPick }) => void) | null = null;
   onHoverFace: ((pick: FacePick | null) => void) | null = null;
   onHoverEdge: ((pick: EdgePick | null) => void) | null = null;
   onCameraChange: (() => void) | null = null;
   onFrame: (() => void) | null = null;
+  onPickFilterChanged: ((filter: PickFilter) => void) | null = null;
 
   private bodies = new Map<string, BodyView>();
   private root = new THREE.Group();
@@ -95,14 +123,19 @@ export class Viewport {
   private sketchGroup = new THREE.Group();
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
-  private pickFilter: "face" | "edge" | "none" = "face";
+  private pickFilter: PickFilter = "face";
   private hoverPickKey = "";
   private selectedFaces: FaceSel[] = [];
+  private selectedVertices: { componentId: string | null; point: Vec3 }[] = [];
   private activeComponentId: string | null = null;
   private displayStyle: DisplayStyle = "shaded-edges";
   private sketchPlane: SketchPlane | null = null;
+  private navScheme: NavScheme = "cad";
   private fitted = false;
   private down: { x: number; y: number; button: number } | null = null;
+  private band: { startX: number; startY: number; el: HTMLDivElement; crossing: boolean } | null = null;
+  private section: SectionState = { enabled: false, axis: "z", offset: 0, flipped: false };
+  private vertexGroup = new THREE.Group();
   private viewAnim: {
     fromPos: THREE.Vector3;
     toPos: THREE.Vector3;
@@ -127,11 +160,13 @@ export class Viewport {
     this.renderer.toneMappingExposure = 1.05;
     this.renderer.domElement.classList.add("viewport-canvas");
     container.appendChild(this.renderer.domElement);
+    if ("localClippingEnabled" in this.renderer) this.renderer.localClippingEnabled = true;
 
     this.scene = new THREE.Scene();
     this.scene.add(this.root);
     this.scene.add(this.planeGroup);
     this.scene.add(this.sketchGroup);
+    this.scene.add(this.vertexGroup);
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 50000);
     this.camera.position.set(150, 140, 210);
@@ -145,11 +180,7 @@ export class Viewport {
     this.controls.maxDistance = 20000;
     this.controls.rotateSpeed = 0.9;
     this.controls.zoomSpeed = 1.1;
-    this.controls.mouseButtons = {
-      LEFT: THREE.MOUSE.ROTATE,
-      MIDDLE: THREE.MOUSE.PAN,
-      RIGHT: THREE.MOUSE.PAN,
-    };
+    this.applyNavScheme();
     this.controls.target.set(0, 0, 0);
     this.controls.addEventListener("change", () => this.onCameraChange?.());
 
@@ -160,7 +191,11 @@ export class Viewport {
     this.renderer.domElement.addEventListener("pointerup", this.handlePointerUp);
     this.renderer.domElement.addEventListener("pointermove", this.handlePointerMove);
     this.renderer.domElement.addEventListener("pointerleave", this.handlePointerLeave);
-    this.renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+    this.renderer.domElement.addEventListener("wheel", this.handleWheel, { passive: false });
+    this.renderer.domElement.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      this.openContextMenu(e);
+    });
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(container);
@@ -168,8 +203,75 @@ export class Viewport {
     this.renderer.setAnimationLoop(this.tick);
   }
 
-  private setupLights(): void {
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x5b6b7c, 1.35);
+  /** Mouse ergonomics: SolidWorks-like CAD scheme by default (middle = orbit,
+   *  right = pan, left = select/box). `legacy` restores left-drag orbit. */
+  setNavScheme(scheme: NavScheme): void {
+    this.navScheme = scheme;
+    this.applyNavScheme();
+  }
+
+  private applyNavScheme(): void {
+    if (this.sketchPlane) {
+      this.controls.mouseButtons.LEFT = null as unknown as THREE.MOUSE;
+      this.controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
+      this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+      return;
+    }
+    if (this.navScheme === "legacy") {
+      this.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+      this.controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+      this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+    } else {
+      this.controls.mouseButtons.LEFT = null as unknown as THREE.MOUSE;
+      this.controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
+      this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+    }
+    this.controls.enableZoom = false;
+  }
+
+  /** Cursor-anchored dolly: the point under the pointer stays put while zooming. */
+  private handleWheel = (e: WheelEvent): void => {
+    e.preventDefault();
+    e.stopPropagation();
+    const before = this.camera.position.distanceTo(this.controls.target);
+    const factor = Math.exp(clampNumber(e.deltaY * 0.0011, -0.6, 0.6));
+    const dist = clampNumber(before * factor, this.controls.minDistance, this.controls.maxDistance);
+    const dir = this.camera.position.clone().sub(this.controls.target);
+    if (dir.lengthSq() < 1e-9) dir.set(1, 0.8, 1);
+    dir.normalize();
+
+    // World point under the cursor on the plane through the orbit target.
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+      this.camera.position.clone().sub(this.controls.target).normalize(),
+      this.controls.target,
+    );
+    const hit = new THREE.Vector3();
+    if (this.raycaster.ray.intersectPlane(plane, hit) && before > 1e-6) {
+      const k = 1 - dist / before;
+      this.controls.target.addScaledVector(hit.clone().sub(this.controls.target), k);
+    }
+    this.camera.position.copy(this.controls.target).addScaledVector(dir, dist);
+    this.controls.update();
+    this.onCameraChange?.();
+  };
+
+  /** Record the section state. The actual cut is produced on the CPU by
+   *  `sectionMesh()` in main.ts, so both the WebGL2 and WebGPU backends show the
+   *  same capped result; the renderer must not clip a second time. */
+  setSectionState(state: Partial<SectionState>): SectionState {
+    this.section = { ...this.section, ...state };
+    return this.section;
+  }
+
+  getSection(): SectionState {
+    return { ...this.section };
+  }
+
+  private setupLights(): void {    const hemi = new THREE.HemisphereLight(0xffffff, 0x5b6b7c, 1.35);
     this.scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 2.1);
     key.position.set(180, 260, 220);
@@ -288,6 +390,7 @@ export class Viewport {
       );
     }
     const material = makeBodyMaterial(spec.color);
+    this.applyClipToMaterial(material);
     const mesh = new THREE.Mesh(bodyGeometry(spec.mesh), material);
     mesh.userData.pickBody = true;
     mesh.userData.key = key;
@@ -299,6 +402,7 @@ export class Viewport {
 
     const edges = new THREE.Group();
     const lineMat = new THREE.LineBasicMaterial({ color: 0x2a3642, transparent: true, opacity: 0.9 });
+    this.applyClipToMaterial(lineMat);
     const edgeLines = new Map<number, THREE.Line>();
     for (const edge of spec.mesh.edges) {
       const line = new THREE.Line(edgePolylineGeometry(edge), lineMat);
@@ -348,6 +452,13 @@ export class Viewport {
     view.hover = null;
   }
 
+  private applyClipToMaterial(material: THREE.Material): void {
+    // Section cuts are computed on the CPU (`sectionMesh`), so new materials
+    // must never inherit a shader clipping plane (that would cut twice).
+    material.clippingPlanes = [];
+    material.needsUpdate = true;
+  }
+
   setDisplayStyle(style: DisplayStyle): void {
     this.displayStyle = style;
     this.applyDisplayStyle();
@@ -374,8 +485,7 @@ export class Viewport {
     this.sketchPlane = plane;
     this.clearSketchGrid();
     if (!plane) {
-      this.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
-      this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+      this.applyNavScheme();
       this.renderer.domElement.style.cursor = "";
       for (const view of this.bodies.values()) {
         view.material.transparent = false;
@@ -386,8 +496,7 @@ export class Viewport {
       }
       return;
     }
-    (this.controls.mouseButtons as any).LEFT = null;
-    this.controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
+    this.applyNavScheme();
     this.buildSketchGrid(plane);
     for (const view of this.bodies.values()) {
       view.material.transparent = true;
@@ -570,10 +679,164 @@ export class Viewport {
     return Math.max(r, 1);
   }
 
-  setPickFilter(filter: "face" | "edge" | "none"): void {
+  setPickFilter(filter: PickFilter): void {
     this.pickFilter = filter;
     this.renderer.domElement.style.cursor = filter === "none" ? "" : "crosshair";
     this.clearHover();
+    this.onPickFilterChanged?.(filter);
+  }
+
+  getPickFilter(): PickFilter {
+    return this.pickFilter;
+  }
+
+  setSelectedVertices(sel: { componentId: string | null; point: Vec3 }[]): void {
+    this.selectedVertices = sel;
+    for (const child of [...this.vertexGroup.children]) {
+      this.vertexGroup.remove(child);
+      if (child instanceof THREE.Points) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+    }
+    if (sel.length === 0) return;
+    const arr: number[] = [];
+    for (const v of sel) arr.push(v.point[0], v.point[1], v.point[2]);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(arr, 3));
+    const mat = new THREE.PointsMaterial({
+      color: 0xffb100,
+      size: 11,
+      sizeAttenuation: false,
+      depthTest: false,
+      transparent: true,
+    });
+    const points = new THREE.Points(geo, mat);
+    points.renderOrder = 40;
+    this.vertexGroup.add(points);
+  }
+
+  /** Unique topological vertices of every visible body. */
+  private vertices(): ({ componentId: string | null; partId: string; point: Vec3; edgeIndex: number })[] {
+    const out: { componentId: string | null; partId: string; point: Vec3; edgeIndex: number }[] = [];
+    const seen = new Set<string>();
+    for (const view of this.bodies.values()) {
+      if (!view.group.visible) continue;
+      const offset = view.group.position;
+      for (const edge of view.data.edges) {
+        for (const p of [edge.points[0], edge.points[edge.points.length - 1]]) {
+          if (!p) continue;
+          const world: Vec3 = [p[0] + offset.x, p[1] + offset.y, p[2] + offset.z];
+          const key = `${view.key}:${world.map((v) => Math.round(v * 100)).join(",")}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ componentId: view.componentId, partId: view.partId, point: world, edgeIndex: edge.index });
+        }
+      }
+    }
+    return out;
+  }
+
+  private pickVertex(clientX: number, clientY: number): VertexPick | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    let best: { pick: VertexPick; dist: number } | null = null;
+    for (const v of this.vertices()) {
+      const s = this.projectToScreen(v.point);
+      if (!s.visible) continue;
+      const sx = rect.left + s.x;
+      const sy = rect.top + s.y;
+      const d = Math.hypot(sx - clientX, sy - clientY);
+      if (d < 10 && (!best || d < best.dist)) best = { pick: v, dist: d };
+    }
+    return best?.pick ?? null;
+  }
+
+  /** Public raycast helpers used by Convert Entities and Measure. */
+  raycastEdgeAt(clientX: number, clientY: number): EdgePick | null {
+    this.updatePointerAt(clientX, clientY);
+    return this.pickEdge();
+  }
+
+  raycastFaceAt(clientX: number, clientY: number): FacePick | null {
+    this.updatePointerAt(clientX, clientY);
+    return this.pickFace();
+  }
+
+  /** Edges connected end-to-end to the picked edge (a topological loop).
+   *  With `tangentOnly`, the walk also requires the directions to line up, which
+   *  is how SolidWorks' Select Tangency behaves. */
+  edgeLoop(start: EdgePick, tangentOnly: boolean): EdgePick[] {
+    const view = [...this.bodies.values()].find(
+      (v) => v.group.visible && v.partId === start.partId && v.componentId === start.componentId,
+    );
+    if (!view) return [start];
+    const keyOf = (p: Vec3) => `${Math.round(p[0] * 100)},${Math.round(p[1] * 100)},${Math.round(p[2] * 100)}`;
+    const dirAt = (edge: EdgeInfo, point: Vec3): Vec3 | null => {
+      const pts = edge.points;
+      if (pts.length < 2) return null;
+      const pointKey = keyOf(point);
+      const isEnd = keyOf(pts[pts.length - 1]!) === pointKey;
+      const end = isEnd ? pts[pts.length - 1] : pts[0];
+      const ref = isEnd ? pts[Math.max(0, pts.length - 2)] : pts[1];
+      const v: Vec3 = [end[0] - ref[0], end[1] - ref[1], end[2] - ref[2]];
+      const l = Math.hypot(v[0], v[1], v[2]) || 1;
+      return [v[0] / l, v[1] / l, v[2] / l];
+    };
+    const startEdge = view.data.edges.find((e) => e.index === start.edgeIndex);
+    if (!startEdge) return [start];
+    const picked = new Set<number>([start.edgeIndex]);
+    const queue: EdgeInfo[] = [startEdge];
+    while (queue.length && picked.size < 400) {
+      const current = queue.shift()!;
+      for (const endpoint of [current.points[0], current.points[current.points.length - 1]]) {
+        if (!endpoint) continue;
+        const endpointKey = keyOf(endpoint);
+        for (const other of view.data.edges) {
+          if (picked.has(other.index)) continue;
+          const a = other.points[0];
+          const b = other.points[other.points.length - 1];
+          if (!a || !b) continue;
+          let shared: Vec3 | null = null;
+          if (keyOf(a) === endpointKey) shared = a;
+          else if (keyOf(b) === endpointKey) shared = b;
+          if (!shared) continue;
+          if (tangentOnly) {
+            const d1 = dirAt(current, endpoint);
+            const d2 = dirAt(other, shared);
+            if (!d1 || !d2) continue;
+            const dot = Math.abs(d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]);
+            if (dot < 0.985) continue;
+          }
+          picked.add(other.index);
+          queue.push(other);
+        }
+      }
+    }
+    return [...picked]
+      .map((index) => {
+        const edge = view.data.edges.find((e) => e.index === index);
+        return edge ? { componentId: view.componentId, partId: view.partId, edgeIndex: index, edge } : null;
+      })
+      .filter((e): e is EdgePick => !!e);
+  }
+
+  /** Align the camera with a face normal (SolidWorks' Normal To). */
+  normalTo(point: Vec3, normal: Vec3): void {
+    const n = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize();
+    const target = new THREE.Vector3(point[0], point[1], point[2]);
+    const distance = Math.max(this.camera.position.distanceTo(this.controls.target), this.sceneRadius() * 1.8);
+    this.camera.up.copy(Math.abs(n.y) > 0.95 ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 1, 0));
+    this.controls.target.copy(target);
+    this.camera.position.copy(target).addScaledVector(n, distance);
+    this.controls.update();
+    this.onCameraChange?.();
+  }
+
+  private updatePointerAt(clientX: number, clientY: number): void {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
   }
 
   private updatePointer(e: PointerEvent): void {
@@ -639,18 +902,50 @@ export class Viewport {
 
   private handlePointerDown = (e: PointerEvent): void => {
     this.down = { x: e.clientX, y: e.clientY, button: e.button };
+    if (e.button === 0 && this.pickFilter !== "none" && !this.sketchPlane) {
+      // A left drag on the canvas is a window/crossing selection in CAD mode;
+      // orbit stays on the middle mouse button.
+      this.startBand(e);
+    }
   };
 
   private handlePointerUp = (e: PointerEvent): void => {
     if (!this.down || e.button !== 0) {
       this.down = null;
+      if (this.band) this.cancelBand();
       return;
     }
     const moved = Math.hypot(e.clientX - this.down.x, e.clientY - this.down.y);
     this.down = null;
+    if (this.band) {
+      if (moved > 6) {
+        this.finishBand(e);
+        return;
+      }
+      this.cancelBand();
+    }
     if (moved > 6 || this.pickFilter === "none") return;
     this.updatePointer(e);
-    if (this.pickFilter === "edge") {
+    const filter = this.pickFilter;
+    if (filter === "vertex") {
+      this.onPickVertex?.(this.pickVertex(e.clientX, e.clientY));
+      return;
+    }
+    if (filter === "all") {
+      const vertex = this.pickVertex(e.clientX, e.clientY);
+      if (vertex) {
+        this.onPickVertex?.(vertex);
+        return;
+      }
+      const edge = this.pickEdge();
+      if (edge) {
+        this.onPickEdge?.(edge);
+        return;
+      }
+      this.onPickFace?.(this.pickFace());
+      return;
+    }
+    if (filter === "edge") {
       const pick = this.pickEdge();
       if (pick) this.onPickEdge?.(pick);
       else this.onPickEdge?.(null);
@@ -661,7 +956,133 @@ export class Viewport {
     }
   };
 
+  private startBand(e: PointerEvent): void {
+    this.cancelBand();
+    const el = document.createElement("div");
+    el.className = "select-band";
+    el.style.left = `${e.clientX}px`;
+    el.style.top = `${e.clientY}px`;
+    el.style.width = "0px";
+    el.style.height = "0px";
+    this.container.appendChild(el);
+    this.band = { startX: e.clientX, startY: e.clientY, el, crossing: false };
+  }
+
+  private updateBand(e: PointerEvent): void {
+    if (!this.band) return;
+    const { startX, startY, el } = this.band;
+    const x = Math.min(startX, e.clientX);
+    const y = Math.min(startY, e.clientY);
+    const w = Math.abs(e.clientX - startX);
+    const h = Math.abs(e.clientY - startY);
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    el.style.width = `${w}px`;
+    el.style.height = `${h}px`;
+    this.band.crossing = e.clientX < startX;
+    el.classList.toggle("crossing", this.band.crossing);
+  }
+
+  private cancelBand(): void {
+    if (!this.band) return;
+    this.band.el.remove();
+    this.band = null;
+  }
+
+  private finishBand(e: PointerEvent): void {
+    if (!this.band) return;
+    const { startX, startY } = this.band;
+    const crossing = e.clientX < startX;
+    const rect = {
+      x1: Math.min(startX, e.clientX),
+      x2: Math.max(startX, e.clientX),
+      y1: Math.min(startY, e.clientY),
+      y2: Math.max(startY, e.clientY),
+    };
+    this.cancelBand();
+    if (rect.x2 - rect.x1 < 4 || rect.y2 - rect.y1 < 4) return;
+    const canvasRect = this.renderer.domElement.getBoundingClientRect();
+    const screen = (world: THREE.Vector3) => {
+      const s = this.projectToScreen([world.x, world.y, world.z]);
+      return { x: canvasRect.left + s.x, y: canvasRect.top + s.y, visible: s.visible };
+    };
+    const inside = (p: { x: number; y: number }) => p.x >= rect.x1 && p.x <= rect.x2 && p.y >= rect.y1 && p.y <= rect.y2;
+    const faces: FacePick[] = [];
+    const edges: EdgePick[] = [];
+    const vertices: VertexPick[] = [];
+
+    for (const view of this.bodies.values()) {
+      if (!view.group.visible) continue;
+      view.group.updateMatrixWorld(true);
+      const data = view.data;
+      for (const face of data.faces) {
+        const triStart = face.triStart;
+        const triCount = face.triCount;
+        let any = false;
+        let all = true;
+        let seen = 0;
+        for (let t = 0; t < triCount && seen < 240; t++) {
+          const base = (triStart + t) * 3;
+          for (let k = 0; k < 3; k++) {
+            const idx = data.indices[base + k];
+            const p = new THREE.Vector3(data.positions[idx * 3], data.positions[idx * 3 + 1], data.positions[idx * 3 + 2]);
+            view.group.localToWorld(p);
+            const s = screen(p);
+            if (!s.visible) continue;
+            seen++;
+            if (inside(s)) any = true;
+            else all = false;
+          }
+        }
+        if (seen === 0) continue;
+        if ((!crossing && all) || (crossing && any)) {
+          faces.push({ componentId: view.componentId, partId: view.partId, faceIndex: face.index, face });
+        }
+      }
+      for (const edge of data.edges) {
+        let any = false;
+        let all = true;
+        for (const p of edge.points) {
+          const world = new THREE.Vector3(p[0], p[1], p[2]);
+          view.group.localToWorld(world);
+          const s = screen(world);
+          if (!s.visible) {
+            all = false;
+            continue;
+          }
+          if (inside(s)) any = true;
+          else all = false;
+        }
+        if ((!crossing && all && edge.points.length > 0) || (crossing && any)) {
+          edges.push({ componentId: view.componentId, partId: view.partId, edgeIndex: edge.index, edge });
+        }
+      }
+      for (const v of this.vertices().filter((q) => q.componentId === view.componentId && q.partId === view.partId)) {
+        const world = new THREE.Vector3(v.point[0], v.point[1], v.point[2]);
+        const s = screen(world);
+        if (s.visible && inside(s)) vertices.push(v);
+      }
+    }
+    this.onBoxSelect?.({ faces, edges, vertices, crossing });
+  }
+
+  private openContextMenu(e: MouseEvent): void {
+    this.updatePointerAt(e.clientX, e.clientY);
+    const vertex = this.pickVertex(e.clientX, e.clientY);
+    const edge = vertex ? null : this.pickEdge();
+    const face = vertex || edge ? null : this.pickFace();
+    this.onContextPick?.(e.clientX, e.clientY, {
+      face: face ?? undefined,
+      edge: edge ?? undefined,
+      vertex: vertex ?? undefined,
+    });
+  }
+
   private handlePointerMove = (e: PointerEvent): void => {
+    if (this.band) {
+      this.updateBand(e);
+      return;
+    }
     if (this.pickFilter === "none") return;
     this.updatePointer(e);
     if (this.pickFilter === "edge") {
@@ -725,6 +1146,7 @@ export class Viewport {
   };
 
   private handlePointerLeave = (): void => {
+    this.cancelBand();
     this.clearHover();
     this.onHoverFace?.(null);
     this.onHoverEdge?.(null);
@@ -885,4 +1307,8 @@ export class Viewport {
     for (const view of this.bodies.values()) this.disposeBody(view);
     this.renderer.dispose();
   }
+}
+
+function clampNumber(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
 }

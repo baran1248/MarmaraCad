@@ -58,6 +58,11 @@ const TABS: TabDef[] = [
       {
         name: "Modify",
         items: [
+          { action: "sketch-construction", label: "For Construction", icon: "ruler", sketchOnly: true },
+          { action: "tool-trim", label: "Trim", icon: "split" },
+          { action: "sketch-offset", label: "Offset Entities", icon: "arrow-right-left", sketchOnly: true },
+          { action: "tool-convert", label: "Convert Entities", icon: "waypoints", sketchOnly: true },
+          { action: "rel-perpendicular", label: "Perpendicular", icon: "move-3d", sketchOnly: true },
           { action: "sketch-delete", label: "Delete", icon: "trash-2", sketchOnly: true },
           { action: "sketch-fit", label: "Fit Sketch", icon: "focus", sketchOnly: true },
           { action: "toggle-planes", label: "Origin Planes", icon: "frame" },
@@ -82,8 +87,28 @@ const TABS: TabDef[] = [
         items: [
           { action: "fillet", label: "Fillet", icon: "circle" },
           { action: "chamfer", label: "Chamfer", icon: "triangle" },
+          { action: "shell", label: "Shell", icon: "box" },
+          { action: "mirror", label: "Mirror", icon: "arrow-right-left" },
+          { action: "linear-pattern", label: "Linear Pattern", icon: "layout-grid" },
           { action: "edit-feature", label: "Edit", icon: "pencil" },
           { action: "delete-selected", label: "Delete", icon: "trash-2" },
+        ],
+      },
+      {
+        name: "Toolbox",
+        items: [
+          { action: "toolbox-bolt", label: "Bolt", icon: "wrench" },
+          { action: "toolbox-nut", label: "Nut", icon: "circle-dot" },
+          { action: "toolbox-washer", label: "Washer", icon: "circle" },
+        ],
+      },
+      {
+        name: "Inspect",
+        items: [
+          { action: "section-view", label: "Section View", icon: "scan" },
+          { action: "interference", label: "Interference", icon: "boxes" },
+          { action: "make-drawing", label: "Drawing / PDF", icon: "file-down" },
+          { action: "equations", label: "Equations", icon: "equal" },
         ],
       },
       {
@@ -150,6 +175,8 @@ const TABS: TabDef[] = [
         name: "Inspect",
         items: [
           { action: "mass-props", label: "Mass Properties", icon: "gauge", primary: true },
+          { action: "measure", label: "Measure", icon: "ruler" },
+          { action: "section-view", label: "Section View", icon: "scan" },
           { action: "model-info", label: "Model Info", icon: "info" },
         ],
       },
@@ -222,12 +249,109 @@ const TABS: TabDef[] = [
   },
 ];
 
+const TR_LABELS: Record<string, string> = {
+  Sketch: "Eskiz",
+  Features: "Özellikler",
+  Assembly: "Montaj",
+  Evaluate: "Değerlendir",
+  Analysis: "Analiz",
+  Draw: "Çiz",
+  Relations: "İlişkiler",
+  Modify: "Değiştir",
+  "Base / Boss": "Taban / Kabartma",
+  Toolbox: "Takım Kutusu",
+  Inspect: "İncele",
+  Components: "Bileşenler",
+  Mates: "Eşleşmeler",
+  Import: "İçe Aktar",
+  Output: "Çıktı",
+  Display: "Görünüm",
+  Views: "Bakışlar",
+  Export: "Dışa Aktar",
+  Setup: "Kurulum",
+  Boundary: "Sınır Koşulları",
+  Solve: "Çöz",
+  Results: "Sonuçlar",
+  Line: "Çizgi",
+  Rectangle: "Dikdörtgen",
+  Circle: "Daire",
+  "3-Point Arc": "3 Noktalı Yay",
+  "Smart Dimension": "Akıllı Ölçü",
+  "New Sketch": "Yeni Eskiz",
+  "Exit Sketch": "Eskizden Çık",
+  Horizontal: "Yatay",
+  Vertical: "Düşey",
+  Coincident: "Çakışık",
+  Tangent: "Teğet",
+  Equal: "Eşit",
+  Fix: "Sabitle",
+  Perpendicular: "Dik",
+  "For Construction": "Yardımcı Geometri",
+  Trim: "Kırp",
+  "Offset Entities": "Ötele",
+  "Convert Entities": "Dönüştür",
+  Delete: "Sil",
+  "Fit Sketch": "Eskizi Sığdır",
+  "Origin Planes": "Orijin Düzlemleri",
+  "Extruded Boss": "Kabartma",
+  "Extruded Cut": "Kesme",
+  Revolve: "Döndür",
+  Fillet: "Yuvarlat",
+  Chamfer: "Pah",
+  Shell: "Kabuk",
+  Mirror: "Ayna",
+  "Linear Pattern": "Doğrusal Desen",
+  Edit: "Düzenle",
+  Bolt: "Cıvata",
+  Nut: "Somun",
+  Washer: "Pul",
+  "Section View": "Kesit Görünümü",
+  Interference: "Girişim",
+  "Drawing / PDF": "Teknik Resim / PDF",
+  Equations: "Denklemler",
+  "Mass Properties": "Kütle Özellikleri",
+  Measure: "Ölç",
+  "Model Info": "Model Bilgisi",
+  "Shaded + Edges": "Gölgeli + Kenar",
+  Shaded: "Gölgeli",
+  Wireframe: "Tel Kafes",
+  Front: "Ön",
+  Top: "Üst",
+  Right: "Sağ",
+  Isometric: "İzometrik",
+  "Zoom Fit": "Sığdır",
+  STEP: "STEP",
+  IGES: "IGES",
+  STL: "STL",
+  OBJ: "OBJ",
+  "Insert Component": "Bileşen Ekle",
+  Transform: "Dönüştür",
+  "Fix / Float": "Sabitle / Serbest",
+  Concentric: "Eş Merkezli",
+  Distance: "Mesafe",
+  "Resolve All": "Tümünü Çöz",
+  "New Study": "Yeni Çalışma",
+  Material: "Malzeme",
+  Mesh: "Ağ",
+  "Fixed Support": "Sabit Mesnet",
+  Force: "Kuvvet",
+  Pressure: "Basınç",
+  "Clear Loads": "Yükleri Temizle",
+  "Clear Results": "Sonuçları Temizle",
+  Deformation: "Deformasyon",
+  "von Mises Stress": "von Mises Gerilmesi",
+  "Safety Factor": "Emniyet Katsayısı",
+};
+
+const TAB_LABELS: Record<CommandTab, string> = { sketch: "Sketch", features: "Features", assembly: "Assembly", evaluate: "Evaluate", analysis: "Analysis" };
+
 export class CommandManager {
   private tabsEl: HTMLElement;
   private groupsEl: HTMLElement;
   private activeTab: CommandTab = "features";
   private activeAction: string | null = null;
   private sketching = false;
+  private lang: "en" | "tr" = "en";
   onAction: (action: string) => void = () => undefined;
 
   constructor(tabsEl: HTMLElement, groupsEl: HTMLElement) {
@@ -269,9 +393,23 @@ export class CommandManager {
     }
   }
 
+  private setLanguageInternal(lang: "en" | "tr"): void {
+    this.lang = lang;
+    this.render();
+  }
+
+  setLanguage(lang: "en" | "tr"): void {
+    this.setLanguageInternal(lang);
+  }
+
+  private t(text: string): string {
+    if (this.lang === "en") return text;
+    return TR_LABELS[text] ?? text;
+  }
+
   private render(): void {
     this.tabsEl.innerHTML = TABS.map(
-      (t) => `<button class="cmd-tab ${t.id === this.activeTab ? "active" : ""}" data-cmd-tab="${t.id}">${t.label}</button>`,
+      (t) => `<button class="cmd-tab ${t.id === this.activeTab ? "active" : ""}" data-cmd-tab="${t.id}">${this.t(TAB_LABELS[t.id] ?? t.label)}</button>`,
     ).join("");
     this.renderGroups();
   }
@@ -283,12 +421,13 @@ export class CommandManager {
         const btns = g.items
           .map((item) => {
             const disabled = item.sketchOnly && !this.sketching;
-            return `<button class="cmd-btn ${item.primary ? "primary" : ""} ${disabled ? "disabled" : ""} ${this.activeAction === item.action ? "active" : ""}" data-cmd-action="${item.action}" title="${item.label}" ${disabled ? "disabled" : ""}>
-              ${icon(item.icon)}<span>${item.label}</span>
+            const label = this.t(item.label);
+            return `<button class="cmd-btn ${item.primary ? "primary" : ""} ${disabled ? "disabled" : ""} ${this.activeAction === item.action ? "active" : ""}" data-cmd-action="${item.action}" title="${label}" ${disabled ? "disabled" : ""}>
+              ${icon(item.icon)}<span>${label}</span>
             </button>`;
           })
           .join("");
-        return `<div class="cmd-group"><div class="cmd-buttons" style="display:flex;gap:1px;align-items:stretch">${btns}</div><div class="cmd-group-label">${g.name}</div></div>`;
+        return `<div class="cmd-group"><div class="cmd-buttons" style="display:flex;gap:1px;align-items:stretch">${btns}</div><div class="cmd-group-label">${this.t(g.name)}</div></div>`;
       })
       .join("");
     hydrateIcons();

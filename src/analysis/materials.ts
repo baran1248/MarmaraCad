@@ -2,6 +2,16 @@ import type { FeaMaterial } from "../model/types";
 
 export const MATERIALS: FeaMaterial[] = [
   {
+    id: "aisi1020",
+    name: "AISI 1020 Steel",
+    category: "Metals",
+    E: 205000,
+    nu: 0.29,
+    yield: 295,
+    density: 7870,
+    color: "#94a2b0",
+  },
+  {
     id: "steel",
     name: "Structural Steel",
     category: "Metals",
@@ -92,6 +102,16 @@ export const MATERIALS: FeaMaterial[] = [
     color: "#e0dcc6",
   },
   {
+    id: "brass",
+    name: "Brass C36000",
+    category: "Metals",
+    E: 97000,
+    nu: 0.31,
+    yield: 124,
+    density: 8500,
+    color: "#c9a94f",
+  },
+  {
     id: "custom",
     name: "Custom Material",
     category: "Custom",
@@ -105,4 +125,19 @@ export const MATERIALS: FeaMaterial[] = [
 
 export function materialById(id: string | undefined): FeaMaterial {
   return MATERIALS.find((m) => m.id === id) ?? MATERIALS[0];
+}
+
+/** Effective material for a part, including per-part overrides. */
+export function partMaterial(part: { materialId?: string; materialOverride?: { name?: string; E?: number; nu?: number; yield?: number; density?: number } } | undefined): FeaMaterial {
+  const base = materialById(part?.materialId);
+  if (!part?.materialOverride) return base;
+  const o = part.materialOverride;
+  return {
+    ...base,
+    name: o.name ?? base.name,
+    E: o.E ?? base.E,
+    nu: o.nu ?? base.nu,
+    yield: o.yield ?? base.yield,
+    density: o.density ?? base.density,
+  };
 }

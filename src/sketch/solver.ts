@@ -166,6 +166,30 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
       } else {
         add((x) => getR(x, c.a!) - getR(x, c.b!), 2);
       }
+    } else if (c.type === "perpendicular") {
+      const la = c.a ? endpointsOfLine(c.a) : null;
+      const lb = c.b ? endpointsOfLine(c.b) : null;
+      if (!la || !lb) continue;
+      add((x) => {
+        const ax = get(x, la[1], "x") - get(x, la[0], "x");
+        const ay = get(x, la[1], "y") - get(x, la[0], "y");
+        const bx = get(x, lb[1], "x") - get(x, lb[0], "x");
+        const by = get(x, lb[1], "y") - get(x, lb[0], "y");
+        const na = Math.hypot(ax, ay) || 1;
+        const nb = Math.hypot(bx, by) || 1;
+        return (ax * bx + ay * by) / (na * nb);
+      }, 2);
+    } else if (c.type === "angle") {
+      const ids = c.entity ? endpointsOfLine(c.entity) : null;
+      if (!ids) continue;
+      const target = ((c.value ?? 0) * Math.PI) / 180;
+      add((x) => {
+        const ang = Math.atan2(get(x, ids[1], "y") - get(x, ids[0], "y"), get(x, ids[1], "x") - get(x, ids[0], "x"));
+        let diff = ang - target;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        return diff;
+      }, 1.5);
     } else if (c.type === "tangent") {
       const lineIds = c.a ? endpointsOfLine(c.a) : null;
       if (!lineIds || !c.entity) continue;

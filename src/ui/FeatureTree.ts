@@ -1,5 +1,5 @@
 import type { AnalysisStudy, Part, ProjectDocument, WorkspaceMode } from "../model/types";
-import { MATERIALS, materialById } from "../analysis/materials";
+import { MATERIALS, materialById, partMaterial } from "../analysis/materials";
 import { escapeHtml } from "../utils/misc";
 import { icon } from "./icons";
 
@@ -58,7 +58,35 @@ export class FeatureTree {
     this.handlers = handlers;
     this.root.addEventListener("click", this.onClick);
     this.root.addEventListener("contextmenu", this.onContextMenu);
+    this.root.addEventListener("dragstart", (event) => {
+      const bar = (event.target as HTMLElement).closest<HTMLElement>("[data-rollback]");
+      if (!bar) return;
+      this.dragPart = bar.dataset.part ?? "";
+      bar.classList.add("dragging");
+      event.dataTransfer?.setData("text/plain", "rollback");
+    });
+    this.root.addEventListener("dragend", () => {
+      this.root.querySelectorAll(".rollback-bar.dragging").forEach((el) => el.classList.remove("dragging"));
+    });
+    this.root.addEventListener("dragover", (event) => {
+      if (!this.dragPart) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    });
+    this.root.addEventListener("drop", (event) => {
+      if (!this.dragPart) return;
+      event.preventDefault();
+      const row = (event.target as HTMLElement).closest<HTMLElement>(".tree-row");
+      if (row?.dataset.kind === "feature" && row.dataset.id) {
+        this.handlers.action("rollback", "feature", `${this.dragPart}|${row.dataset.id}`);
+      } else if ((event.target as HTMLElement).closest("[data-rollback]")) {
+        this.handlers.action("rollback-clear", "part", this.dragPart);
+      }
+      this.dragPart = "";
+    });
   }
+
+  private dragPart = "";
 
   private lastClickKey = "";
   private lastClickTime = 0;
@@ -147,6 +175,8 @@ export class FeatureTree {
       tangent: "Tangent",
       fix: "Fixed",
       equal: "Equal",
+      perpendicular: "Perpendicular",
+      angle: "Angle",
     };
     const iconNames: Record<string, string> = {
       horizontal: "move-horizontal",
@@ -157,8 +187,15 @@ export class FeatureTree {
       tangent: "magnet",
       fix: "lock",
       equal: "equal",
+      perpendicular: "move-3d",
+      angle: "ruler",
     };
-    const value = c.value !== undefined && (c.type === "distance" || c.type === "radius") ? `${c.value.toFixed(1)} mm` : "";
+    const value =
+      c.value !== undefined && (c.type === "distance" || c.type === "radius")
+        ? `${c.value.toFixed(1)} mm`
+        : c.value !== undefined && c.type === "angle"
+          ? `${c.value.toFixed(1)}°`
+          : "";
     return this.row(`constraint:${sketchId}:${c.id}`, {
       kind: "constraint",
       id: `${sketchId}|${c.id}`,
@@ -229,6 +266,20 @@ export class FeatureTree {
       html += planeRow("top", "Top Plane", "#86b98e");
       html += planeRow("right", "Right Plane", "#cf9f7d");
     }
+
+    // Material line, like SolidWorks' "Material <not specified>" row.
+    const material = part.materialId ? materialById(part.materialId) : undefined;
+    html += `<div class="tree-material">
+      <button class="material-button" data-tree-action="edit-material" data-kind="part" data-id="${escapeHtml(part.id)}" title="Assign or edit the part material">
+        <span class="swatch" style="background:${material?.color ?? "#c9d3dc"}"></span>
+        ${
+          material
+            ? `<span>${escapeHtml(material.name)}</span>`
+            : `<span class="unset">Material &lt;not specified&gt;</span>`
+        }
+        <span class="edit">${material ? "Edit Material" : "Assign"}</span>
+      </button>
+    </div>`;
 
     if (doc.parts.length > 1) {
       const open = expand("parts", true);
@@ -313,7 +364,13 @@ export class FeatureTree {
                 ? "circle"
                 : f.type === "chamfer"
                   ? "triangle"
-                  : "box";
+                  : f.type === "shell"
+                    ? "box"
+                    : f.type === "mirror"
+                      ? "arrow-right-left"
+                      : f.type === "pattern"
+                        ? "layout-grid"
+                        : "box";
       const params =
         f.type === "extrude" || f.type === "cut"
           ? `${f.params.depth ?? 0} mm`
@@ -323,7 +380,14 @@ export class FeatureTree {
               ? `R${f.params.radius ?? 0}`
               : f.type === "chamfer"
                 ? `${f.params.distance ?? 0} mm`
-                : "";
+                : f.type === "shell"
+                  ? `t ${f.params.thickness ?? 0} mm`
+                  : f.type === "mirror"
+                    ? `${f.params.mirrorPlane ?? "right"} plane`
+                    : f.type === "pattern"
+                      ? `${f.params.patternCount ?? 2} × ${f.params.patternSpacing ?? 10} mm`
+                      : "";
+      const rolledBack = part.rollbackIndex !== undefined && part.features.indexOf(f) >= part.rollbackIndex;
       html += this.row(key, {
         kind: "feature",
         id: f.id,
@@ -332,7 +396,7 @@ export class FeatureTree {
         iconName,
         iconClass: "feature",
         selected: ctx.selection === key,
-        suppressed: f.suppressed,
+        suppressed: f.suppressed || rolledBack,
         error: !!f.error,
         badge: f.error ? "!" : undefined,
         sub: params,
@@ -341,6 +405,21 @@ export class FeatureTree {
       if (f.error && ctx.expanded.has(`error:${f.id}`)) {
         html += `<div class="tree-note" style="color:#c0392b;padding-left:32px">${escapeHtml(f.error)}</div>`;
       }
+      if (part.rollbackIndex !== undefined && part.features.indexOf(f) === part.rollbackIndex - 1) {
+        html += `<div class="rollback-bar active" draggable="true" data-rollback data-part="${escapeHtml(part.id)}" title="Drag the rollback bar to rebuild up to a feature">
+          <span class="drag-icon">${icon("more-horizontal")}</span> Rollback
+        </div>`;
+      }
+    }
+    if (part.rollbackIndex === 0 && part.features.length > 0) {
+      html += `<div class="rollback-bar active" draggable="true" data-rollback data-part="${escapeHtml(part.id)}" title="Drag the rollback bar to rebuild up to a feature">
+        <span class="drag-icon">${icon("more-horizontal")}</span> Rollback
+      </div>`;
+    }
+    if (part.rollbackIndex === undefined && part.features.length > 0) {
+      html += `<div class="rollback-bar" draggable="true" data-rollback data-part="${escapeHtml(part.id)}" title="Drag the rollback bar up to rebuild only part of the tree">
+        <span class="drag-icon">${icon("more-horizontal")}</span> Rollback
+      </div>`;
     }
 
     if (part.asset) {
@@ -446,7 +525,7 @@ export class FeatureTree {
       </div>`;
       return html;
     }
-    const material = materialById(study.materialId);
+    const material = part ? partMaterial(part) : materialById(study.materialId);
     const statusLabel =
       study.status === "solved" ? "Solved" : study.status === "meshed" ? "Meshed" : study.status === "failed" ? "Failed" : "Setup";
     html += this.row(`study:${study.id}`, {
@@ -461,6 +540,21 @@ export class FeatureTree {
       expanded: true,
       eye: null,
     });
+    // Ansys-style state ribbon: geometry, material, mesh, loads, results.
+    const hasMesh = !!study.meshStats;
+    const hasLoads = study.supports.length > 0 && study.loads.length > 0;
+    const stale = !!study.stale;
+    const solved = study.status === "solved" && !stale;
+    const pill = (label: string, state: "ok" | "input" | "solve" | "stale", text: string) =>
+      `<div class="status-pill ${state}"><span class="dot"></span><span class="label">${label}</span><span class="state">${text}</span></div>`;
+    html += `<div class="analysis-status-grid">
+      ${pill("Geometry", part && part.features.length > 0 ? "ok" : "input", part && part.features.length > 0 ? "Current" : "Input required")}
+      ${pill("Material", part?.materialId ? "ok" : "input", part?.materialId ? "Current" : "Input required")}
+      ${pill("Mesh", hasMesh ? (stale ? "stale" : "ok") : "input", hasMesh ? (stale ? "Stale" : "Current") : "Input required")}
+      ${pill("Loads", hasLoads ? "ok" : "input", hasLoads ? "Current" : "Input required")}
+      ${pill("Results", solved ? "ok" : stale ? "stale" : study.status === "failed" ? "solve" : "solve", solved ? "Current" : stale ? "Stale · re-solve" : "Solve required")}
+    </div>
+    <div class="analysis-units">MMGS / NMM · mm, N, MPa</div>`;
     html += this.row(`study-geometry:${study.id}`, {
       kind: "study-geometry",
       id: study.id,
