@@ -2702,6 +2702,7 @@ export class App {
       this.toolbarMode = null;
       this.refreshScene();
       this.showResult("stress");
+      this.viewport.zoomFit(false);
       this.refreshTree();
       toast(
         `Solved in ${(outcome.result.solveMs / 1000).toFixed(2)} s · max ${fmt(outcome.result.maxStress, 2)} MPa · SF ${Number.isFinite(outcome.result.safetyFactor) ? fmt(outcome.result.safetyFactor, 2) : "∞"}`,

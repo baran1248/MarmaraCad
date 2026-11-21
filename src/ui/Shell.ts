@@ -595,6 +595,7 @@ export class Shell {
   }
 
   showColorbar(options: { title: string; min: number; max: number; unit: string; gradient: string } | null): void {
+    document.body.classList.toggle("has-legend", Boolean(options));
     if (!options) {
       this.colorbarEl.classList.remove("visible");
       this.colorbarEl.innerHTML = "";
@@ -602,14 +603,15 @@ export class Shell {
     }
     this.colorbarEl.classList.add("visible");
     const mid = (options.min + options.max) / 2;
+    const scale = formatScaleSet([options.min, mid, options.max]);
     this.colorbarEl.innerHTML = `
       <div class="cb-title">${options.title}</div>
       <div class="cb-scale">
         <div class="cb-gradient" style="background:${options.gradient}"></div>
         <div class="cb-labels">
-          <span>${formatScale(options.max)}</span>
-          <span>${formatScale(mid)}</span>
-          <span>${formatScale(options.min)}</span>
+          <span>${scale(options.max)}</span>
+          <span>${scale(mid)}</span>
+          <span>${scale(options.min)}</span>
         </div>
       </div>
       <div class="cb-title cb-unit">${options.unit}</div>
@@ -640,16 +642,17 @@ export class Shell {
   }
 }
 
-function formatScale(v: number): string {
-  if (!Number.isFinite(v)) return "—";
-  // Keep the tick column narrow and consistent: every tick uses a similar width.
-  if (Math.abs(v) < 5e-4) return "0.00";
-  if (Math.abs(v) >= 1000) return (v / 1000).toFixed(2) + "k";
-  if (Math.abs(v) >= 100) return v.toFixed(1);
-  if (Math.abs(v) >= 10) return v.toFixed(1);
-  if (Math.abs(v) >= 1) return v.toFixed(2);
-  if (Math.abs(v) >= 0.01) return v.toFixed(3);
-  return v.toExponential(1);
+function formatScaleSet(values: number[]): (v: number) => string {
+  const peak = Math.max(...values.filter((v) => Number.isFinite(v)).map((v) => Math.abs(v)), 0);
+  // One decimal rule for the whole legend so 0, the midpoint and the peak line up.
+  const digits = peak >= 10 ? 1 : peak >= 1 ? 2 : peak >= 0.01 ? 3 : peak > 0 ? 4 : 2;
+  const kilo = peak >= 10_000;
+  return (v: number) => {
+    if (!Number.isFinite(v)) return "—";
+    if (kilo) return (v / 1000).toFixed(digits) + "k";
+    if (Math.abs(v) < Math.pow(10, -digits) / 2) return (0).toFixed(digits);
+    return v.toFixed(digits);
+  };
 }
 
 export type { CommandTab };

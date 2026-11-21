@@ -191,12 +191,37 @@ const ICONS = {
   X,
 };
 
-export function hydrateIcons(): void {
+let observer: MutationObserver | null = null;
+
+function hydrateNow(): void {
   createIcons({
     icons: ICONS,
     nameAttr: "data-lucide",
     attrs: { "stroke-width": "1.65", "aria-hidden": "true" },
   });
+}
+
+/** Replace `<i data-lucide>` placeholders with SVG.
+ *
+ *  Panels, toolbars and chip lists are re-rendered from HTML strings all over
+ *  the app, so the first call also installs a MutationObserver that hydrates
+ *  icons injected later. Without it a tab switch or a re-rendered PropertyManager
+ *  would show empty boxes where the icons should be. */
+export function hydrateIcons(): void {
+  hydrateNow();
+  if (observer || typeof MutationObserver === "undefined" || !document.body) return;
+  observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (!(node instanceof Element)) continue;
+        if (node.matches?.("i[data-lucide]") || node.querySelector?.("i[data-lucide]")) {
+          hydrateNow();
+          return;
+        }
+      }
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 export function icon(name: string, className = ""): string {

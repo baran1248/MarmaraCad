@@ -1,4 +1,4 @@
-import { icon } from "./icons";
+import { hydrateIcons, icon } from "./icons";
 
 export type CommandTab = "sketch" | "features" | "assembly" | "evaluate" | "analysis";
 
@@ -291,5 +291,6 @@ export class CommandManager {
         return `<div class="cmd-group"><div class="cmd-buttons" style="display:flex;gap:1px;align-items:stretch">${btns}</div><div class="cmd-group-label">${g.name}</div></div>`;
       })
       .join("");
+    hydrateIcons();
   }
 }

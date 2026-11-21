@@ -167,6 +167,8 @@ export function toast(message: string, kind: ToastKind = "info", timeout = 4200)
   const remove = () => el.remove();
   el.querySelector(".close")?.addEventListener("click", remove);
   stack.appendChild(el);
+  // Keep the stack small so it cannot bury the viewport or the result legend.
+  while (stack.children.length > 3) stack.firstElementChild?.remove();
   hydrateIcons();
   window.setTimeout(remove, timeout);
 }

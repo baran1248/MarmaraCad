@@ -293,9 +293,9 @@ svg {
   bottom: 0;
   left: 50%;
   transform: translateX(-50%);
-  font-size: 8.5px;
-  letter-spacing: 0.5px;
-  color: #96a3b0;
+  font-size: 9.5px;
+  letter-spacing: 0.4px;
+  color: #7b8996;
   text-transform: uppercase;
   white-space: nowrap;
   pointer-events: none;
@@ -1433,7 +1433,8 @@ svg {
   top: 208px;
   bottom: 100px;
   width: 92px;
-  z-index: 7;
+  /* Above the toast stack: the legend must never lose its min/max labels. */
+  z-index: 96;
   display: none;
   flex-direction: column;
   pointer-events: none;
@@ -1885,6 +1886,11 @@ svg {
   z-index: 95;
   pointer-events: none;
   max-width: 340px;
+}
+
+/* Keep notifications clear of the result legend. */
+body.has-legend .toast-stack {
+  right: 124px;
 }
 
 .toast {
