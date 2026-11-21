@@ -2,6 +2,7 @@
  * section view, rollback bar, Toolbox fastener, language switch, view selector,
  * confirmation corner and the keyboard-shortcut help. */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { launch, openApp, newDocument, waitForRebuild } from "./e2e-lib.mjs";
 
@@ -130,7 +131,9 @@ try {
     dimLayout ? { heightGap: dimLayout.heightGap, heightDimX: dimLayout.heightDimX } : {},
   );
 
-  const tmpPdf = path.join(process.cwd(), "tests", ".tmp-drawing.pdf");
+  // Download into the OS temp folder: writing into tests/ made Vite's file
+  // watcher lock the PDF mid-write and crash the dev server (EBUSY).
+  const tmpPdf = path.join(os.tmpdir(), "marmaracad-drawing.pdf");
   const [download] = await Promise.all([
     page.waitForEvent("download", { timeout: 60000 }),
     page.click('.modal .btn:has-text("Download PDF")'),

@@ -306,6 +306,12 @@ Live: https://baran1248.github.io/MarmaraCad/
 - HUD audit (1440 × 900): tools `top 144…172`, filters `180…209`, corner `144…181`, cube
   `186…332` — every pair disjoint (0 collisions); the same holds at 1180 px. The view cube moved to
   `top: 52px` and the filter bar to `top: 46px`.
+- Dev-server crash fixed: `e2e-faz2.mjs` used to `saveAs` the downloaded PDF into `tests/`, so
+  Vite's watcher locked the file mid-write and killed `npm run dev` with
+  `EBUSY: resource busy or locked, watch '…\tests\.tmp-drawing.pdf'`. The download now goes to
+  `os.tmpdir()`, and `vite.config.ts` ignores `tests/.tmp-*`, `tests/*.pdf`, `tests/*.step` and
+  `tests/*.mcad.json`. Verified by re-running the suite against a live dev server: PDF 92,963 bytes,
+  `RESULT PASS`, dev server still answering 200 with no watcher errors.
 - Technical drawing: the front view spans y 215.53…278.47; the width dimension sits at y 302.47
   (gap 23.997 px, slot limit 368) and the height dimension at x 564 (28 px right of the outline),
   so neither dimension crosses the part.

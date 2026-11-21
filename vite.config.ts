@@ -16,6 +16,11 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    watch: {
+      // The e2e suites download artefacts (PDF/STEP/project JSON); a file locked
+      // there by Playwright crashed the watcher with EBUSY on Windows.
+      ignored: ["**/tests/.tmp-*", "**/tests/*.step", "**/tests/*.pdf", "**/tests/*.mcad.json"],
+    },
   },
   preview: {
     port: 4173,
