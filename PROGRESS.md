@@ -283,3 +283,7 @@ Live: https://baran1248.github.io/MarmaraCad/
   FEA 4,854 nodes / 3,352 hexahedra, max 0.102 mm / 61.35 MPa, zero console errors. All six
   deep suites (boot, sketch tools, features, mates, STEP audit, beam benchmark) pass against the
   same deployed URL.
+- Phase-2B live verification (commit `931876e`, deploy run 44882973857): eleven suites run against
+  the published URL — `e2e-live`, `e2e-sample`, `e2e-multiselect`, `e2e-dynamic-input`, `e2e-snap`,
+  `e2e-template-boxlid`, `e2e-faz2`, `e2e-ai`, `e2e-variables`, `e2e-analysis-strip` and
+  `e2e-templates` — all `RESULT PASS` with `EXIT=0` and no console errors.

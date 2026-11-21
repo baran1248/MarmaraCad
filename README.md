@@ -58,11 +58,13 @@ MARMARACAD_URL=https://baran1248.github.io/MarmaraCad/ npm run test:e2e
 
 The phase-2 suites cover Ctrl+click multi-selection into a bulk fillet/chamfer and into Mate,
 Fixed Support and a multi-face Force, right-click Select Loop/Tangency, dynamic input
-(`100`, `Tab`, `0`, `Enter`), midpoint/endpoint/origin snaps and alignment guides, window vs
-crossing selection, construction/trim/offset/convert plus sketch definition colours, the Box + Lid
-template (shell volume, placement, zero interference, mass), technical drawing + PDF, Section View,
-rollback, Toolbox, TR/EN, the view selector, the `?` guide, and the Gemini assistant with a mocked
-API.
+(`100`, `Tab`, `0`, `Enter`, plus a typed R25 3-point arc), midpoint/endpoint/origin snaps and
+alignment guides, window vs crossing selection, construction/trim/offset/convert plus sketch
+definition colours, the Box + Lid template (shell volume, placement, zero interference, a detected
+1,152 mm³ overlap, mass), the Beam/L-Bracket/Blank templates, Linear Pattern + Mirror, parametric
+variables (`L = 100`, `W = L / 2`), the Ansys-style analysis strip, technical drawing + PDF, Section
+View, rollback, Toolbox M4–M12, TR/EN, keyboard shortcuts (N, Ctrl+8, F, Esc, wheel zoom), the view
+selector, the `?` guide, and the Gemini assistant with a mocked API.
 
 CI runs `npm test` and `npm run build` on every push to `main`, then publishes `dist` to GitHub
 Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow` scope
