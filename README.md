@@ -31,6 +31,7 @@ npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
 npm run test:e2e # Playwright end-to-end suite (start `npm run dev` first; uses local Chrome)
+npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
 

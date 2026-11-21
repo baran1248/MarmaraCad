@@ -418,8 +418,8 @@ export class FeatureTree {
           iconClass: "feature",
           selected: ctx.selection === key,
           error: !!m.error,
-          badge: m.type,
-          title: m.error ? `${m.name}: ${m.error}` : `${m.name} — double-click to edit`,
+          badge: m.type.charAt(0).toUpperCase() + m.type.slice(1),
+          title: m.error ? `${m.name}: ${m.error}` : `${m.name} — ${m.type} mate, double-click to edit`,
         });
       }
     }

@@ -133,3 +133,24 @@ Live: https://baran1248.github.io/MarmaraCad/
   92 px with consistent tick formatting and preserved `MPa` casing; the assembly mass card now
   aggregates visible components; the sketch solver recognises an already-consistent profile so a
   freshly drawn rectangle no longer reports a false constraint conflict.
+- Second QA pass (non-visual audit + pixel measurements, because the review model had no vision
+  channel):
+  - icons are hydrated through a `MutationObserver`, so tab switches and re-rendered panels no
+    longer leave empty `<i data-lucide>` boxes (audit went from 14 unhydrated icons to 0);
+  - every legend tick now uses one decimal rule (`560.4 / 280.2 / 0.0`, no more mixed `560`/`280.2`),
+    the card is 104 px wide with 9.5 px labels, nothing is clipped, and the title fits two lines;
+  - the legend sits above the toast stack (`z-index: 96`) and the stack shifts 138 px left while a
+    result legend is visible, so the minimum label can never be covered (measured overlap: false);
+  - toasts are capped at three cards and still auto-dismiss after 4.2 s;
+  - the viewport is zoomed to fit after a solve (result coverage 22 % of canvas pixels, up from
+    3.8 % in the reviewed screenshot);
+  - mate features are named after their type (`Coincident1`, `Concentric1`, `Distance1`) and the
+    tree badge is capitalised, so the assembly tree states the mate type.
+- Sketch-canvas regression proof: capture the canvas while a 80×50 rectangle is edited, finish the
+  sketch and capture again — 17.4 % of the pixels change, i.e. the overlay (grid + lines + origin
+  planes) really rasterises; the "blank canvas" report was a thin-line/OCR artefact.
+- Live build at https://baran1248.github.io/MarmaraCad/ re-verified after deploy (run for commit
+  83f003c): boot 4.9 s, WebGPU, sample 98,507 mm³ / 13 faces / 30 edges, STEP 37,607 bytes,
+  FEA 4,854 nodes / 3,352 hexahedra, max 0.102 mm / 61.35 MPa, zero console errors. All six
+  deep suites (boot, sketch tools, features, mates, STEP audit, beam benchmark) pass against the
+  same deployed URL.

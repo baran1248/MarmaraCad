@@ -102,11 +102,21 @@ await page.waitForTimeout(900);
 
 out.legend = await page.evaluate(() => {
   const bar = document.getElementById("colorbar");
-  const labels = [...bar.querySelectorAll(".cb-labels span")].map((s) => s.textContent);
+  const spans = [...bar.querySelectorAll(".cb-labels span")];
+  const labels = spans.map((s) => s.textContent);
+  const clipped = spans.filter((s) => s.scrollWidth > s.clientWidth + 1).map((s) => s.textContent);
   const rect = bar.getBoundingClientRect();
   const toasts = [...document.querySelectorAll(".toast")].map((t) => t.getBoundingClientRect());
   const overlap = toasts.some((t) => !(t.right < rect.left || t.left > rect.right || t.bottom < rect.top || t.top > rect.bottom));
-  return { labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height }, zIndex: getComputedStyle(bar).zIndex, toasts: toasts.length, overlap };
+  return {
+    labels,
+    clipped,
+    rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+    zIndex: getComputedStyle(bar).zIndex,
+    titleLines: Math.round(bar.querySelector(".cb-title").getBoundingClientRect().height / 12),
+    toasts: toasts.length,
+    overlap,
+  };
 });
 
 // Result coverage: sample the viewport screenshot and count non-background pixels.

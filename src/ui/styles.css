@@ -370,6 +370,7 @@ svg {
 .left-panel {
   background: var(--panel);
   border-right: 1px solid var(--line);
+  box-shadow: 2px 0 8px rgba(40, 62, 84, 0.07);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1432,7 +1433,7 @@ svg {
   right: 20px;
   top: 208px;
   bottom: 100px;
-  width: 92px;
+  width: 104px;
   /* Above the toast stack: the legend must never lose its min/max labels. */
   z-index: 96;
   display: none;
@@ -1445,10 +1446,10 @@ svg {
 }
 
 .colorbar .cb-title {
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.3px;
+  letter-spacing: 0.2px;
   line-height: 1.25;
   color: #455a6e;
   background: rgba(255, 255, 255, 0.85);
@@ -1490,10 +1491,11 @@ svg {
   flex-direction: column;
   justify-content: space-between;
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 9.5px;
   color: #2f4356;
-  padding: 3px 4px;
+  padding: 3px 5px;
   text-align: right;
+  white-space: nowrap;
 }
 
 .result-toolbar {
@@ -1890,7 +1892,7 @@ svg {
 
 /* Keep notifications clear of the result legend. */
 body.has-legend .toast-stack {
-  right: 124px;
+  right: 138px;
 }
 
 .toast {

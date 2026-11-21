@@ -2092,12 +2092,13 @@ export class App {
           const componentA = this.doc.components.find((c) => c.id === picks[0].componentId);
           const componentB = this.doc.components.find((c) => c.id === picks[1].componentId);
           if (!componentA || !componentB) return;
+          const label = mateType === "concentric" ? "Concentric" : mateType === "distance" ? "Distance" : "Coincident";
           let suffix = 1;
-          while (this.doc.mates.some((m) => m.name === `Mate${suffix}`)) suffix++;
+          while (this.doc.mates.some((m) => m.name === `${label}${suffix}`)) suffix++;
           const mate: Mate = {
             id: uid("mate"),
             type: mateType,
-            name: `Mate${suffix}`,
+            name: `${label}${suffix}`,
             a: faceRefFromPick(componentA, picks[0].faceIndex, picks[0].face.surface, picks[0].face.point, picks[0].face.normal, picks[0].face.axis, picks[0].face.radius),
             b: faceRefFromPick(componentB, picks[1].faceIndex, picks[1].face.surface, picks[1].face.point, picks[1].face.normal, picks[1].face.axis, picks[1].face.radius),
             distance: mateType === "distance" ? distance : undefined,

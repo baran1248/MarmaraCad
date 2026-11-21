@@ -151,7 +151,7 @@ export class ResultView {
     if (mode === "stress") {
       return {
         mode,
-        title: "Equivalent (von Mises) Stress",
+        title: "von Mises Stress",
         min: 0,
         max: result.maxStress,
         unit: "MPa",
