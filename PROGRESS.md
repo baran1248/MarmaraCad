@@ -525,6 +525,13 @@ Live: https://baran1248.github.io/MarmaraCad/
     the `.mcad.json` round-trip (sheet metal + flanges too).
   - Live assembly drag: six pointer frames keep the concentric mate at radial residual 0.000 mm and
     axis cross 0.000 mm while the component slides 12.28 mm along the free axis; one undo step.
+- Live verification on https://baran1248.github.io/MarmaraCad/ after deploy run 45080257978
+  (commit `059ed30`): `e2e-phase4.mjs` reports `RESULT PASS 53/53` with no console or page errors
+  (push/pull 167,999.956 mm3, R6 fillet 95,845.49 mm3, BA flatten 23,123.823 mm3, DXF 1,196 B,
+  configurations 48,000 <-> 144,000 mm3, live drag radial residual 0.000 mm / moved 12.28 mm), and
+  `e2e-live`, `e2e-ribbon` (7/7), `e2e-controlmodes` (14/14), `e2e-faz2`, `e2e-ai`, `e2e-hud`,
+  `e2e-body-features`, `e2e-fea-tet`, `e2e-fea-multiphysics`, `e2e-variables`, `e2e-snap`,
+  `e2e-dynamic-input` and `e2e-template-boxlid` all exit 0 against the published URL.
 - Real bugs the new suites caught and fixed: WebGPU `LineDashedMaterial` (`Uniform "null" not
   declared.`) -> geometry-baked dashes; navigation preferences read but never handed to the viewport
   at boot; new configurations losing activation; configuration apply order (apply -> evaluate);
