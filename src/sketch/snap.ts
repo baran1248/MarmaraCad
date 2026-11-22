@@ -108,8 +108,8 @@ function lineEnds(sketch: Sketch, id: string): [Pt, Pt] | null {
 
 function circleOf(sketch: Sketch, id: string): { c: Pt; r: number; arc?: boolean; start?: Pt; end?: Pt; ccw?: boolean } | null {
   const e = sketch.entities.find((q) => q.id === id);
-  if (!e) return null;
-  const c = sketch.points.find((p) => p.id === (e.kind === "line" ? "" : e.center));
+  if (!e || e.kind === "line" || e.kind === "spline") return null;
+  const c = sketch.points.find((p) => p.id === e.center);
   if (!c) return null;
   if (e.kind === "circle") return { c: { x: c.x, y: c.y }, r: e.radius };
   if (e.kind === "arc") {
@@ -205,7 +205,7 @@ export function snapCandidates(
 
   if (settings.center || settings.quadrant) {
     for (const e of sketch.entities) {
-      if (e.kind === "line") continue;
+      if (e.kind === "line" || e.kind === "spline") continue;
       const c = sketch.points.find((p) => p.id === e.center);
       if (!c) continue;
       const r = e.kind === "circle" ? e.radius : Math.hypot((sketch.points.find((p) => p.id === e.start)?.x ?? 0) - c.x, (sketch.points.find((p) => p.id === e.start)?.y ?? 0) - c.y);

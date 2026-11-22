@@ -15,8 +15,16 @@ visualisation — executes on the user's own CPU/GPU.
 - SolidWorks-inspired CommandManager, FeatureManager design tree and ViewCube.
 - Parametric sketches with dimensions and geometric relations, solved with a
   Levenberg–Marquardt constraint solver.
-- Extrude Boss/Base, Extruded Cut, Revolve, Fillet, Chamfer, Shell, Mirror and Linear Pattern
+- Extrude Boss/Base, Extruded Cut, Revolve, Fillet, Chamfer, Shell, Mirror, Linear Pattern, Sweep,
+  Helix/Spiral, Loft, Circular Pattern, Hole Wizard (M3–M16, counterbore/countersink), Draft and Rib
   as an editable feature history.
+- Reference planes (offset / angled / mid) and reference axes (plane intersection / cylinder axis),
+  with sketching directly on a generated plane.
+- Sketch tools: Slot (straight / arc), Polygon (3–12 sides, inscribed / circumscribed), Spline,
+  Sketch Fillet / Chamfer and Circular Sketch Pattern — all OSnap and Dynamic Input aware.
+- Mouse / Trackpad / Pen control modes with SolidWorks, Fusion and Ansys mouse presets, persisted in
+  `localStorage`; two-finger trackpad orbit/pan/pinch and pen pressure-free draw/select with a
+  barrel-button context menu.
 - Multi-select with Ctrl/Shift-click, window (left→right) and crossing (right→left) selection,
   All / Faces / Edges / Vertices pick filters, and loop / tangency selection from the context menu.
 - SolidWorks-style dynamic input while drawing (type length/angle, `Tab`, `Enter`) and object snaps
@@ -26,16 +34,25 @@ visualisation — executes on the user's own CPU/GPU.
 - Material row above the feature tree (AISI 1020, 6061-T6, 304 SS, Ti-6Al-4V, ABS, Brass and
   custom), feeding mass properties and every analysis study.
 - Evaluate tools: Mass Properties (volume, area, mass, centre of mass X/Y/Z), Measure, Section View,
-  Interference Detection, technical drawing (3 orthographic + isometric views) and PDF export.
+  Interference Detection, technical drawing (3 orthographic + isometric views, hidden lines,
+  centerlines/center marks, hatched A-A section, assembly BOM) and PDF export.
 - Toolbox fasteners (M4–M12 hex bolts, nuts, washers), equations/variables, rollback bar,
   TR/EN interface, document templates (`Cantilever Beam`, `L-Bracket`, `Box + Lid Assembly`).
 - Gemini CAD assistant: the API key is stored only in this browser; Turkish or English requests are
-  translated to a validated command list and applied inside the normal undo/redo history.
-- Multi-part assemblies with Coincident, Concentric and Distance mates.
+  translated to a validated command list and applied inside the normal undo/redo history, including
+  reference planes, sweeps, lofts, circular patterns, holes, exploded views, modal, thermal and
+  buckling studies.
+- Multi-part assemblies with Coincident, Concentric, Distance and Angle mates plus an exploded view
+  with an explode/collapse slider.
 - STEP (AP214), IGES, STL and OBJ import/export; `.mcad.json` projects; IndexedDB autosave.
-- Ansys-inspired structural analysis: material library, conforming hexahedral (8-node brick)
-  mesh, fixed supports, forces/pressures, linear static solve, total deformation and Von Mises
-  stress with Geometry/Material/Mesh/Loads/Results status indicators.
+- Ansys-class FEA: material library, conformal Tet4/Tet10 mesher on the OCCT triangulation (with a
+  voxel hexahedron fallback, local mesh sizing and aspect-ratio/Jacobian quality metrics),
+  Jacobi-preconditioned block CG with a WebGPU WGSL PCG path and CPU fallback, fixed / displacement /
+  frictionless / cylindrical / bonded supports, force / pressure / moment / gravity / thermal loads,
+  and total/directional deformation, von Mises, principal, shear, safety factor, reaction force,
+  probe, min/max flags, deformation animation and an undeformed wireframe.
+- Multiphysics studies: modal (first 4–6 frequencies with mode shapes), linear buckling (critical
+  load multiplier) and steady-state thermal (temperature field in °C).
 - WebGPU renderer with an automatic WebGL2 fallback (`?renderer=webgl2` forces the fallback).
 
 ## Development
@@ -45,7 +62,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 26 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 30 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -69,6 +86,12 @@ overlap guard (`e2e-hud.mjs`), per-generation Gemini thinking config with AI-dri
 and AI cut/revolve/mirror/pattern/mate commands, the drawing dimension placement check, and Turkish
 Assembly/mass-card/menu labels.
 
+The phase-3 suites add the ribbon caption-lane guard (`e2e-ribbon.mjs`, `getBoundingClientRect()` at
+1440 and 1024 px), the control-mode matrix (`e2e-controlmodes.mjs`: presets, trackpad gestures, pen and
+`localStorage` persistence across reload), the conformal Tet10 result surface (`e2e-fea-tet.mjs`:
+deflection, reaction, 13 result modes, probe, animation, wireframe, min/max) and multiphysics
+(`e2e-fea-multiphysics.mjs`: modal f₁, 1-D thermal profile, buckling multiplier).
+
 CI runs `npm test` and `npm run build` on every push to `main`, then publishes `dist` to GitHub
 Pages. Pushing changes to `.github/workflows/` needs a token with the `workflow` scope
 (`gh auth refresh -h github.com -s workflow`).
@@ -87,8 +110,8 @@ a new deployment invalidates the entry automatically (Tools → Clear Cached Ker
 | Layer | Responsibility |
 | --- | --- |
 | `src/kernel/cad.worker.ts` | OCCT B-Rep operations, tessellation, topological metadata, STEP/IGES |
-| `src/kernel/fea.worker.ts` | voxel hexahedral meshing, CSR assembly, PCG solve, stress recovery |
-| `src/viewport/` | Three.js scene, picking, sketch rendering, CPU section cut, result visualisation |
+| `src/fea/` | voxel + conformal Tet4/Tet10 meshing, CSR assembly, CPU/WebGPU PCG, modal/buckling/thermal |
+| `src/viewport/` | Three.js scene, picking, sketch rendering, control modes, CPU section cut, result visualisation |
 | `src/sketch/` | 2D constraint solver, profile extraction, snapping, dynamic input |
 | `src/model/` | project document model, feature history, mates, materials, expressions, toolbox |
 | `src/analysis/` | material library, FEA study model, solver and result helpers |

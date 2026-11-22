@@ -95,6 +95,40 @@ export function sampleArc(center: Vec2, start: Vec2, end: Vec2, ccw: boolean): V
   return out;
 }
 
+/** Catmull-Rom interpolation through control points, the sketch Spline tool.
+ *  The curve is sampled densely enough that extrusions, sweeps and drawings see
+ *  a smooth contour while the editable control points stay in the sketch. */
+export function sampleSpline(control: Vec2[], segments = 16): Vec2[] {
+  if (control.length < 2) return control.map((p) => ({ ...p }));
+  if (control.length === 2) {
+    const out: Vec2[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      out.push({ x: control[0].x + (control[1].x - control[0].x) * t, y: control[0].y + (control[1].y - control[0].y) * t });
+    }
+    return out;
+  }
+  const out: Vec2[] = [];
+  const at = (i: number) => control[Math.max(0, Math.min(control.length - 1, i))];
+  for (let i = 0; i < control.length - 1; i++) {
+    const p0 = at(i - 1);
+    const p1 = at(i);
+    const p2 = at(i + 1);
+    const p3 = at(i + 2);
+    for (let s = 0; s < segments; s++) {
+      const t = s / segments;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      out.push({
+        x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3),
+      });
+    }
+  }
+  out.push({ ...control[control.length - 1] });
+  return out;
+}
+
 export function sampleCircle(center: Vec2, radius: number): Vec2[] {
   const steps = 72;
   const out: Vec2[] = [];
@@ -169,10 +203,17 @@ export function extractLoops(sketch: Sketch, tolerance = 1e-6): LoopExtraction {
   }
 
   const adj = new Map<string, string[]>();
+  const endpoints = (e: Sketch["entities"][number]): [string, string] | null => {
+    if (e.kind === "line") return [e.p1, e.p2];
+    if (e.kind === "arc") return [e.start, e.end];
+    if (e.kind === "spline") return e.points.length >= 2 ? [e.points[0], e.points[e.points.length - 1]] : null;
+    return null;
+  };
   for (const e of sketch.entities) {
     if (e.kind === "circle") continue;
-    const ids = e.kind === "line" ? [e.p1, e.p2] : [e.start, e.end];
-    for (const id of ids) {
+    const ends = endpoints(e);
+    if (!ends) continue;
+    for (const id of ends) {
       if (!adj.has(id)) adj.set(id, []);
       adj.get(id)!.push(e.id);
     }
@@ -180,8 +221,10 @@ export function extractLoops(sketch: Sketch, tolerance = 1e-6): LoopExtraction {
 
   for (const e of sketch.entities) {
     if (e.kind === "circle" || used.has(e.id)) continue;
-    const startId = e.kind === "line" ? e.p1 : e.start;
-    let curId = e.kind === "line" ? e.p2 : e.end;
+    const ends = endpoints(e);
+    if (!ends) continue;
+    const startId = ends[0];
+    let curId = ends[1];
     const entityIds: string[] = [e.id];
     const ordered: Array<{ entityId: string; forward: boolean }> = [];
     const firstEntity = sketch.entities.find((x) => x.id === e.id)!;
@@ -195,12 +238,14 @@ export function extractLoops(sketch: Sketch, tolerance = 1e-6): LoopExtraction {
       const nextId = cands[0];
       const next = sketch.entities.find((x) => x.id === nextId);
       if (!next || next.kind === "circle") break;
-      const nextStart = next.kind === "line" ? next.p1 : next.start;
+      const nextEnds = endpoints(next);
+      if (!nextEnds) break;
+      const [nextStart, nextEnd] = nextEnds;
       const forward = nextStart === curId;
       used.add(nextId);
       entityIds.push(nextId);
       ordered.push({ entityId: nextId, forward });
-      curId = forward ? (next.kind === "line" ? next.p2 : next.end) : nextStart;
+      curId = forward ? nextEnd : nextStart;
       closed = curId === startId;
     }
     if (!closed) {
@@ -215,6 +260,11 @@ export function extractLoops(sketch: Sketch, tolerance = 1e-6): LoopExtraction {
           const s = points.get(forward ? ent.start : ent.end);
           const end = points.get(forward ? ent.end : ent.start);
           if (c && s && end) pts.push(...sampleArc({ x: c.x, y: c.y }, { x: s.x, y: s.y }, { x: end.x, y: end.y }, forward ? ent.ccw : !ent.ccw));
+        } else if (ent.kind === "spline") {
+          const ctrl = ent.points.map((id) => points.get(id)).filter((p): p is NonNullable<typeof p> => !!p);
+          const spline = sampleSpline(ctrl);
+          if (!forward) spline.reverse();
+          pts.push(...spline);
         }
       }
       openChains.push(pts);
@@ -242,6 +292,14 @@ export function extractLoops(sketch: Sketch, tolerance = 1e-6): LoopExtraction {
         const en = points.get(forward ? ent.end : ent.start);
         if (!c || !s || !en) continue;
         const segPts = sampleArc({ x: c.x, y: c.y }, { x: s.x, y: s.y }, { x: en.x, y: en.y }, forward ? ent.ccw : !ent.ccw);
+        segs.push({ kind: "polyline", points: segPts });
+        for (const sp of segPts) {
+          if (pts.length === 0 || Math.hypot(pts[pts.length - 1].x - sp.x, pts[pts.length - 1].y - sp.y) > tolerance) pts.push(sp);
+        }
+      } else if (ent.kind === "spline") {
+        const ctrl = ent.points.map((id) => points.get(id)).filter((p): p is NonNullable<typeof p> => !!p);
+        let segPts = sampleSpline(ctrl);
+        if (!forward) segPts = [...segPts].reverse();
         segs.push({ kind: "polyline", points: segPts });
         for (const sp of segPts) {
           if (pts.length === 0 || Math.hypot(pts[pts.length - 1].x - sp.x, pts[pts.length - 1].y - sp.y) > tolerance) pts.push(sp);
@@ -347,8 +405,8 @@ export function dimensionLabel(sketch: Sketch, constraintId: string): { x: numbe
   }
   if (c.type === "radius" && c.entity) {
     const e = sketch.entities.find((q) => q.id === c.entity);
-    if (!e || e.kind === "line") return null;
-    const ctr = pm.get(e.kind === "circle" ? e.center : e.center);
+    if (!e || e.kind === "line" || e.kind === "spline") return null;
+    const ctr = pm.get(e.center);
     if (!ctr) return null;
     const r = entityRadius(sketch, e);
     return { x: ctr.x, y: ctr.y + r, text: `R${(c.value ?? r).toFixed(1)}`, kind: "radius" };

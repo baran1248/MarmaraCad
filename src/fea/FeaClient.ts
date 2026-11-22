@@ -1,17 +1,24 @@
-import type { FeaNodeResult } from "../model/types";
+import type { AnalysisType, FeaMeshKind, FeaMeshMetrics, FeaNodeResult } from "../model/types";
 import type { FeaLoadSpec } from "./solver";
+import type { TetSupportSpec } from "./tetSolver";
 
 export interface FeaMeshPayload {
   positions: Float32Array;
   indices: Uint32Array;
   meshSize: number;
+  meshKind?: FeaMeshKind;
 }
 
 export interface FeaSolvePayload extends FeaMeshPayload {
-  material: { E: number; nu: number; yield: number };
+  material: { E: number; nu: number; yield: number; density?: number; conductivity?: number };
   triFaceIds: Uint32Array;
   supportFaces: number[];
+  supports?: TetSupportSpec[];
   loads: FeaLoadSpec[];
+  analysisType?: AnalysisType;
+  localSizing?: { faceIndex: number; size: number }[];
+  modeCount?: number;
+  ambient?: number;
 }
 
 export interface FeaMeshStats {
@@ -19,6 +26,8 @@ export interface FeaMeshStats {
   elements: number;
   h: number;
   warnings: string[];
+  kind?: FeaMeshKind;
+  metrics?: FeaMeshMetrics;
 }
 
 export interface FeaSolveOutcome {

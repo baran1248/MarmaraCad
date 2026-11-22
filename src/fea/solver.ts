@@ -2,10 +2,12 @@ import type { FeaNodeResult, Vec3 } from "../model/types";
 import { buildVoxelMesh, hexVolume, tetVolume, type VoxelMeshData } from "./mesher";
 
 export interface FeaLoadSpec {
-  type: "force" | "pressure";
+  type: "force" | "pressure" | "moment" | "gravity" | "temperature" | "heatflux" | "convection";
   faceIndex: number;
   magnitude: number;
   direction?: Vec3;
+  /** Ambient temperature for convection, secondary axis/angle value otherwise. */
+  secondary?: number;
 }
 
 export interface StaticSolveOptions {
@@ -19,7 +21,7 @@ export interface StaticSolveOptions {
   onProgress?: (phase: string, percent: number) => void;
 }
 
-interface FaceTriangles {
+export interface FaceTriangles {
   ax: number; ay: number; az: number;
   bx: number; by: number; bz: number;
   cx: number; cy: number; cz: number;
@@ -379,7 +381,7 @@ export function solveStatic(options: StaticSolveOptions): { mesh: VoxelMeshData;
   return { mesh, result };
 }
 
-function vonMises(stress: number[]): number {
+export function vonMises(stress: number[]): number {
   return Math.sqrt(
     0.5 * ((stress[0] - stress[1]) ** 2 + (stress[1] - stress[2]) ** 2 + (stress[2] - stress[0]) ** 2) +
       3 * (stress[3] ** 2 + stress[4] ** 2 + stress[5] ** 2),
@@ -494,7 +496,7 @@ function countFlags(flags: Uint8Array): number {
   return n;
 }
 
-function collectFaceTriangles(options: StaticSolveOptions, faces: Set<number>): FaceTriangles[] {
+export function collectFaceTriangles(options: StaticSolveOptions, faces: Set<number>): FaceTriangles[] {
   const out: FaceTriangles[] = [];
   const p = options.sourcePositions;
   const idx = options.sourceIndices;
@@ -549,7 +551,7 @@ function nodesNearTriangles(mesh: VoxelMeshData, tris: FaceTriangles[], capture:
   return flags;
 }
 
-function pointNearTriangles(positions: Float32Array, node: number, tris: FaceTriangles[], capture: number): boolean {
+export function pointNearTriangles(positions: Float32Array, node: number, tris: FaceTriangles[], capture: number): boolean {
   const px = positions[node * 3], py = positions[node * 3 + 1], pz = positions[node * 3 + 2];
   const capture2 = capture * capture;
   for (const t of tris) {

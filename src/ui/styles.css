@@ -67,7 +67,7 @@ svg {
 /* ------------------------------------------------------------------ shell */
 .app-shell {
   display: grid;
-  grid-template-rows: 36px 98px minmax(0, 1fr) 25px;
+  grid-template-rows: 36px 128px minmax(0, 1fr) 25px;
   height: 100vh;
   width: 100vw;
   background: var(--bg);
@@ -224,7 +224,7 @@ svg {
 /* -------------------------------------------------------------- commandbar */
 .commandbar {
   display: grid;
-  grid-template-rows: 32px minmax(0, 1fr);
+  grid-template-rows: 30px minmax(0, 1fr);
   background: linear-gradient(180deg, #fbfcfd, #edf2f7);
   border-bottom: 1px solid var(--line);
   z-index: 20;
@@ -271,7 +271,9 @@ svg {
   gap: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 5px 8px 4px;
+  /* The bottom padding is the exclusive lane for the horizontal scrollbar.
+     The caption lane itself lives inside each group (see .cmd-group). */
+  padding: 5px 8px 8px;
   scrollbar-width: thin;
 }
 
@@ -279,7 +281,10 @@ svg {
   display: flex;
   align-items: stretch;
   gap: 2px;
-  padding: 0 8px;
+  /* Bottom padding is the caption lane: buttons stop above it, so a wrapped
+     two-line label can never touch BASE / BOSS, MODIFY, INSPECT, IMPORT,
+     OUTPUT or any other group caption. */
+  padding: 0 8px 19px;
   border-right: 1px solid #d5dee7;
   position: relative;
 }
@@ -290,7 +295,7 @@ svg {
 
 .cmd-group-label {
   position: absolute;
-  bottom: 0;
+  bottom: 2px;
   left: 50%;
   transform: translateX(-50%);
   font-size: 9.5px;
@@ -304,7 +309,7 @@ svg {
 .cmd-btn {
   min-width: 55px;
   max-width: 86px;
-  padding: 4px 5px 11px;
+  padding: 4px 5px 3px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 4px;
@@ -327,9 +332,13 @@ svg {
 
 .cmd-btn span {
   font-size: 9.5px;
+  line-height: 1.12;
   text-align: center;
   white-space: normal;
+  overflow-wrap: anywhere;
   max-width: 78px;
+  max-height: 2.24em;
+  overflow: hidden;
 }
 
 .cmd-btn:hover {
@@ -2354,6 +2363,50 @@ body.has-legend .toast-stack {
   }
 }
 
+/* ---------------------------------------------------- control mode switcher */
+.control-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 5px;
+  height: 21px;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  background: #edf3f8;
+}
+.control-switcher .cs-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .35px;
+  color: #73818e;
+  margin-right: 3px;
+}
+.control-switcher button {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #526474;
+  font-size: 9.5px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  line-height: 1.2;
+}
+.control-switcher button:hover { background: #dde8f2; }
+.control-switcher button.active {
+  background: #fff;
+  border-color: #b9cfe2;
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+.control-switcher select {
+  height: 17px;
+  font-size: 9px;
+  border: 1px solid #c6d4e0;
+  border-radius: 3px;
+  background: #fff;
+  color: #435566;
+  max-width: 92px;
+}
+
 /* ------------------------------------------------------- phase 2 additions */
 .title-actions .ai-launch {
   display: inline-flex;
@@ -2740,6 +2793,12 @@ body.has-legend .toast-stack {
 
 .drawing-preview { background: #fff; border: 1px solid #cbd8e3; border-radius: 4px; padding: 4px; text-align: center; }
 .drawing-preview svg { max-width: 100%; height: auto; }
+.drawing-options { display: flex; flex-wrap: wrap; gap: 12px; padding: 2px 2px 10px; font-size: 12px; color: var(--text-dim, #52616f); }
+.drawing-options label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.result-toolbar { flex-wrap: wrap; justify-content: center; max-width: min(1200px, calc(100% - 32px)); }
+.result-toolbar .rt-modes { flex-wrap: wrap; }
+.dof-row { display: flex; gap: 18px; padding: 2px 0 8px; font-size: 12px; }
+.dof-row label { display: inline-flex; align-items: center; gap: 5px; }
 
 .edit-material-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .edit-material-grid .field { margin: 0; }

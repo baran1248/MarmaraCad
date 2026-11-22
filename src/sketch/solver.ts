@@ -101,7 +101,7 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
     else if (v.kind === "y") x0[i] = pointById.get(v.refId)?.y ?? 0;
     else {
       const e = entityById.get(v.refId);
-      x0[i] = e && e.kind !== "line" ? (e.kind === "circle" ? e.radius : arcRadius(sketch, e)) : 1;
+      x0[i] = e && (e.kind === "circle" || e.kind === "arc") ? (e.kind === "circle" ? e.radius : arcRadius(sketch, e)) : 1;
     }
   }
 
@@ -117,7 +117,7 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
     const idx = varIndex.get(`r:${id}`);
     if (idx !== undefined) return x[idx];
     const e = entityById.get(id);
-    return e && e.kind !== "line" ? (e.kind === "circle" ? e.radius : arcRadius(sketch, e)) : 1;
+    return e && (e.kind === "circle" || e.kind === "arc") ? (e.kind === "circle" ? e.radius : arcRadius(sketch, e)) : 1;
   };
 
   const residuals: Array<(x: Float64Array) => number> = [];
@@ -199,7 +199,7 @@ export function solveSketch(input: Sketch, options: SolveOptions = {}): SolveRes
         const bx = get(x, lineIds[1], "x");
         const by = get(x, lineIds[1], "y");
         const e = entityById.get(c.entity!);
-        const centerId = e && e.kind !== "line" ? e.center : "";
+        const centerId = e && (e.kind === "circle" || e.kind === "arc") ? e.center : "";
         const cx = get(x, centerId, "x");
         const cy = get(x, centerId, "y");
         const dx = bx - ax;
@@ -407,6 +407,7 @@ export function removePoint(sketch: Sketch, pointId: string): void {
   sketch.entities = sketch.entities.filter((e) => {
     if (e.kind === "line") return e.p1 !== pointId && e.p2 !== pointId;
     if (e.kind === "circle") return e.center !== pointId;
+    if (e.kind === "spline") return !e.points.includes(pointId);
     return e.center !== pointId && e.start !== pointId && e.end !== pointId;
   });
 }

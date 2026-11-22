@@ -186,6 +186,69 @@ Live: https://baran1248.github.io/MarmaraCad/
 - [x] Live GitHub Pages verification (desktop)
 - [x] README with architecture, usage, verification and license notes
 
+## Phase 3 — Advanced CAD, Shapr3D control modes & Ansys-class FEA
+
+### Input modes & ribbon
+- [x] Mouse / Trackpad / Pen switcher in the status bar, persisted in `localStorage`
+      (`marmaracad.controlMode`), with SolidWorks / Fusion / Ansys mouse presets
+      (`marmaracad.mousePreset`)
+- [x] Mouse presets: MMB orbit (SolidWorks, Ansys), MMB pan (Fusion), Shift+MMB orbit (Fusion),
+      Ctrl+MMB pan everywhere, wheel zoom at the cursor, RMB box zoom / context menu
+- [x] Trackpad: two-finger orbit, Shift (or horizontal) pan, Ctrl+wheel cursor-anchored pinch zoom
+- [x] Pen: `pointerType === "pen"` draw/select/drag, touch orbit/pan/pinch, barrel button or
+      press-and-hold context menu
+- [x] Debug hook `window.__marmaracad.control()` returns the mode, preset and live
+      orbit/pan/zoom/pinch/pen/touch counters
+- [x] Ribbon captions no longer collide with wrapped two-line button labels: every group reserves a
+      19 px caption lane and the ribbon row is 128 px, proven with `getBoundingClientRect()` at
+      1440 and 1024 px (`tests/e2e-ribbon.mjs`)
+- [x] Playwright end-to-end control-mode suite (`tests/e2e-controlmodes.mjs`)
+
+### Sketch tools
+- [x] Slot (straight / arc), Polygon (3–12 sides, inscribed / circumscribed), Spline
+      (Catmull-Rom), Sketch Fillet / Chamfer, Circular Sketch Pattern
+- [x] All new tools respect OSnap, Dynamic Input, the solver and profile extraction
+
+### Part & assembly features
+- [x] Reference planes (offset, angled, mid) and reference axes (plane intersection, cylinder axis),
+      including sketching on a reference plane
+- [x] Sweep, Helix/Spiral (diameter, pitch, turns, hand), Loft (≥2 sections), Circular Pattern,
+      Hole Wizard (M3–M16, simple / counterbore / countersink), Draft, Rib
+- [x] Angle mate and Exploded View (axis offsets with an explode/collapse slider)
+- [x] Technical drawing: hidden lines, centerlines, center marks, hatched A-A section view and an
+      assembly BOM table — all present in both SVG and PDF output
+
+### FEA (Ansys-class)
+- [x] Conformal Tet4 / Tet10 mesher built on the OCCT surface triangulation (24 tets per voxel
+      through shared face centres, watertight across neighbours), with local mesh sizing and
+      element/node/aspect-ratio/Jacobian quality metrics; the voxel hexahedron mesher stays as the
+      fast preview/fallback
+- [x] Tet4/Tet10 stiffness assembly (4-point tetrahedral rule), Jacobi-preconditioned block CG
+- [x] WebGPU WGSL compute PCG (single dispatch, whole iteration on the GPU) with an automatic CPU
+      fallback; the GPU result is accepted only when the shader reports convergence
+- [x] Boundary conditions: Fixed, Displacement (X/Y/Z), Frictionless, Cylindrical, Moment,
+      Standard Earth Gravity (1 g = 9810 mm/s², density-driven), Bonded contact
+- [x] Results: Total/Directional deformation, von Mises, Max/Min Principal, Shear, Safety Factor,
+      Reaction Force (per-node field + Fx/Fy/Fz/total), Probe pin, Min/Max flags, deformation
+      animation (play/pause), undeformed wireframe
+- [x] Modal (first 4–6 frequencies + mode animation), Linear Buckling (load multiplier) and
+      Steady-State Thermal (°C distribution, temperature / heat flux / convection loads)
+- [x] Analytical vitest suite: cantilever δ = FL³/3EI = 2.000 mm and σ = 600 MPa (<2 %),
+      reaction force, probe, Tet4 vs Tet10 perforated plate stress concentration, modal
+      Euler–Bernoulli f₁, 1-D thermal linear profile, buckling π²EI/(4L²)
+
+### AI
+- [x] Gemini actions `reference-plane`, `circular-pattern`, `sweep`, `loft`, `hole`,
+      `exploded-view`, `modal`, `thermal`, `buckling` wired into the system prompt and the command
+      applier
+
+### Verification
+- [x] `npm test` — 23/23 unit + analytical tests
+- [x] `npm run test:e2e` — full browser suite including the new ribbon, control-mode, Tet10 and
+      multiphysics suites
+- [x] `npm run test:ui` — visual QA pass
+- [x] Live GitHub Pages verification
+
 ## Verification log
 - Phase-2 verification (local dev server, headless Chrome, all measured from the live document):
   - Ctrl+click builds a 3-edge selection that Fillet consumes (`3 EDGE(S)`), volume 19,935.62 mm³

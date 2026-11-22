@@ -48,7 +48,15 @@ export interface ArcEntity {
   construction?: boolean;
 }
 
-export type SketchEntity = LineEntity | CircleEntity | ArcEntity;
+export interface SplineEntity {
+  id: string;
+  kind: "spline";
+  /** Ordered sketch-point ids. The curve passes through every control point. */
+  points: string[];
+  construction?: boolean;
+}
+
+export type SketchEntity = LineEntity | CircleEntity | ArcEntity | SplineEntity;
 
 export type ConstraintType =
   | "horizontal"
@@ -93,6 +101,13 @@ export type FeatureType =
   | "shell"
   | "mirror"
   | "pattern"
+  | "sweep"
+  | "loft"
+  | "circularPattern"
+  | "hole"
+  | "draft"
+  | "rib"
+  | "helix"
   | "imported";
 
 export type BooleanOp = "new" | "join" | "cut";
@@ -121,9 +136,52 @@ export interface FeatureParams {
   patternAxis?: "x" | "y" | "z";
   patternCount?: number;
   patternSpacing?: number;
+  /** Sweep path / loft sections. */
+  pathSketchId?: string;
+  profileSketchIds?: string[];
+  /** Circular pattern settings. */
+  circularAxis?: "x" | "y" | "z";
+  circularCount?: number;
+  circularAngle?: number;
+  /** Hole Wizard. */
+  standard?: string;
+  holeType?: "simple" | "counterbore" | "countersink" | "tap";
+  holeDiameter?: number;
+  holeHeadDiameter?: number;
+  holeDepth?: number;
+  /** Draft / rib. */
+  faceIndex?: number;
+  ribThickness?: number;
+  /** Helix / thread path. */
+  helixDiameter?: number;
+  helixPitch?: number;
+  helixTurns?: number;
+  helixHand?: "right" | "left";
+  /** Placement for hole/rib when no face is selected. */
+  center?: Vec3;
+  normal?: Vec3;
   /** Expression evaluated at rebuild time, e.g. "L / 2". */
   depthExpression?: string;
   radiusExpression?: string;
+}
+
+export interface ReferencePlane {
+  id: string;
+  name: string;
+  origin: Vec3;
+  u: Vec3;
+  v: Vec3;
+  n: Vec3;
+  kind: "offset" | "angle" | "mid";
+  visible: boolean;
+}
+
+export interface ReferenceAxis {
+  id: string;
+  name: string;
+  origin: Vec3;
+  direction: Vec3;
+  visible: boolean;
 }
 
 export interface Feature {
@@ -164,6 +222,10 @@ export interface Part {
   };
   /** Features at or below this index rebuild; the rest are rolled back. */
   rollbackIndex?: number;
+  referencePlanes?: ReferencePlane[];
+  referenceAxes?: ReferenceAxis[];
+  /** Exploded-view slider state (0 = assembled, 1 = fully exploded). */
+  explode?: number;
 }
 
 export interface Component {
@@ -177,7 +239,7 @@ export interface Component {
   color?: string;
 }
 
-export type MateType = "coincident" | "concentric" | "distance";
+export type MateType = "coincident" | "concentric" | "distance" | "angle";
 
 export interface FaceRef {
   componentId: string;
@@ -196,6 +258,8 @@ export interface Mate {
   a: FaceRef;
   b: FaceRef;
   distance?: number;
+  /** Angle mate value in degrees. */
+  angle?: number;
   flipped?: boolean;
   error?: string;
 }
@@ -207,23 +271,48 @@ export interface AnalysisFaceSelection {
   normal: Vec3;
 }
 
+export type AnalysisLoadType = "force" | "pressure" | "moment" | "gravity" | "temperature" | "heatflux" | "convection";
+
 export interface AnalysisLoad {
   id: string;
-  type: "force" | "pressure";
+  type: AnalysisLoadType;
   faceIndex: number;
   face: AnalysisFaceSelection;
-  magnitude: number; // N for force, MPa for pressure
+  magnitude: number; // N, MPa, N·mm, °C, W/mm², W/mm²·K
   direction: Vec3;
   label: string;
+  /** Secondary value: ambient temperature (°C) for convection, moment axis etc. */
+  secondary?: number;
 }
+
+export type SupportKind = "fixed" | "frictionless" | "cylindrical" | "displacement" | "bonded";
 
 export interface AnalysisSupport {
   id: string;
   faceIndex: number;
   face: AnalysisFaceSelection;
+  kind?: SupportKind;
+  /** Displacement support: free/blocked per global axis. */
+  dofs?: { x: boolean; y: boolean; z: boolean };
+  values?: { x: number; y: number; z: number };
 }
 
 export type AnalysisStatus = "draft" | "meshed" | "solved" | "failed";
+export type AnalysisType = "static" | "modal" | "buckling" | "thermal";
+export type FeaMeshKind = "hex" | "tet4" | "tet10";
+
+export interface LocalMeshSizing {
+  id: string;
+  faceIndex: number;
+  size: number;
+}
+
+export interface FeaMeshMetrics {
+  minAspect: number;
+  avgAspect: number;
+  minJacobian: number;
+  avgJacobian: number;
+}
 
 export interface AnalysisStudy {
   id: string;
@@ -238,6 +327,14 @@ export interface AnalysisStudy {
   error?: string;
   /** Geometry or material changed after the solve; results need a re-run. */
   stale?: boolean;
+  analysisType?: AnalysisType;
+  meshKind?: FeaMeshKind;
+  localSizing?: LocalMeshSizing[];
+  modeCount?: number;
+  thermal?: { ambient: number; convection: number };
+  meshMetrics?: FeaMeshMetrics;
+  /** Last result summary persisted with the document (mode frequencies etc.). */
+  resultSummary?: Record<string, number>;
 }
 
 export interface Variable {
@@ -266,6 +363,8 @@ export interface ProjectDocument {
   updatedAt: number;
   variables?: Variable[];
   language?: Language;
+  /** Exploded view amount (0 = assembled, 1 = fully exploded). */
+  exploded?: number;
 }
 
 export interface MeshData {
@@ -325,6 +424,8 @@ export interface FeaMaterial {
   nu: number;
   yield: number; // MPa
   density: number; // kg/m3
+  /** Thermal conductivity in W/(mm·K); defaults to steel-like 0.05. */
+  conductivity?: number;
   color: string;
 }
 
@@ -343,11 +444,25 @@ export interface FeaNodeResult {
   minStress: number;
   safetyFactor: number;
   reaction: Vec3;
+  /** Nodal reaction-force magnitude (N) for probes and reaction plots. */
+  reactionForce?: Float32Array;
   solveMs: number;
   dofs: number;
   converged: boolean;
   iterations: number;
   warnings: string[];
+  /** Extended Ansys-style result fields. */
+  maxPrincipal?: Float32Array;
+  minPrincipal?: Float32Array;
+  shearStress?: Float32Array;
+  directional?: { x: Float32Array; y: Float32Array; z: Float32Array };
+  temperature?: Float32Array;
+  frequencies?: number[];
+  modeShapes?: Float32Array[];
+  bucklingMultiplier?: number;
+  bucklingMode?: Float32Array;
+  meshKind?: FeaMeshKind;
+  meshMetrics?: FeaMeshMetrics;
 }
 
 export interface ProjectFile {

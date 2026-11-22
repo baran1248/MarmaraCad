@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { Sketch, SketchConstraint, SketchPlane, Vec2, Vec3 } from "../model/types";
-import { dimensionLabel, planePoint, sampleArc, sampleCircle } from "./geometry";
+import { dimensionLabel, planePoint, sampleArc, sampleCircle, sampleSpline } from "./geometry";
 import { solveSketch } from "./solver";
 import { uid } from "../model/defaults";
 import type { Viewport } from "../viewport/Viewport";
@@ -8,7 +8,7 @@ import { DEFAULT_SNAPS, alignmentGuides, bestSnap, snapSymbol, type SnapCandidat
 import { SKETCH_COLORS, sketchStatus, type SketchStatus } from "./status";
 import { DynamicInput } from "./dynamicInput";
 
-export type SketchTool = "select" | "line" | "rectangle" | "circle" | "arc" | "dimension" | "trim" | "offset" | "convert";
+export type SketchTool = "select" | "line" | "rectangle" | "circle" | "arc" | "slot" | "polygon" | "spline" | "dimension" | "trim" | "offset" | "convert";
 
 export interface SketchEditorCallbacks {
   onChange: (sketch: Sketch, committed: boolean) => void;
@@ -44,6 +44,9 @@ export class SketchEditor {
   snapStep = 1;
   snaps: SnapSettings = { ...DEFAULT_SNAPS };
   construction = false;
+  polygonSides = 6;
+  polygonCircumscribed = false;
+  cornerSize = 4;
 
   private group = new THREE.Group();
   private previewGroup = new THREE.Group();
@@ -435,6 +438,10 @@ export class SketchEditor {
       const c = pm.get(e.center);
       return c ? sampleCircle({ x: c.x, y: c.y }, Math.max(0.01, e.radius)) : null;
     }
+    if (e.kind === "spline") {
+      const ctrl = e.points.map((id) => pm.get(id)).filter((p): p is NonNullable<typeof p> => !!p);
+      return ctrl.length >= 2 ? sampleSpline(ctrl) : null;
+    }
     const c = pm.get(e.center);
     const a = pm.get(e.start);
     const b = pm.get(e.end);
@@ -606,7 +613,7 @@ export class SketchEditor {
       }
     } else if (c.type === "radius" && c.entity) {
       const e = this.sketch.entities.find((x) => x.id === c.entity);
-      if (e && e.kind !== "line") {
+      if (e && e.kind !== "line" && e.kind !== "spline") {
         const ctr = pm.get(e.center);
         const r = e.kind === "circle" ? e.radius : Math.hypot((pm.get(e.start)?.x ?? 0) - (ctr?.x ?? 0), (pm.get(e.start)?.y ?? 0) - (ctr?.y ?? 0));
         if (ctr) {
@@ -697,6 +704,37 @@ export class SketchEditor {
           this.addLine([a, b], PREVIEW, true, 0.6, this.previewGroup);
         }
       }
+    } else if (this.tool === "slot" && this.pending.points.length >= 1) {
+      const [a, b] = this.pending.points.length === 1 ? [this.pending.points[0], p] : [this.pending.points[0], this.pending.points[1]];
+      const radius = this.pending.points.length === 1 ? Math.hypot(b.x - a.x, b.y - a.y) / 4 : Math.hypot(p.x - b.x, p.y - b.y);
+      const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const nx = -(b.y - a.y) / len;
+      const ny = (b.x - a.x) / len;
+      this.addLine(
+        [
+          { x: a.x + nx * radius, y: a.y + ny * radius },
+          { x: b.x + nx * radius, y: b.y + ny * radius },
+          { x: b.x - nx * radius, y: b.y - ny * radius },
+          { x: a.x - nx * radius, y: a.y - ny * radius },
+          { x: a.x + nx * radius, y: a.y + ny * radius },
+        ],
+        PREVIEW,
+        true,
+        0.9,
+        this.previewGroup,
+      );
+    } else if (this.tool === "polygon" && this.pending.stage === 1) {
+      const center = this.pending.points[0];
+      const radius = Math.hypot(p.x - center.x, p.y - center.y);
+      const start = Math.atan2(p.y - center.y, p.x - center.x);
+      const pts: Vec2[] = [];
+      for (let i = 0; i <= this.polygonSides; i++) {
+        const a = start + (i * Math.PI * 2) / this.polygonSides;
+        pts.push({ x: center.x + Math.cos(a) * radius, y: center.y + Math.sin(a) * radius });
+      }
+      this.addLine(pts, PREVIEW, true, 0.9, this.previewGroup);
+    } else if (this.tool === "spline" && this.pending.points.length >= 1) {
+      this.addLine(sampleSpline([...this.pending.points, p]), PREVIEW, true, 0.9, this.previewGroup);
     }
   }
 
@@ -767,6 +805,21 @@ export class SketchEditor {
       if (l2 < 1e-12) return Math.hypot(p.x - a.x, p.y - a.y);
       const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
       return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+    }
+    if (e.kind === "spline") {
+      const pts = this.entitySample(e.id);
+      if (!pts) return Infinity;
+      let best = Infinity;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i];
+        const b = pts[i + 1];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const l2 = dx * dx + dy * dy;
+        const t = l2 > 1e-12 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2)) : 0;
+        best = Math.min(best, Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy)));
+      }
+      return best;
     }
     const c = pm.get(e.center);
     if (!c) return Infinity;
@@ -970,6 +1023,60 @@ export class SketchEditor {
       return;
     }
 
+    if (this.tool === "spline") {
+      const existing = this.pending.points;
+      if (existing.length >= 2 && Math.hypot(p.x - existing[0].x, p.y - existing[0].y) < this.viewport.worldPerPixel() * 6) {
+        this.finishSpline();
+        this.pending = { stage: 0, points: [] };
+        this.commit(false);
+      } else if (e.detail >= 2 && existing.length >= 2) {
+        this.finishSpline();
+        this.pending = { stage: 0, points: [] };
+        this.commit(false);
+      } else {
+        existing.push(p);
+        this.pending = { stage: 1, points: existing };
+        this.callbacks.notify("Spline: click control points, click the first point or double-click to finish.");
+      }
+      this.render();
+      return;
+    }
+
+    if (this.tool === "slot") {
+      if (this.pending.stage < 2) {
+        this.pending = { stage: this.pending.stage + 1, points: [...this.pending.points, p] };
+      } else {
+        const [a, b] = this.pending.points;
+        const len = Math.hypot(b.x - a.x, b.y - a.y);
+        const radius = Math.max(0.1, Math.hypot(p.x - b.x, p.y - b.y));
+        if (len < 0.2) {
+          this.callbacks.notify("Slot centreline is too short.", "warn");
+          return;
+        }
+        this.createSlot(a, b, radius);
+        this.pending = { stage: 0, points: [] };
+        this.commit(false);
+      }
+      this.updateDynamicInput(e);
+      this.render();
+      return;
+    }
+
+    if (this.tool === "polygon") {
+      if (this.pending.stage === 0) {
+        this.pending = { stage: 1, points: [p] };
+        this.pendingPointId = snap.pointId ?? null;
+      } else {
+        this.createPolygon(this.pending.points[0], p, this.polygonSides, this.polygonCircumscribed);
+        this.pending = { stage: 0, points: [] };
+        this.pendingPointId = null;
+        this.commit(false);
+      }
+      this.updateDynamicInput(e);
+      this.render();
+      return;
+    }
+
     if (this.tool === "trim") {
       const entityId = this.hitEntity(raw);
       if (!entityId) return;
@@ -991,6 +1098,180 @@ export class SketchEditor {
       return;
     }
   };
+
+  /** Straight/rounded slot from two centreline points and a radius. */
+  createSlot(a: Vec2, b: Vec2, radius: number): void {
+    if (!this.sketch) return;
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len < 1e-4) return;
+    const r = Math.max(0.05, Math.min(radius, len * 2));
+    const nx = -(b.y - a.y) / len;
+    const ny = (b.x - a.x) / len;
+    const pA1 = this.ensurePoint({ x: a.x + nx * r, y: a.y + ny * r });
+    const pB1 = this.ensurePoint({ x: b.x + nx * r, y: b.y + ny * r });
+    const pB2 = this.ensurePoint({ x: b.x - nx * r, y: b.y - ny * r });
+    const pA2 = this.ensurePoint({ x: a.x - nx * r, y: a.y - ny * r });
+    const cA = this.ensurePoint(a);
+    const cB = this.ensurePoint(b);
+    const line1 = uid("ln");
+    const line2 = uid("ln");
+    this.sketch.entities.push(
+      { id: line1, kind: "line", p1: pA1, p2: pB1, construction: this.construction || undefined },
+      { id: uid("ar"), kind: "arc", center: cB, start: pB1, end: pB2, radius: r, ccw: true, construction: this.construction || undefined },
+      { id: line2, kind: "line", p1: pB2, p2: pA2, construction: this.construction || undefined },
+      { id: uid("ar"), kind: "arc", center: cA, start: pA2, end: pA1, radius: r, ccw: true, construction: this.construction || undefined },
+    );
+    this.sketch.constraints.push(
+      { id: uid("c"), type: "equal", a: line1, b: line2 },
+      { id: uid("c"), type: "distance", a: pA1, b: pB1, value: len },
+    );
+  }
+
+  /** Regular polygon: `sides` 3..12, centre + circumscribed circle radius. */
+  createPolygon(center: Vec2, vertex: Vec2, sides = 6, circumscribed = false): void {
+    if (!this.sketch) return;
+    const n = Math.max(3, Math.min(12, Math.round(sides)));
+    const reference = Math.hypot(vertex.x - center.x, vertex.y - center.y);
+    if (reference < 0.1) return;
+    const radius = circumscribed ? reference / Math.cos(Math.PI / n) : reference;
+    const start = Math.atan2(vertex.y - center.y, vertex.x - center.x);
+    const ids: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = start + (i * Math.PI * 2) / n;
+      ids.push(this.ensurePoint({ x: center.x + Math.cos(a) * radius, y: center.y + Math.sin(a) * radius }));
+    }
+    const lines: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const id = uid("ln");
+      lines.push(id);
+      this.sketch.entities.push({ id, kind: "line", p1: ids[i], p2: ids[(i + 1) % n], construction: this.construction || undefined });
+    }
+    this.sketch.constraints.push({ id: uid("c"), type: "equal", a: lines[0], b: lines[1] });
+    this.ensurePoint(center);
+  }
+
+  private finishSpline(): void {
+    if (!this.sketch || this.pending.points.length < 2) return;
+    const ids = this.pending.points.map((p) => this.ensurePoint(p));
+    this.sketch.entities.push({ id: uid("sp"), kind: "spline", points: ids, construction: this.construction || undefined });
+  }
+
+  /** Sketch fillet/chamfer between two selected (or adjacent) lines. */
+  applySketchCorner(kind: "fillet" | "chamfer", size = this.cornerSize): boolean {
+    if (!this.sketch) return false;
+    const all = this.sketch.entities.filter((e): e is Extract<typeof e, { kind: "line" }> => e.kind === "line");
+    let pair: [typeof all[number], typeof all[number]] | null = null;
+    const selected = all.filter((e) => this.selectedEntities.has(e.id));
+    if (selected.length >= 2) pair = [selected[0], selected[1]];
+    else {
+      for (let i = 0; i < all.length && !pair; i++) {
+        for (let j = i + 1; j < all.length; j++) {
+          if (all[i].p1 === all[j].p1 || all[i].p1 === all[j].p2 || all[i].p2 === all[j].p1 || all[i].p2 === all[j].p2) {
+            pair = [all[i], all[j]];
+            break;
+          }
+        }
+      }
+    }
+    if (!pair) {
+      this.callbacks.notify("Select two adjacent lines for a sketch fillet/chamfer.", "warn");
+      return false;
+    }
+    const [e1, e2] = pair;
+    const sharedId = [e1.p1, e1.p2].find((id) => id === e2.p1 || id === e2.p2);
+    if (!sharedId) {
+      this.callbacks.notify("The two lines must share an endpoint.", "warn");
+      return false;
+    }
+    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    const shared = pm.get(sharedId);
+    const far1 = pm.get(e1.p1 === sharedId ? e1.p2 : e1.p1);
+    const far2 = pm.get(e2.p1 === sharedId ? e2.p2 : e2.p1);
+    if (!shared || !far1 || !far2) return false;
+    const v1 = { x: far1.x - shared.x, y: far1.y - shared.y };
+    const v2 = { x: far2.x - shared.x, y: far2.y - shared.y };
+    const l1 = Math.hypot(v1.x, v1.y) || 1;
+    const l2 = Math.hypot(v2.x, v2.y) || 1;
+    const cos = Math.max(-1, Math.min(1, (v1.x * v2.x + v1.y * v2.y) / (l1 * l2)));
+    const theta = Math.acos(cos);
+    if (theta < 1e-3 || theta > Math.PI - 1e-3) {
+      this.callbacks.notify("Choose two lines that form a corner.", "warn");
+      return false;
+    }
+    const r = Math.max(0.01, Math.min(size, Math.min(l1, l2) * 0.9));
+    const tangent = kind === "chamfer" ? r : r / Math.tan(theta / 2);
+    const p1 = { x: shared.x + (v1.x / l1) * tangent, y: shared.y + (v1.y / l1) * tangent };
+    const p2 = { x: shared.x + (v2.x / l2) * tangent, y: shared.y + (v2.y / l2) * tangent };
+    const id1 = this.ensurePoint(p1);
+    const id2 = this.ensurePoint(p2);
+    const e1Start = e1.p1 === sharedId;
+    const e2Start = e2.p1 === sharedId;
+    if (e1Start) e1.p1 = id1; else e1.p2 = id1;
+    if (e2Start) e2.p1 = id2; else e2.p2 = id2;
+    if (kind === "chamfer") {
+      this.sketch.entities.push({ id: uid("ln"), kind: "line", p1: id1, p2: id2, construction: this.construction || undefined });
+    } else {
+      const bis = { x: v1.x / l1 + v2.x / l2, y: v1.y / l1 + v2.y / l2 };
+      const bl = Math.hypot(bis.x, bis.y) || 1;
+      const distance = r / Math.sin(theta / 2);
+      const center = { x: shared.x + (bis.x / bl) * distance, y: shared.y + (bis.y / bl) * distance };
+      const startAngle = Math.atan2(p1.y - center.y, p1.x - center.x);
+      const endAngle = Math.atan2(p2.y - center.y, p2.x - center.x);
+      let ccw = endAngle > startAngle;
+      if (Math.abs(endAngle - startAngle) > Math.PI) ccw = !ccw;
+      this.sketch.entities.push({
+        id: uid("ar"),
+        kind: "arc",
+        center: this.ensurePoint(center),
+        start: id1,
+        end: id2,
+        radius: r,
+        ccw,
+        construction: this.construction || undefined,
+      });
+    }
+    this.commit(false);
+    this.render();
+    return true;
+  }
+
+  /** Circular pattern of selected entities (or the whole sketch) around a centre. */
+  circularSketchPattern(count: number, totalAngle = 360, center: Vec2 = { x: 0, y: 0 }): boolean {
+    if (!this.sketch) return false;
+    const n = Math.max(2, Math.round(count));
+    const targets = this.sketch.entities.filter((e) => this.selectedEntities.size === 0 || this.selectedEntities.has(e.id));
+    if (!targets.length) return false;
+    const pm = new Map(this.sketch.points.map((p) => [p.id, p]));
+    const angleStep = (totalAngle * Math.PI) / 180 / (totalAngle >= 359.999 ? n : Math.max(1, n - 1));
+    const pointMap = new Map<string, string>();
+    for (let copy = 1; copy < n; copy++) {
+      // Rotate progressively: recreate the accumulated angle.
+      const angle = angleStep * copy;
+      pointMap.clear();
+      const map = (id: string): string => {
+        const cached = pointMap.get(id);
+        if (cached) return cached;
+        const p = pm.get(id);
+        if (!p) return id;
+        const dx = p.x - center.x;
+        const dy = p.y - center.y;
+        const c = Math.cos(angle);
+        const s = Math.sin(angle);
+        const next = this.ensurePoint({ x: center.x + dx * c - dy * s, y: center.y + dx * s + dy * c });
+        pointMap.set(id, next);
+        return next;
+      };
+      for (const e of targets) {
+        if (e.kind === "line") this.sketch.entities.push({ id: uid("ln"), kind: "line", p1: map(e.p1), p2: map(e.p2), construction: e.construction });
+        else if (e.kind === "circle") this.sketch.entities.push({ id: uid("ci"), kind: "circle", center: map(e.center), radius: e.radius, construction: e.construction });
+        else if (e.kind === "arc") this.sketch.entities.push({ id: uid("ar"), kind: "arc", center: map(e.center), start: map(e.start), end: map(e.end), radius: e.radius, ccw: e.ccw, construction: e.construction });
+        else if (e.kind === "spline") this.sketch.entities.push({ id: uid("sp"), kind: "spline", points: e.points.map(map), construction: e.construction });
+      }
+    }
+    this.commit(false);
+    this.render();
+    return true;
+  }
 
   /** Add a chain of line entities from projected 3D points. */
   addProjectedPolyline(points: Vec2[]): void {
@@ -1033,6 +1314,12 @@ export class SketchEditor {
         if (!oa || !ob) continue;
         const hit = lineHit(a, b, oa, ob);
         if (hit) hits.push(hit);
+      } else if (other.kind === "spline") {
+        const pts = this.entitySample(other.id) ?? [];
+        for (let i = 0; i < pts.length - 1; i++) {
+          const hit = lineHit(a, b, pts[i], pts[i + 1]);
+          if (hit) hits.push(hit);
+        }
       } else {
         const c = pm.get(other.center);
         if (!c) continue;
@@ -1091,6 +1378,23 @@ export class SketchEditor {
         const p1 = this.ensurePoint({ x: a.x + nx * distance, y: a.y + ny * distance });
         const p2 = this.ensurePoint({ x: b.x + nx * distance, y: b.y + ny * distance });
         this.sketch.entities.push({ id: uid("ln"), kind: "line", p1, p2, construction: this.construction || undefined });
+      } else if (e.kind === "spline") {
+        const ctrl = e.points.map((id) => pm.get(id)).filter((p): p is NonNullable<typeof p> => !!p);
+        if (ctrl.length < 2) continue;
+        const offsetPts = ctrl.map((p, i) => {
+          const prev = ctrl[Math.max(0, i - 1)];
+          const next = ctrl[Math.min(ctrl.length - 1, i + 1)];
+          const dx = next.x - prev.x;
+          const dy = next.y - prev.y;
+          const len = Math.hypot(dx, dy) || 1;
+          return { x: p.x - (dy / len) * distance, y: p.y + (dx / len) * distance };
+        });
+        this.sketch.entities.push({
+          id: uid("sp"),
+          kind: "spline",
+          points: offsetPts.map((p) => this.ensurePoint(p)),
+          construction: this.construction || undefined,
+        });
       } else {
         const c = pm.get(e.center);
         if (!c) continue;
@@ -1290,7 +1594,13 @@ export class SketchEditor {
             ? [{ key: "diameter", label: "Ø", unit: "mm", value: Math.hypot(dx, dy) * 2, digits: 2 }]
             : this.tool === "arc" && this.pending.points.length === 2
               ? [{ key: "radius", label: "R", unit: "mm", value: Math.hypot(dx, dy), digits: 2 }]
-              : [];
+              : this.tool === "slot" && this.pending.points.length === 2
+                ? [{ key: "radius", label: "R", unit: "mm", value: Math.hypot(dx, dy), digits: 2 }]
+                : this.tool === "slot"
+                  ? [{ key: "length", label: "L", unit: "mm", value: Math.hypot(dx, dy), digits: 2 }]
+                  : this.tool === "polygon"
+                    ? [{ key: "diameter", label: "Ø", unit: "mm", value: Math.hypot(dx, dy) * 2, digits: 2 }]
+                    : [];
     if (fields.length === 0) {
       this.dynamic.hide();
       this.renderSnapMarker();
@@ -1444,6 +1754,8 @@ export class SketchEditor {
         for (let i = 0; i <= 8; i++) {
           samples.push({ x: a.x + ((b.x - a.x) * i) / 8, y: a.y + ((b.y - a.y) * i) / 8 });
         }
+      } else if (entity.kind === "spline") {
+        samples.push(...(this.entitySample(entity.id) ?? []));
       } else {
         const c = pm.get(entity.center);
         if (!c) continue;
@@ -1506,9 +1818,12 @@ export class SketchEditor {
     const p3 = { x: b.x, y: b.y };
     const p4 = { x: a.x, y: b.y };
     const ids = [
+      // `aid` is the first clicked corner (p1) and `bid` the second (p3). Mapping
+      // bid onto p2 would put the clicked endpoint on the derived corner and
+      // turn the rectangle into a diagonal whenever the click snaps.
       this.ensurePoint(p1, aid),
-      this.ensurePoint(p2, bid),
-      this.ensurePoint(p3),
+      this.ensurePoint(p2),
+      this.ensurePoint(p3, bid),
       this.ensurePoint(p4),
     ];
     const l1 = uid("ln");
@@ -1558,6 +1873,9 @@ export class SketchEditor {
       this.commit(false);
       this.render();
       this.callbacks.onRequestDimensionEdit(id);
+    } else if (e.kind === "spline") {
+      this.callbacks.notify("Spline radius dimensions are not supported; dimension its endpoints instead.", "info");
+      return;
     } else {
       const existing = this.sketch.constraints.find((c) => c.type === "radius" && c.entity === entityId);
       if (existing) {
@@ -1660,6 +1978,8 @@ export class SketchEditor {
           if (e?.kind === "line") {
             points.add(e.p1);
             points.add(e.p2);
+          } else if (e?.kind === "spline") {
+            for (const id of e.points) points.add(id);
           } else if (e) points.add(e.center);
         }
       }
@@ -1719,6 +2039,7 @@ export class SketchEditor {
       if (entities.has(e.id)) return false;
       if (e.kind === "line") return !(points.has(e.p1) || points.has(e.p2));
       if (e.kind === "circle") return !points.has(e.center);
+      if (e.kind === "spline") return !e.points.some((id) => points.has(id));
       return !(points.has(e.center) || points.has(e.start) || points.has(e.end));
     });
     const usedPoints = new Set<string>();
@@ -1727,6 +2048,7 @@ export class SketchEditor {
         usedPoints.add(e.p1);
         usedPoints.add(e.p2);
       } else if (e.kind === "circle") usedPoints.add(e.center);
+      else if (e.kind === "spline") for (const id of e.points) usedPoints.add(id);
       else {
         usedPoints.add(e.center);
         usedPoints.add(e.start);

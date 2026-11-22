@@ -3,15 +3,21 @@ import * as THREE from "three";
 import type {
   AnalysisLoad,
   AnalysisStudy,
+  AnalysisType,
   Component,
   Feature,
+  FeaMeshKind,
   FeaNodeResult,
   Mate,
   MeshData,
   Part,
   ProjectDocument,
+  ReferenceAxis,
+  ReferencePlane,
   Sketch,
   SketchPlane,
+  SupportKind,
+  Vec2,
   Vec3,
   WorkspaceMode,
 } from "./model/types";
@@ -178,6 +184,10 @@ export class App {
   private sketchStartDoc: ProjectDocument | null = null;
   private activeResult: ResultMode | null = null;
   private resultScale = 1;
+  private resultProbeActive = false;
+  private probeText = "";
+  private animationTimer = 0;
+  private animationStart = 0;
   private toolbarMode: ResultMode | null = null;
   private feaResults = new Map<string, FeaNodeResult>();
   private rebuildToken = 0;
@@ -190,6 +200,25 @@ export class App {
     this.shell = new Shell(root);
     this.viewport = new Viewport(this.shell.viewHost, graphics.renderer, graphics.backend);
     this.resultView = new ResultView(this.viewport);
+    this.viewport.renderer.domElement.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (!this.resultProbeActive || !this.activeResult) return;
+        const reading = this.resultView.probeFromScreen(event.clientX, event.clientY);
+        if (!reading) return;
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        this.probeText = `${reading.fieldLabel} ${fmt(reading.field, 3)} ${reading.unit} · U ${reading.displacementMagnitude.toExponential(2)} mm`;
+        const host = this.shell.resultToolbarEl.querySelector<HTMLElement>("#rt-probe-value");
+        if (host) host.textContent = this.probeText;
+        toast(
+          `Probe · node ${reading.node + 1} · ${reading.fieldLabel} ${fmt(reading.field, 3)} ${reading.unit} · U ${reading.displacementMagnitude.toExponential(3)} mm · von Mises ${fmt(reading.vonMises, 2)} MPa`,
+          "info",
+          7000,
+        );
+      },
+      true,
+    );
 
     this.editor = new SketchEditor(this.viewport, {
       onChange: (sketch) => this.onSketchChanged(sketch),
@@ -208,12 +237,30 @@ export class App {
       onStatus: (status) => this.shell.setSketchStatus(status.state === "empty" ? null : `${status.label} · ${status.dof} DOF`, status.state),
       onConvertPick: (clientX, clientY) => {
         const plane = this.editor.sketch?.plane;
-        const pick = this.viewport.raycastEdgeAt(clientX, clientY);
-        if (!plane || !pick) return null;
-        return pick.edge.points.map((p) => {
-          const d: Vec3 = [p[0] - plane.origin[0], p[1] - plane.origin[1], p[2] - plane.origin[2]];
-          return { x: d[0] * plane.u[0] + d[1] * plane.u[1] + d[2] * plane.u[2], y: d[0] * plane.v[0] + d[1] * plane.v[1] + d[2] * plane.v[2] };
-        });
+        if (!plane) return null;
+        const project = (points: Vec3[]): Vec2[] =>
+          points.map((p) => {
+            const d: Vec3 = [p[0] - plane.origin[0], p[1] - plane.origin[1], p[2] - plane.origin[2]];
+            return { x: d[0] * plane.u[0] + d[1] * plane.u[1] + d[2] * plane.u[2], y: d[0] * plane.v[0] + d[1] * plane.v[1] + d[2] * plane.v[2] };
+          });
+        const extent = (points: Vec2[]): number => {
+          if (points.length < 2) return 0;
+          let span = 0;
+          for (let i = 1; i < points.length; i++) {
+            span = Math.max(span, Math.hypot(points[i].x - points[0].x, points[i].y - points[0].y));
+          }
+          return span;
+        };
+        // Clicking near a corner can raycast an edge that runs straight through
+        // the sketch plane; its projection is a single point and would create a
+        // zero-length line. Take the nearest edge that actually projects.
+        let fallback: Vec2[] | null = null;
+        for (const pick of this.viewport.raycastEdgesAt(clientX, clientY)) {
+          const projected = project(pick.edge.points);
+          if (!fallback) fallback = projected;
+          if (extent(projected) > 0.05) return projected;
+        }
+        return fallback;
       },
     });
 
@@ -223,6 +270,8 @@ export class App {
     });
 
     this.bindShell();
+    this.viewport.setControlMode(this.shell.inputMode);
+    this.viewport.setMousePreset(this.shell.inputPreset);
     this.bindViewport();
     this.bindKeys();
 
@@ -300,6 +349,7 @@ export class App {
         assistant: this.assistant,
         selections: () => ({ faces: this.selFaces, edges: this.selEdges, vertices: this.selVertices }),
         renderer: () => this.graphics.backend,
+        control: () => ({ ...this.viewport.getControlState(), ...this.viewport.debugControl }),
         kernel: () => ({
           bootMs: this.bootMs,
           fromCache: cadClient().kernelFromCache,
@@ -357,6 +407,16 @@ export class App {
       this.navScheme = scheme;
       this.viewport.setNavScheme(scheme);
       toast(scheme === "cad" ? "SolidWorks / Fusion mouse scheme active." : "Legacy mouse scheme active (left-drag orbits).", "info");
+    };
+    this.shell.onControlMode = (mode) => {
+      this.viewport.setControlMode(mode);
+      const label = mode === "mouse" ? "Mouse preset" : mode === "trackpad" ? "Trackpad: two-finger orbit, Shift pan, pinch zoom" : "Pen: draw/select, touch orbits, side button/long press menu";
+      this.shell.setStatus(label);
+    };
+    this.shell.onMousePreset = (preset) => {
+      this.viewport.setMousePreset(preset);
+      const label = preset === "solidworks" ? "SolidWorks" : preset === "fusion" ? "Fusion 360" : "Ansys";
+      this.shell.setStatus(`Mouse preset · ${label} · MMB orbit, Ctrl+MMB pan, wheel zoom, RMB menu`);
     };
     this.viewport.onCameraChange = () => this.shell.setViewCubeSynced(this.viewport.camera);
   }
@@ -859,6 +919,39 @@ export class App {
         let bodyMesh = mesh;
         let position = component.position;
         let rotation = component.rotation;
+        const explodeAmount = this.doc.exploded ?? 0;
+        if (explodeAmount > 0 && !sectionActive) {
+          const index = this.doc.components.indexOf(component);
+          const n = Math.max(1, this.doc.components.length);
+          const cx = this.doc.components.reduce((sum, c) => sum + c.position[0], 0) / n;
+          const cy = this.doc.components.reduce((sum, c) => sum + c.position[1], 0) / n;
+          const cz = this.doc.components.reduce((sum, c) => sum + c.position[2], 0) / n;
+          let dx = component.position[0] - cx;
+          let dy = component.position[1] - cy;
+          let dz = component.position[2] - cz;
+          const len = Math.hypot(dx, dy, dz);
+          if (len < 1) {
+            const angle = (index / n) * Math.PI * 2;
+            dx = Math.cos(angle);
+            dy = 0.4;
+            dz = Math.sin(angle);
+          } else {
+            dx /= len;
+            dy /= len;
+            dz /= len;
+          }
+          const diagonal = Math.hypot(
+            mesh.bbox.max[0] - mesh.bbox.min[0],
+            mesh.bbox.max[1] - mesh.bbox.min[1],
+            mesh.bbox.max[2] - mesh.bbox.min[2],
+          );
+          const spread = Math.max(60, diagonal) * explodeAmount;
+          position = [
+            component.position[0] + dx * spread,
+            component.position[1] + dy * spread + explodeAmount * 18 * (index - (n - 1) / 2),
+            component.position[2] + dz * spread,
+          ];
+        }
         if (sectionActive) {
           // Cut in world space, then place the already-transformed body at the origin.
           bodyMesh = cutMesh(transformMeshData(mesh, componentMatrix(component.position, component.rotation)));
@@ -891,6 +984,7 @@ export class App {
     }
     this.viewport.setBodies(bodies);
     this.viewport.setSectionState(this.sectionState);
+    this.viewport.setReferenceGeometry(activePart?.referencePlanes ?? [], activePart?.referenceAxes ?? []);
     this.viewport.setActiveComponent(this.doc.mode === "assembly" ? this.doc.activeComponentId : null);
     if (this.doc.mode === "analysis") this.syncResultView();
     else {
@@ -1100,6 +1194,16 @@ export class App {
   private async treeOpen(kind: string, id: string): Promise<void> {
     if (kind === "plane") {
       this.startSketch(basePlane(id as "front" | "top" | "right"));
+      return;
+    }
+    if (kind === "refplane") {
+      const part = this.activePart();
+      const ref = part?.referencePlanes?.find((r) => r.id === id);
+      if (ref) this.startSketch(this.referencePlaneSketchPlane(ref));
+      return;
+    }
+    if (kind === "refaxis") {
+      toast("Reference axes are construction geometry. Use them for circular patterns, revolves and hole placement.", "info");
       return;
     }
     if (kind === "sketch") {
@@ -1866,16 +1970,58 @@ export class App {
       return;
     }
     const materialName = part.materialId ? partMaterial(part).name : "Material <not specified>";
-    const svg = buildDrawingSvg(mesh, {
+    const bom = this.doc.components.length
+      ? [...new Set(this.doc.components.map((component) => component.partId))].map((partId, index) => {
+          const componentPart = this.doc.parts.find((p) => p.id === partId);
+          return {
+            item: index + 1,
+            name: componentPart?.name ?? "Component",
+            qty: this.doc.components.filter((component) => component.partId === partId).length,
+            material: componentPart?.materialId ? partMaterial(componentPart).name : "—",
+          };
+        })
+      : [{ item: 1, name: part.name, qty: 1, material: materialName }];
+    const state = {
+      hiddenLines: false,
+      centerlines: true,
+      centerMarks: true,
+      section: false,
+      bom: this.doc.components.length > 0,
+    };
+    const info = {
       partName: part.name,
       material: materialName,
       scale: "1:1",
       units: "mm",
       document: this.doc.name,
-    });
+    };
+    const build = () =>
+      buildDrawingSvg(mesh, info, {
+        hiddenLines: state.hiddenLines,
+        centerlines: state.centerlines,
+        centerMarks: state.centerMarks,
+        section: state.section,
+        bom: state.bom ? bom : undefined,
+      });
     const body = document.createElement("div");
-    body.innerHTML = `<div class="drawing-preview">${svg}</div>
-      <div class="hint" style="margin-top:8px">A4 landscape · 3 orthographic views + isometric · overall width/height dimensions · title block (part, material, scale, units).</div>`;
+    body.innerHTML = `
+      <div class="drawing-options">
+        <label><input type="checkbox" data-drawing-option="hiddenLines" /> Hidden lines</label>
+        <label><input type="checkbox" data-drawing-option="centerlines" checked /> Centerlines</label>
+        <label><input type="checkbox" data-drawing-option="centerMarks" checked /> Center marks</label>
+        <label><input type="checkbox" data-drawing-option="section" /> Section A-A</label>
+        <label><input type="checkbox" data-drawing-option="bom" ${this.doc.components.length ? "checked" : ""} /> BOM</label>
+      </div>
+      <div class="drawing-preview" id="drawing-preview">${build()}</div>
+      <div class="hint" style="margin-top:8px">A4 landscape · 3 orthographic views + isometric/section · dimensions · hidden lines, centerlines, center marks and assembly BOM are included in both SVG and PDF output.</div>`;
+    const preview = body.querySelector<HTMLElement>("#drawing-preview");
+    body.querySelectorAll<HTMLInputElement>("[data-drawing-option]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const key = input.dataset.drawingOption as keyof typeof state;
+        if (key in state) state[key] = input.checked;
+        if (preview) preview.innerHTML = build();
+      });
+    });
     const result = await openModal({
       title: "Technical Drawing",
       icon: "file-down",
@@ -1888,11 +2034,11 @@ export class App {
       ],
     });
     if (result === "svg") {
-      downloadText(svg, `${safeFilename(part.name)}.svg`, "image/svg+xml");
+      downloadText(build(), `${safeFilename(part.name)}.svg`, "image/svg+xml");
       toast("Drawing exported as SVG.", "success");
     } else if (result === "pdf") {
       try {
-        await downloadDrawingPdf(svg, `${part.name}-drawing.pdf`);
+        await downloadDrawingPdf(build(), `${part.name}-drawing.pdf`);
         toast("Drawing exported as PDF.", "success");
       } catch (error) {
         toast(`PDF export failed: ${messageOf(error)}`, "error");
@@ -2265,6 +2411,120 @@ export class App {
         active.rollbackIndex = undefined;
         return true;
       }
+      case "circular-pattern": {
+        if (!active) return false;
+        if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
+        if (!this.meshForPart(active.id)) return false;
+        const axis = text("axis", "z");
+        active.features.push({
+          id: uid("feat"),
+          type: "circularPattern",
+          name: nextFeatureName("circularPattern", active.features),
+          params: {
+            circularAxis: axis === "x" || axis === "y" ? axis : "z",
+            circularCount: Math.max(2, Math.round(num("count", 6))),
+            circularAngle: clamp(num("angle", 360), 1, 360),
+          },
+        });
+        return true;
+      }
+      case "sweep": {
+        if (!active) return false;
+        const sketches = active.sketches;
+        const profile = sketches.find((s) => s.name === text("sketch") || s.id === text("sketch")) ?? sketches[0];
+        const pathSketch = sketches.find((s) => s.name === text("pathSketch") || s.id === text("pathSketch")) ?? sketches.find((s) => s.id !== profile?.id);
+        if (!profile || !pathSketch) return false;
+        active.features.push({
+          id: uid("feat"),
+          type: "sweep",
+          name: nextFeatureName("sweep", active.features),
+          sketchId: profile.id,
+          params: { pathSketchId: pathSketch.id, operation: "join" },
+        });
+        return true;
+      }
+      case "loft": {
+        if (!active) return false;
+        const requested = Array.isArray(params.sketches) ? (params.sketches as string[]) : [];
+        const sections = requested.length >= 2
+          ? requested.map((name) => active.sketches.find((s) => s.name === name || s.id === name)).filter((s): s is Sketch => !!s)
+          : active.sketches.slice(0, Math.max(2, Math.min(active.sketches.length, 2)));
+        if (sections.length < 2) return false;
+        active.features.push({
+          id: uid("feat"),
+          type: "loft",
+          name: nextFeatureName("loft", active.features),
+          sketchId: sections[0].id,
+          params: { profileSketchIds: sections.map((s) => s.id), operation: "join" },
+        });
+        return true;
+      }
+      case "hole": {
+        if (!active) return false;
+        if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
+        const mesh = this.meshForPart(active.id);
+        if (!mesh) return false;
+        const requestedFace = num("faceIndex", -1);
+        const face = mesh.faces.find((f) => f.index === requestedFace) ?? mesh.faces.find((f) => f.surface === "plane") ?? mesh.faces[0];
+        if (!face) return false;
+        const diameter = Math.max(0.5, num("diameter", 6));
+        active.features.push({
+          id: uid("feat"),
+          type: "hole",
+          name: nextFeatureName("hole", active.features),
+          params: {
+            holeDiameter: diameter,
+            holeHeadDiameter: Math.max(diameter * 1.5, num("headDiameter", diameter * 2)),
+            holeDepth: Math.max(diameter, num("depth", 100)),
+            holeType: text("type", "simple") === "counterbore" ? "counterbore" : text("type", "simple") === "countersink" ? "countersink" : "simple",
+            throughAll: params.through !== false,
+            center: [...face.point],
+            normal: [...face.normal],
+            faceIndex: face.index,
+          },
+        });
+        return true;
+      }
+      case "exploded-view": {
+        this.doc.exploded = clamp(num("amount", 0.65), 0, 1);
+        this.refreshScene();
+        return true;
+      }
+      case "reference-plane": {
+        if (!active) return false;
+        active.referencePlanes ??= [];
+        const baseId = text("base", "front") as "front" | "top" | "right";
+        const base = basePlane(["front", "top", "right"].includes(baseId) ? baseId : "front");
+        const mode = text("mode", "offset");
+        const value = num("value", 25);
+        const origin: Vec3 = [...base.origin];
+        let n: Vec3 = [...base.n];
+        let v: Vec3 = [...base.v];
+        let name: string;
+        if (mode === "angle") {
+          const angle = (value * Math.PI) / 180;
+          const axis = new THREE.Vector3(...base.u).normalize();
+          const nv = new THREE.Vector3(...n).applyAxisAngle(axis, angle);
+          const vv = new THREE.Vector3(...v).applyAxisAngle(axis, angle);
+          n = [nv.x, nv.y, nv.z];
+          v = [vv.x, vv.y, vv.z];
+          name = `Angled Plane ${active.referencePlanes.length + 1}`;
+        } else {
+          const distance = mode === "mid" ? value * 0.5 : value;
+          origin[0] += n[0] * distance;
+          origin[1] += n[1] * distance;
+          origin[2] += n[2] * distance;
+          name = `${mode === "mid" ? "Mid" : "Offset"} Plane ${active.referencePlanes.length + 1}`;
+        }
+        active.referencePlanes.push({ id: uid("rplane"), name, origin, u: [...base.u], v, n, kind: mode === "angle" ? "angle" : mode === "mid" ? "mid" : "offset", visible: true });
+        this.viewport.setReferenceGeometry(active.referencePlanes, active.referenceAxes ?? []);
+        return true;
+      }
+      case "modal":
+      case "thermal":
+      case "buckling":
+        await this.setupFeaFromAi({ ...params, analysis: command.action });
+        return true;
       case "mate":
         return this.createMateFromAi(params);
       case "material": {
@@ -2369,25 +2629,79 @@ export class App {
       this.shell.setCommandTab("analysis");
     }
     let study = this.doc.analyses.find((s) => s.partId === part.id);
+    const analysis = typeof params.analysis === "string" ? params.analysis : "static";
     if (!study) {
       study = {
         id: uid("study"),
-        name: `Static ${this.doc.analyses.length + 1}`,
+        name:
+          analysis === "modal"
+            ? `Modal ${this.doc.analyses.length + 1}`
+            : analysis === "thermal"
+              ? `Thermal ${this.doc.analyses.length + 1}`
+              : analysis === "buckling"
+                ? `Buckling ${this.doc.analyses.length + 1}`
+                : `Static ${this.doc.analyses.length + 1}`,
         partId: part.id,
         materialId: part.materialId ?? "aisi1020",
         meshSize: Number(params.meshSize) || Math.max(0.5, Math.round((part ? this.meshForPart(part.id)?.bbox.max[0] ?? 80 : 80) / 20)),
         supports: [],
         loads: [],
         status: "draft",
+        analysisType: analysis as AnalysisType,
+        meshKind: "tet10",
       };
       this.doc.analyses.push(study);
       this.doc.activeStudyId = study.id;
+    } else {
+      study.analysisType = analysis as AnalysisType;
+      study.meshKind = study.meshKind ?? "tet10";
     }
     if (typeof params.material === "string" && MATERIALS.some((m) => m.id === params.material)) study.materialId = params.material;
     if (typeof params.meshSize === "number" && params.meshSize > 0) {
       study.meshSize = clamp(params.meshSize, 0.2, 50);
     }
-    if ("force" in params || "pressure" in params) {
+    if (analysis === "modal") {
+      if (typeof params.modes === "number") study.modeCount = clamp(Math.round(params.modes), 1, 6);
+      if (!this.meshForPart(part.id) && part.features.length) await this.rebuild();
+      this.bindStudyLoadsFromAi(study, {}, part);
+    } else if (analysis === "buckling") {
+      if (!this.meshForPart(part.id) && part.features.length) await this.rebuild();
+      this.bindStudyLoadsFromAi(study, { force: Number(params.force) || 1000, direction: [-1, 0, 0] }, part);
+    } else if (analysis === "thermal") {
+      study.thermal = { ambient: Number(params.ambient) || 22, convection: 10 };
+      if (!this.meshForPart(part.id) && part.features.length) await this.rebuild();
+      const mesh = this.meshForPart(part.id);
+      if (mesh) {
+        const planar = mesh.faces
+          .filter((face) => face.surface === "plane" && Math.abs(face.normal[0]) > 0.9)
+          .sort((a, b) => a.point[0] - b.point[0]);
+        if (planar.length >= 2) {
+          const hot = planar[planar.length - 1];
+          const cold = planar[0];
+          const temperature = Number(params.temperature) || 100;
+          study.loads.push(
+            {
+              id: uid("load"),
+              type: "temperature",
+              faceIndex: hot.index,
+              face: { faceIndex: hot.index, surface: hot.surface, point: hot.point, normal: hot.normal },
+              magnitude: temperature,
+              direction: [0, 0, 0],
+              label: `Temperature ${fmt(temperature, 1)} °C`,
+            },
+            {
+              id: uid("load"),
+              type: "temperature",
+              faceIndex: cold.index,
+              face: { faceIndex: cold.index, surface: cold.surface, point: cold.point, normal: cold.normal },
+              magnitude: study.thermal.ambient,
+              direction: [0, 0, 0],
+              label: `Temperature ${fmt(study.thermal.ambient, 1)} °C`,
+            },
+          );
+        }
+      }
+    } else if ("force" in params || "pressure" in params) {
       // An AI batch may create the part first; rebuild so the faces exist.
       if (!this.meshForPart(part.id) && part.features.length) await this.rebuild();
       this.bindStudyLoadsFromAi(study, params, part);
@@ -2687,6 +3001,12 @@ export class App {
   private openPlanePicker(): void {
     if (this.command) this.cancelCommand();
     const part = this.activePart();
+    const referenceCards = (part?.referencePlanes ?? [])
+      .map(
+        (ref) =>
+          `<button class="plane-card" data-ref-plane="${ref.id}"><span class="swatch" style="background:#c9a25e"></span><span>${escapeHtml(ref.name)}</span>${icon("chevron-right")}</button>`,
+      )
+      .join("");
     this.command = {
       kind: "plane-pick",
       onFace: (pick) => {
@@ -2713,7 +3033,7 @@ export class App {
             <button class="plane-card" data-plane-kind="front"><span class="swatch" style="background:#7faed4"></span><span>Front Plane</span>${icon("chevron-right")}</button>
             <button class="plane-card top" data-plane-kind="top"><span class="swatch"></span><span>Top Plane</span>${icon("chevron-right")}</button>
             <button class="plane-card right" data-plane-kind="right"><span class="swatch"></span><span>Right Plane</span>${icon("chevron-right")}</button>
-          </div>`,
+          </div>${referenceCards ? `<div class="plane-grid" style="margin-top:6px">${referenceCards}</div>` : ""}`,
         ) +
         pmSection(
           "Face",
@@ -2727,7 +3047,225 @@ export class App {
             this.startSketch(basePlane(kind));
           });
         });
+        root.querySelectorAll<HTMLElement>("[data-ref-plane]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const ref = part?.referencePlanes?.find((r) => r.id === button.dataset.refPlane);
+            if (ref) this.startSketch(this.referencePlaneSketchPlane(ref));
+          });
+        });
       },
+    });
+  }
+
+  private referencePlaneSketchPlane(ref: ReferencePlane): SketchPlane {
+    return { kind: "custom", name: ref.name, origin: [...ref.origin], u: [...ref.u], v: [...ref.v], n: [...ref.n] };
+  }
+
+  private referencePlaneChoices(): { id: string; name: string; plane: SketchPlane }[] {
+    const part = this.activePart();
+    const out: { id: string; name: string; plane: SketchPlane }[] = (["front", "top", "right"] as const).map((kind) => ({
+      id: kind,
+      name: basePlane(kind).name,
+      plane: basePlane(kind),
+    }));
+    for (const ref of part?.referencePlanes ?? []) {
+      out.push({ id: ref.id, name: ref.name, plane: this.referencePlaneSketchPlane(ref) });
+    }
+    return out;
+  }
+
+  private openReferenceGeometry(): void {
+    const part = this.activePart();
+    if (!part) {
+      toast("Create a part before adding reference geometry.", "warn");
+      return;
+    }
+    part.referencePlanes ??= [];
+    part.referenceAxes ??= [];
+    if (this.command) this.cancelCommand();
+    const planes = this.referencePlaneChoices();
+    const planeOptions = planes.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+    const refPlaneList = part.referencePlanes.length
+      ? part.referencePlanes
+          .map(
+            (ref) =>
+              `<div class="selection-item">${icon("frame")}<span>${escapeHtml(ref.name)} <b style="font-weight:400;color:#7d8a97">${ref.kind}</b></span>
+                <button class="mini-btn" data-ref-sketch="${ref.id}" title="New sketch on this plane">${icon("drafting-compass")}</button>
+                <button class="mini-btn" data-ref-hide="${ref.id}" title="Show / hide">${icon(ref.visible ? "eye" : "eye-off")}</button>
+                <button class="mini-btn" data-ref-delete="${ref.id}" title="Delete">${icon("x")}</button>
+              </div>`,
+          )
+          .join("")
+      : `<div class="hint">No reference planes yet. Offset, angled and mid planes appear here and in the New Sketch plane picker.</div>`;
+    const refAxisList = part.referenceAxes.length
+      ? part.referenceAxes
+          .map(
+            (axis) =>
+              `<div class="selection-item">${icon("axis-3d")}<span>${escapeHtml(axis.name)}</span>
+                <button class="mini-btn" data-ref-axis-delete="${axis.id}" title="Delete">${icon("x")}</button>
+              </div>`,
+          )
+          .join("")
+      : `<div class="hint">No reference axes yet.</div>`;
+    this.showPanel({
+      icon: "frame",
+      title: "Reference Geometry",
+      sub: `Planes ${part.referencePlanes.length} · Axes ${part.referenceAxes.length}`,
+      okTitle: "Done",
+      cancel: false,
+      body:
+        pmSection(
+          "Reference Plane",
+          "frame",
+          pmField("Type", `<select id="ref-plane-kind">
+              <option value="offset">Offset plane</option>
+              <option value="angle">Angled plane</option>
+              <option value="mid">Mid plane</option>
+            </select>`) +
+            pmField("Base plane", `<select id="ref-plane-base">${planeOptions}</select>`) +
+            pmField("Offset / angle", `<div class="input-wrap"><input id="ref-plane-value" type="number" step="5" value="25" /><span class="unit">mm / °</span></div>`) +
+            `<div class="inline-options" style="margin-top:8px"><button class="opt-btn" data-ref-action="plane">${icon("plus")} Add Plane</button></div>`,
+        ) +
+        pmSection(
+          "Reference Axis",
+          "axis-3d",
+          pmField("Method", `<select id="ref-axis-kind">
+              <option value="planes">Intersection of two planes</option>
+              <option value="cylinder">Axis of a cylindrical face</option>
+            </select>`) +
+            pmField("Plane A", `<select id="ref-axis-a">${planeOptions}</select>`) +
+            pmField("Plane B", `<select id="ref-axis-b">${planeOptions.replace(`value="front"`, `value="front" selected`)}</select>`) +
+            `<div class="hint" style="margin-top:4px">For a cylinder axis, select a cylindrical face in the viewport first.</div>
+            <div class="inline-options" style="margin-top:8px"><button class="opt-btn" data-ref-action="axis">${icon("plus")} Add Axis</button></div>`,
+        ) +
+        pmSection("Reference Planes", "layers", refPlaneList) +
+        pmSection("Reference Axes", "axis-3d", refAxisList),
+      onMount: (root) => {
+        const rebuild = () => {
+          this.refreshScene();
+          this.refreshTree();
+          this.openReferenceGeometry();
+        };
+        root.querySelector<HTMLElement>('[data-ref-action="plane"]')?.addEventListener("click", () => {
+          const kind = readText(root, "ref-plane-kind", "offset") as ReferencePlane["kind"];
+          const baseId = readText(root, "ref-plane-base", "front");
+          const base = planes.find((p) => p.id === baseId)?.plane ?? basePlane("front");
+          const value = readNumber(root, "ref-plane-value", 25);
+          const before = this.capture();
+          const origin: Vec3 = [...base.origin];
+          let u: Vec3 = [...base.u];
+          let v: Vec3 = [...base.v];
+          let n: Vec3 = [...base.n];
+          let name: string;
+          if (kind === "offset") {
+            origin[0] += n[0] * value;
+            origin[1] += n[1] * value;
+            origin[2] += n[2] * value;
+            name = `Offset Plane ${part.referencePlanes!.length + 1}`;
+          } else if (kind === "mid") {
+            origin[0] += n[0] * value * 0.5;
+            origin[1] += n[1] * value * 0.5;
+            origin[2] += n[2] * value * 0.5;
+            name = `Mid Plane ${part.referencePlanes!.length + 1}`;
+          } else {
+            const angle = (value * Math.PI) / 180;
+            const axis = new THREE.Vector3(...u).normalize();
+            const nv = new THREE.Vector3(...n).applyAxisAngle(axis, angle);
+            const vv = new THREE.Vector3(...v).applyAxisAngle(axis, angle);
+            n = [nv.x, nv.y, nv.z];
+            v = [vv.x, vv.y, vv.z];
+            name = `Angled Plane ${part.referencePlanes!.length + 1}`;
+          }
+          part.referencePlanes!.push({ id: uid("rplane"), name, origin, u, v, n, kind, visible: true });
+          this.commit(before);
+          this.refreshScene();
+          this.refreshTree();
+          toast(`${name} created. Double-click it in the tree to sketch on it.`, "success");
+          rebuild();
+        });
+        root.querySelector<HTMLElement>('[data-ref-action="axis"]')?.addEventListener("click", () => {
+          const method = readText(root, "ref-axis-kind", "planes");
+          let origin: Vec3;
+          let direction: Vec3;
+          let name: string;
+          if (method === "cylinder") {
+            const pick = this.selectedFace;
+            if (!pick || pick.face.surface !== "cylinder" || !pick.face.axis) {
+              toast("Select a cylindrical face in the viewport first.", "warn");
+              return;
+            }
+            origin = [...pick.face.point];
+            direction = [...pick.face.axis];
+            name = `Cylinder Axis ${part.referenceAxes!.length + 1}`;
+          } else {
+            const a = planes.find((p) => p.id === readText(root, "ref-axis-a", "front"))?.plane ?? basePlane("front");
+            const b = planes.find((p) => p.id === readText(root, "ref-axis-b", "right"))?.plane ?? basePlane("right");
+            const n1 = new THREE.Vector3(...a.n).normalize();
+            const n2 = new THREE.Vector3(...b.n).normalize();
+            const dir = new THREE.Vector3().crossVectors(n1, n2);
+            if (dir.length() < 1e-6) {
+              toast("Those planes are parallel; choose two non-parallel planes.", "warn");
+              return;
+            }
+            dir.normalize();
+            const d1 = n1.dot(new THREE.Vector3(...a.origin));
+            const d2 = n2.dot(new THREE.Vector3(...b.origin));
+            const p = new THREE.Vector3()
+              .addScaledVector(new THREE.Vector3().crossVectors(n2, dir), d1)
+              .addScaledVector(new THREE.Vector3().crossVectors(dir, n1), d2)
+              .divideScalar(dir.lengthSq());
+            origin = [p.x, p.y, p.z];
+            direction = [dir.x, dir.y, dir.z];
+            name = `Axis ${part.referenceAxes!.length + 1}`;
+          }
+          const before = this.capture();
+          part.referenceAxes!.push({ id: uid("raxis"), name, origin, direction, visible: true });
+          this.commit(before);
+          this.refreshScene();
+          this.refreshTree();
+          toast(`${name} created.`, "success");
+          rebuild();
+        });
+        root.querySelectorAll<HTMLElement>("[data-ref-sketch]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const ref = part.referencePlanes?.find((r) => r.id === button.dataset.refSketch);
+            if (ref) {
+              this.cancelCommand();
+              this.startSketch(this.referencePlaneSketchPlane(ref));
+            }
+          });
+        });
+        root.querySelectorAll<HTMLElement>("[data-ref-hide]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const ref = part.referencePlanes?.find((r) => r.id === button.dataset.refHide);
+            if (!ref) return;
+            ref.visible = !ref.visible;
+            this.refreshScene();
+            this.openReferenceGeometry();
+          });
+        });
+        root.querySelectorAll<HTMLElement>("[data-ref-delete]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const before = this.capture();
+            part.referencePlanes = part.referencePlanes?.filter((r) => r.id !== button.dataset.refDelete);
+            this.commit(before);
+            this.refreshScene();
+            this.refreshTree();
+            this.openReferenceGeometry();
+          });
+        });
+        root.querySelectorAll<HTMLElement>("[data-ref-axis-delete]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const before = this.capture();
+            part.referenceAxes = part.referenceAxes?.filter((r) => r.id !== button.dataset.refAxisDelete);
+            this.commit(before);
+            this.refreshScene();
+            this.refreshTree();
+            this.openReferenceGeometry();
+          });
+        });
+      },
+      onOk: () => this.finishCommand(),
     });
   }
 
@@ -2804,6 +3342,9 @@ export class App {
             ${toolButton("rectangle", "Rectangle", "rectangle-horizontal")}
             ${toolButton("circle", "Circle", "circle")}
             ${toolButton("arc", "3-Pt Arc", "circle-dot")}
+            ${toolButton("slot", "Slot", "rectangle-horizontal")}
+            ${toolButton("polygon", "Polygon", "hexagon")}
+            ${toolButton("spline", "Spline", "waypoints")}
             ${toolButton("dimension", "Dimension", "ruler")}
           </div>`,
         ) +
@@ -2825,6 +3366,9 @@ export class App {
           "Modify",
           "trash-2",
           `<div class="inline-options">
+            <button class="opt-btn" data-sketch-action="fillet">${icon("circle")} Fillet</button>
+            <button class="opt-btn" data-sketch-action="chamfer">${icon("triangle")} Chamfer</button>
+            <button class="opt-btn" data-sketch-action="pattern">${icon("refresh-cw")} Circular Pattern</button>
             <button class="opt-btn" data-sketch-action="delete">${icon("trash-2")} Delete</button>
             <button class="opt-btn" data-sketch-action="fit">${icon("focus")} Fit</button>
           </div>`,
@@ -2854,6 +3398,14 @@ export class App {
                 this.updateSketchPanelInfo();
                 this.refreshTree();
               }
+            } else if (button.dataset.sketchAction === "fillet" || button.dataset.sketchAction === "chamfer") {
+              if (this.editor.applySketchCorner(button.dataset.sketchAction, this.editor.cornerSize)) {
+                this.sketchDirty = true;
+                this.updateSketchPanelInfo();
+                this.refreshTree();
+              }
+            } else if (button.dataset.sketchAction === "pattern") {
+              void this.openSketchPattern();
             } else {
               this.editor.fit();
             }
@@ -2899,6 +3451,9 @@ export class App {
       rectangle: "Rectangle: click two opposite corners. Horizontal and vertical relations are added automatically.",
       circle: "Circle: click the centre, then drag or click to set the radius.",
       arc: "3-point arc: click the start point, the end point, then a point on the arc.",
+      slot: "Slot: click the two centreline ends, then a third point to set the radius.",
+      polygon: "Polygon: click the centre, then a vertex. The side count is set in the sketch panel.",
+      spline: "Spline: click control points; click the first point or double-click to finish the smooth curve.",
       dimension: "Smart Dimension: click a line, then place the dimension. Double-click the label to change it.",
       trim: "Trim: click the part of an entity to cut away between its intersections.",
       offset: "Offset Entities: select entities, then choose Offset and enter the distance.",
@@ -2913,6 +3468,20 @@ export class App {
 
   private setSketchTool(tool: SketchTool): void {
     this.editor.setTool(tool);
+  }
+
+  private async openSketchPattern(): Promise<void> {
+    if (!this.editor.isActive) return;
+    const count = await promptNumber({ title: "Circular Sketch Pattern", label: "Instance count", value: 6, unit: "", min: 2, step: 1 });
+    if (count === null) return;
+    const angle = await promptNumber({ title: "Circular Sketch Pattern", label: "Total angle", value: 360, unit: "°", min: 1, step: 15 });
+    if (angle === null) return;
+    if (this.editor.circularSketchPattern(count, angle)) {
+      this.sketchDirty = true;
+      this.updateSketchPanelInfo();
+      this.refreshTree();
+      toast(`Circular sketch pattern: ${Math.round(count)} instances over ${fmt(angle, 0)}°.`, "success");
+    }
   }
 
   private async editDimension(constraintId: string): Promise<void> {
@@ -3469,6 +4038,382 @@ export class App {
     });
   }
 
+  private openSweep(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to create part features.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    if (this.command) this.cancelCommand();
+    const sketchOptions = part.sketches.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join("");
+    const profile = part.sketches.find((s) => s.id === this.defaultSketchForFeature(part)?.id);
+    this.showPanel({
+      icon: "waypoints",
+      title: "Sweep",
+      sub: "Profile along a path",
+      body:
+        pmSection(
+          "Profile and Path",
+          "waypoints",
+          pmField("Profile sketch", `<select id="pm-sweep-profile">${sketchOptions}</select>`) +
+            pmField("Path sketch (open curve)", `<select id="pm-sweep-path">${sketchOptions}</select>`) +
+            `<div class="hint">The profile must be a closed sketch. The path is the first open chain of the path sketch. Both sketches can be on different planes.</div>`,
+        ) +
+        pmSection(
+          "Operation",
+          "layers",
+          pmField("Boolean", `<select id="pm-sweep-op"><option value="join">Join with body</option><option value="new">New body</option><option value="cut">Cut</option></select>`),
+        ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const profileId = readText(root, "pm-sweep-profile", profile?.id ?? "");
+        const pathId = readText(root, "pm-sweep-path", "");
+        if (!profileId || !pathId || profileId === pathId) {
+          toast("Choose different profile and path sketches.", "warn");
+          return;
+        }
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "sweep",
+          name: nextFeatureName("sweep", part.features),
+          sketchId: profileId,
+          params: { pathSketchId: pathId, operation: readText(root, "pm-sweep-op", "join") as "join" | "new" | "cut" },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+      },
+    });
+  }
+
+  private openLoft(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to create part features.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    if (part.sketches.length < 2) {
+      toast("Loft needs at least two closed sketches on different planes.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    const checks = part.sketches
+      .map(
+        (s) =>
+          `<label class="check-row"><input type="checkbox" data-loft-sketch="${s.id}" ${s === part.sketches[0] || s === part.sketches[1] ? "checked" : ""} /> <span>${escapeHtml(s.name)}</span><span class="hint">${s.plane.name}</span></label>`,
+      )
+      .join("");
+    this.showPanel({
+      icon: "layers-3",
+      title: "Loft",
+      sub: "Sections through profiles",
+      body:
+        pmSection("Sections", "layers-3", `${checks}<div class="hint">Select two or more closed profiles in order. Each section may sit on a different plane.</div>`) +
+        pmSection("Operation", "layers", pmField("Boolean", `<select id="pm-loft-op"><option value="join">Join with body</option><option value="new">New body</option><option value="cut">Cut</option></select>`)),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const ids = [...root.querySelectorAll<HTMLInputElement>("[data-loft-sketch]:checked")].map((el) => el.dataset.loftSketch ?? "");
+        if (ids.length < 2) {
+          toast("Select at least two profiles for the loft.", "warn");
+          return;
+        }
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "loft",
+          name: nextFeatureName("loft", part.features),
+          sketchId: ids[0],
+          params: { profileSketchIds: ids, operation: readText(root, "pm-loft-op", "join") as "join" | "new" | "cut" },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+      },
+    });
+  }
+
+  private openHelix(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to create part features.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "rotate-3d",
+      title: "Helix / Spiral",
+      sub: "Coil with a circular cross-section",
+      body:
+        pmSection(
+          "Helix",
+          "rotate-3d",
+          pmField("Diameter", numInput("pm-helix-diameter", 20, "mm", 0.5)) +
+            pmField("Pitch", numInput("pm-helix-pitch", 5, "mm", 0.1)) +
+            pmField("Turns", numInput("pm-helix-turns", 4, "", 0.25, "0.25")) +
+            pmField("Wire radius", numInput("pm-helix-wire", 1.2, "mm", 0.05)) +
+            pmField("Axis", `<select id="pm-helix-axis"><option value="y">Y</option><option value="x">X</option><option value="z">Z</option></select>`) +
+            pmField("Hand", `<select id="pm-helix-hand"><option value="right">Right hand</option><option value="left">Left hand</option></select>`) +
+            `<div class="hint">A true helical sweep: the circular cross-section follows the helix path. Join it with an existing body to cut a thread-like coil or create a new spring body.</div>`,
+        ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const axis = readText(root, "pm-helix-axis", "y");
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "helix",
+          name: nextFeatureName("helix", part.features),
+          params: {
+            helixDiameter: Math.max(0.5, readNumber(root, "pm-helix-diameter", 20)),
+            helixPitch: Math.max(0.1, readNumber(root, "pm-helix-pitch", 5)),
+            helixTurns: Math.max(0.25, readNumber(root, "pm-helix-turns", 4)),
+            radius: Math.max(0.05, readNumber(root, "pm-helix-wire", 1.2)),
+            normal: axis === "x" ? [1, 0, 0] : axis === "z" ? [0, 0, 1] : [0, 1, 0],
+            center: [0, 0, 0],
+            helixHand: readText(root, "pm-helix-hand", "right") as "right" | "left",
+          },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+      },
+    });
+  }
+
+  private openCircularPattern(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to modify the part.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part || !this.meshForPart(part.id)) {
+      toast("Create a body before patterning it.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "refresh-cw",
+      title: "Circular Pattern",
+      sub: "Repeat the body around an axis",
+      body: pmSection(
+        "Parameters",
+        "refresh-cw",
+        pmField("Axis", `<select id="pm-circular-axis"><option value="y">Y</option><option value="x">X</option><option value="z">Z</option></select>`) +
+          pmField("Count", numInput("pm-circular-count", 4, "", 2)) +
+          pmField("Total angle", numInput("pm-circular-angle", 360, "°", 1)) +
+          `<div class="hint">Copies are rotated about the body centre and fused into one solid.</div>`,
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "circularPattern",
+          name: nextFeatureName("circularPattern", part.features),
+          params: {
+            circularAxis: readText(root, "pm-circular-axis", "y") as "x" | "y" | "z",
+            circularCount: Math.max(2, Math.round(readNumber(root, "pm-circular-count", 4))),
+            circularAngle: clamp(readNumber(root, "pm-circular-angle", 360), 1, 360),
+          },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+      },
+    });
+  }
+
+  private openHoleWizard(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to create part features.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    const mesh = part ? this.meshForPart(part.id) : undefined;
+    if (!part || !mesh) {
+      toast("Create a body before adding a hole.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    const pick = this.selectedFace;
+    const fallbackCenter: Vec3 = [
+      (mesh.bbox.min[0] + mesh.bbox.max[0]) / 2,
+      mesh.bbox.max[1],
+      (mesh.bbox.min[2] + mesh.bbox.max[2]) / 2,
+    ];
+    const center = pick ? pick.face.point : fallbackCenter;
+    const normal = pick ? pick.face.normal : ([0, 1, 0] as Vec3);
+    const sizes: Record<string, number> = { M3: 3.4, M4: 4.5, M5: 5.5, M6: 6.6, M8: 9, M10: 11, M12: 13.5, M16: 17.5 };
+    this.showPanel({
+      icon: "circle-dot",
+      title: "Hole Wizard",
+      sub: pick ? `Face ${pick.faceIndex + 1}` : "Top face (select a face to change)",
+      body:
+        pmSection(
+          "Hole",
+          "circle-dot",
+          pmField("Standard", `<select id="pm-hole-standard">${Object.keys(sizes).map((k) => `<option value="${k}">${k}</option>`).join("")}</select>`) +
+            pmField("Type", `<select id="pm-hole-type"><option value="simple">Simple</option><option value="counterbore">Counterbore</option><option value="countersink">Countersink</option></select>`) +
+            pmField("Diameter", numInput("pm-hole-diameter", 6.6, "mm", 0.1)) +
+            pmField("Head diameter", numInput("pm-hole-head", 12, "mm", 0.2)) +
+            pmField("Depth", numInput("pm-hole-depth", 100, "mm", 0.1)) +
+            `<div class="hint">${pick ? "The hole is cut normal to the selected face." : "No face selected: the hole is placed at the top centre of the bounding box along −Y."} M3–M16 clearance sizes are built in.</div>`,
+        ),
+      onMount: (root) => {
+        root.querySelector<HTMLSelectElement>("#pm-hole-standard")?.addEventListener("change", (event) => {
+          const size = sizes[(event.target as HTMLSelectElement).value] ?? 6.6;
+          const input = root.querySelector<HTMLInputElement>("#pm-hole-diameter");
+          if (input) input.value = String(size);
+        });
+      },
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "hole",
+          name: nextFeatureName("hole", part.features),
+          params: {
+            standard: readText(root, "pm-hole-standard", "M6"),
+            holeType: readText(root, "pm-hole-type", "simple") as "simple" | "counterbore" | "countersink",
+            holeDiameter: Math.max(0.1, readNumber(root, "pm-hole-diameter", 6.6)),
+            holeHeadDiameter: Math.max(0.2, readNumber(root, "pm-hole-head", 12)),
+            holeDepth: Math.max(0.1, readNumber(root, "pm-hole-depth", 100)),
+            center,
+            normal,
+          },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+        toast(`Hole ${feature.params.standard} cut on the selected face.`, "success");
+      },
+    });
+  }
+
+  private openDraft(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to modify the part.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    const pick = this.selectedFace;
+    if (!pick) {
+      toast("Select a face to draft, then run Draft again.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "triangle",
+      title: "Draft",
+      sub: `Face ${pick.faceIndex + 1}`,
+      body: pmSection(
+        "Parameters",
+        "triangle",
+        pmField("Draft angle", numInput("pm-draft-angle", 3, "°", 0.1)) +
+          `<div class="hint">The selected face is tapered about a neutral plane at the bottom of the body.</div>`,
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const before = this.capture();
+        part.features.push({
+          id: uid("feat"),
+          type: "draft",
+          name: nextFeatureName("draft", part.features),
+          params: {
+            draftAngle: clamp(readNumber(root, "pm-draft-angle", 3), 0.1, 60),
+            faceIndex: pick.faceIndex,
+            normal: pick.face.normal,
+          },
+        });
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: part.features[part.features.length - 1].id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+      },
+    });
+  }
+
+  private openRib(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to create part features.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    const openSketches = part.sketches.filter((s) => !profileSummary(s).closed);
+    const choices = (openSketches.length ? openSketches : part.sketches)
+      .map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`)
+      .join("");
+    if (!choices) {
+      toast("Create an open sketch line or curve for the rib first.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "layout-grid",
+      title: "Rib",
+      sub: "Thin wall from an open profile",
+      body: pmSection(
+        "Parameters",
+        "layout-grid",
+        pmField("Sketch", `<select id="pm-rib-sketch">${choices}</select>`) +
+          pmField("Thickness", numInput("pm-rib-thickness", 3, "mm", 0.2)) +
+          pmField("Height", numInput("pm-rib-height", 10, "mm", 0.2)) +
+          `<div class="hint">The open chain is offset by half the thickness and extruded along the sketch normal, then joined with the body.</div>`,
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "rib",
+          name: nextFeatureName("rib", part.features),
+          sketchId: readText(root, "pm-rib-sketch", ""),
+          params: {
+            ribThickness: Math.max(0.2, readNumber(root, "pm-rib-thickness", 3)),
+            depth: Math.max(0.2, readNumber(root, "pm-rib-height", 10)),
+            operation: "join",
+          },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild();
+      },
+    });
+  }
+
   private editFeature(feature: Feature): void {
     if (this.editor.isActive) {
       toast("Finish the sketch first.", "warn");
@@ -3723,6 +4668,8 @@ export class App {
       const kind = readText(root, "pm-mate-type", type);
       const row = root.querySelector<HTMLElement>("#pm-mate-distance-row");
       if (row) row.style.display = kind === "distance" ? "" : "none";
+      const angleRow = root.querySelector<HTMLElement>("#pm-mate-angle-row");
+      if (angleRow) angleRow.style.display = kind === "angle" ? "" : "none";
     };
     this.command = {
       kind: "mate",
@@ -3751,7 +4698,7 @@ export class App {
     this.showPanel({
       icon: "link",
       title: existing ? `Edit ${existing.name}` : "Mate",
-      sub: existing ? existing.name : "Coincident / Concentric / Distance",
+      sub: existing ? existing.name : "Coincident / Concentric / Distance / Angle",
       body:
         pmSection(
           "Mate Selections",
@@ -3768,9 +4715,11 @@ export class App {
               <option value="coincident" ${type === "coincident" ? "selected" : ""}>Coincident — faces touch</option>
               <option value="concentric" ${type === "concentric" ? "selected" : ""}>Concentric — axes align</option>
               <option value="distance" ${type === "distance" ? "selected" : ""}>Distance — offset faces</option>
+              <option value="angle" ${type === "angle" ? "selected" : ""}>Angle — faces at an angle</option>
             </select>`,
           ) +
             `<div id="pm-mate-distance-row">${pmField("Distance", numInput("pm-mate-distance", existing?.distance ?? 10, "mm"))}</div>
+            <div id="pm-mate-angle-row" style="display:none">${pmField("Angle", numInput("pm-mate-angle", existing?.angle ?? 90, "°", 0.1))}</div>
             <label class="check-row"><input type="checkbox" id="pm-mate-flip" ${existing?.flipped ? "checked" : ""} /> Flip alignment</label>`,
         ),
       onMount: (root) => {
@@ -3788,11 +4737,13 @@ export class App {
         const root = this.panelRoot ?? document;
         const mateType = readText(root, "pm-mate-type", type) as Mate["type"];
         const distance = Math.abs(readNumber(root, "pm-mate-distance", existing?.distance ?? 10));
+        const angle = clamp(readNumber(root, "pm-mate-angle", existing?.angle ?? 90), 0.1, 179.9);
         const flipped = readChecked(root, "pm-mate-flip");
         const before = this.capture();
         if (existing) {
           existing.type = mateType;
           existing.distance = mateType === "distance" ? distance : undefined;
+          existing.angle = mateType === "angle" ? angle : undefined;
           existing.flipped = flipped;
         } else {
           if (picks.length < 2) {
@@ -3802,7 +4753,7 @@ export class App {
           const componentA = this.doc.components.find((c) => c.id === picks[0].componentId);
           const componentB = this.doc.components.find((c) => c.id === picks[1].componentId);
           if (!componentA || !componentB) return;
-          const label = mateType === "concentric" ? "Concentric" : mateType === "distance" ? "Distance" : "Coincident";
+          const label = mateType === "concentric" ? "Concentric" : mateType === "distance" ? "Distance" : mateType === "angle" ? "Angle" : "Coincident";
           let suffix = 1;
           while (this.doc.mates.some((m) => m.name === `${label}${suffix}`)) suffix++;
           const mate: Mate = {
@@ -3812,6 +4763,7 @@ export class App {
             a: faceRefFromPick(componentA, picks[0].faceIndex, picks[0].face.surface, picks[0].face.point, picks[0].face.normal, picks[0].face.axis, picks[0].face.radius),
             b: faceRefFromPick(componentB, picks[1].faceIndex, picks[1].face.surface, picks[1].face.point, picks[1].face.normal, picks[1].face.axis, picks[1].face.radius),
             distance: mateType === "distance" ? distance : undefined,
+            angle: mateType === "angle" ? angle : undefined,
             flipped,
           };
           this.doc.mates.push(mate);
@@ -3824,6 +4776,51 @@ export class App {
         this.refreshTree();
         if (report.errors) toast(`${report.errors} mate(s) could not be resolved.`, "warn");
         else toast("Mate solved.", "success");
+      },
+    });
+  }
+
+  private openExplodedView(): void {
+    if (this.doc.components.length === 0) {
+      toast("Insert components before creating an exploded view.", "warn");
+      return;
+    }
+    if (this.doc.mode !== "assembly") this.setMode("assembly");
+    if (this.command) this.cancelCommand();
+    const current = Math.round((this.doc.exploded ?? 0) * 100);
+    this.showPanel({
+      icon: "boxes",
+      title: "Exploded View",
+      sub: "Components along their assembly axes",
+      body: pmSection(
+        "Explode",
+        "boxes",
+        `<div class="field"><label>Explode amount</label><div class="input-wrap"><input id="pm-explode" type="range" min="0" max="100" step="1" value="${current}" /><span class="unit" id="pm-explode-value">${current}%</span></div></div>
+        <div class="inline-options" style="margin-top:8px">
+          <button class="opt-btn" data-explode-action="explode">${icon("maximize")} Explode</button>
+          <button class="opt-btn" data-explode-action="collapse">${icon("arrow-down-to-line")} Collapse</button>
+        </div>
+        <div class="hint" style="margin-top:6px">Components move radially from the assembly centre and are layered along Y. The slider blends smoothly between assembled and fully exploded.</div>`,
+      ),
+      onMount: (root) => {
+        const slider = root.querySelector<HTMLInputElement>("#pm-explode");
+        const valueEl = root.querySelector<HTMLElement>("#pm-explode-value");
+        const apply = (value: number) => {
+          this.doc.exploded = clamp(value, 0, 1);
+          if (slider) slider.value = String(Math.round(this.doc.exploded * 100));
+          if (valueEl) valueEl.textContent = `${Math.round(this.doc.exploded * 100)}%`;
+          this.refreshScene();
+        };
+        slider?.addEventListener("input", () => apply(Number(slider.value) / 100));
+        root.querySelectorAll<HTMLElement>("[data-explode-action]").forEach((button) => {
+          button.addEventListener("click", () => apply(button.dataset.explodeAction === "explode" ? 1 : 0));
+        });
+      },
+      onOk: () => {
+        const before = this.capture();
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
       },
     });
   }
@@ -3886,22 +4883,45 @@ export class App {
     if (!root) return;
     const supportHost = root.querySelector<HTMLElement>("#pm-support-list");
     if (supportHost) {
+      const kindLabel = (kind?: string) =>
+        kind === "displacement"
+          ? "Displacement"
+          : kind === "frictionless"
+            ? "Frictionless"
+            : kind === "cylindrical"
+              ? "Cylindrical"
+              : kind === "bonded"
+                ? "Bonded"
+                : "Fixed";
       supportHost.innerHTML = study.supports.length
         ? study.supports
             .map(
               (support) =>
-                `<div class="selection-item">${icon("anchor")}<span>Fixed support · Face ${support.faceIndex + 1}</span><button class="x" data-remove-support="${support.id}" title="Remove">${icon("x")}</button></div>`,
+                `<div class="selection-item">${icon("anchor")}<span>${kindLabel(support.kind)} · Face ${support.faceIndex + 1}${
+                  support.kind === "displacement" && support.dofs
+                    ? ` · ${[support.dofs.x ? "X" : "", support.dofs.y ? "Y" : "", support.dofs.z ? "Z" : ""].filter(Boolean).join("")}`
+                    : ""
+                }</span><button class="x" data-remove-support="${support.id}" title="Remove">${icon("x")}</button></div>`,
             )
             .join("")
         : `<div class="hint">No supports yet.</div>`;
     }
     const loadHost = root.querySelector<HTMLElement>("#pm-load-list");
     if (loadHost) {
+      const loadLabel = (load: AnalysisLoad) => {
+        if (load.type === "pressure") return `Pressure ${fmt(load.magnitude, 2)} MPa`;
+        if (load.type === "moment") return `Moment ${fmt(load.magnitude, 0)} N·mm`;
+        if (load.type === "gravity") return `Gravity ${fmt(load.magnitude, 2)} g`;
+        if (load.type === "temperature") return `Temperature ${fmt(load.magnitude, 1)} °C`;
+        if (load.type === "heatflux") return `Heat flux ${fmt(load.magnitude, 3)} W/mm²`;
+        if (load.type === "convection") return `Convection ${fmt(load.magnitude, 3)} W/mm²·K`;
+        return `Force ${fmt(load.magnitude, 1)} N`;
+      };
       loadHost.innerHTML = study.loads.length
         ? study.loads
             .map(
               (load) =>
-                `<div class="selection-item">${icon(load.type === "pressure" ? "gauge" : "arrow-down-to-line")}<span>${load.type === "pressure" ? `${fmt(load.magnitude, 2)} MPa` : `${fmt(load.magnitude, 1)} N`} · Face ${load.faceIndex + 1}</span><button class="x" data-remove-load="${load.id}" title="Remove">${icon("x")}</button></div>`,
+                `<div class="selection-item">${icon(load.type === "pressure" ? "gauge" : load.type === "moment" ? "rotate-3d" : "arrow-down-to-line")}<span>${loadLabel(load)} · Face ${load.faceIndex + 1}</span><button class="x" data-remove-load="${load.id}" title="Remove">${icon("x")}</button></div>`,
             )
             .join("")
         : `<div class="hint">No loads yet.</div>`;
@@ -3980,10 +5000,87 @@ export class App {
         </div>`
       : "";
     this.command = { kind: "study" };
+    const analysisType = study.analysisType ?? "static";
+    const analysisName =
+      analysisType === "modal"
+        ? "Modal"
+        : analysisType === "buckling"
+          ? "Linear Buckling"
+          : analysisType === "thermal"
+            ? "Steady-State Thermal"
+            : "Static Structural";
+    const resultSummaryLine = (() => {
+      if (!result) return "";
+      if (analysisType === "modal") {
+        const frequencies = result.frequencies ?? [];
+        return `<div class="study-stats">${frequencies
+          .slice(0, 6)
+          .map((f, index) => `<span>Mode ${index + 1}</span><span>${f.toFixed(2)} Hz</span>`)
+          .join("")}<span>Solve time</span><span>${(result.solveMs / 1000).toFixed(2)} s</span></div>`;
+      }
+      if (analysisType === "thermal") {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (const value of result.temperature ?? []) {
+          lo = Math.min(lo, value);
+          hi = Math.max(hi, value);
+        }
+        return `<div class="study-stats"><span>Min temperature</span><span>${fmt(lo, 2)} °C</span><span>Max temperature</span><span>${fmt(hi, 2)} °C</span><span>DOFs</span><span>${result.dofs.toLocaleString()}</span></div>`;
+      }
+      if (analysisType === "buckling") {
+        return `<div class="study-stats"><span>Load multiplier</span><span>${Number.isFinite(result.bucklingMultiplier ?? Infinity) ? fmt(result.bucklingMultiplier ?? 0, 3) : "∞"}</span><span>Reaction Fx/Fy/Fz</span><span>${result.reaction.map((v) => fmt(v, 1)).join(" / ")} N</span></div>`;
+      }
+      return `<div class="study-stats">
+          <span>Max deformation</span><span>${result.maxDisplacement.toExponential(3)} mm</span>
+          <span>Max von Mises</span><span>${fmt(result.maxStress, 2)} MPa</span>
+          <span>Safety factor</span><span>${Number.isFinite(result.safetyFactor) ? fmt(result.safetyFactor, 2) : "∞"}</span>
+          <span>Reaction Fx/Fy/Fz</span><span>${result.reaction.map((v) => fmt(v, 1)).join(" / ")} N</span>
+          <span>DOFs</span><span>${result.dofs.toLocaleString()}</span>
+          <span>Iterations</span><span>${result.iterations}${result.converged ? "" : " (not converged)"}</span>
+          <span>Solve time</span><span>${(result.solveMs / 1000).toFixed(2)} s</span>
+        </div>`;
+    })();
+    const materialProperties =
+      analysisType === "thermal"
+        ? `<span>Conductivity</span><span>${fmt(material.conductivity ?? 0.05, 3)} W/(mm·K)</span>`
+        : `<span>Young's modulus</span><span>${material.E >= 1000 ? `${fmt(material.E / 1000, 1)} GPa` : `${fmt(material.E, 0)} MPa`}</span>
+           <span>Poisson's ratio</span><span>${material.nu}</span>
+           <span>Yield strength</span><span>${fmt(material.yield, 1)} MPa</span>
+           <span>Density</span><span>${fmt(material.density, 0)} kg/m³</span>`;
+    const meshKind = study.meshKind ?? "hex";
+    const metrics = study.meshMetrics;
+    const qualityHtml = metrics
+      ? `<div class="study-stats">
+          <span>Min / avg aspect</span><span>${metrics.minAspect.toFixed(2)} / ${metrics.avgAspect.toFixed(2)}</span>
+          <span>Min / avg Jacobian</span><span>${metrics.minJacobian.toFixed(3)} / ${metrics.avgJacobian.toFixed(3)}</span>
+        </div>`
+      : "";
+    const localSizingHtml = (study.localSizing ?? []).length
+      ? `<div class="selection-list">${(study.localSizing ?? [])
+          .map(
+            (zone) =>
+              `<div class="selection-item">${icon("grid-3x3")}<span>Face ${zone.faceIndex + 1} · ${fmt(zone.size, 2)} mm</span><button class="x" data-remove-sizing="${zone.id}" title="Remove">${icon("x")}</button></div>`,
+          )
+          .join("")}</div>`
+      : "";
+    const bcButtons =
+      analysisType === "thermal"
+        ? `<button class="opt-btn" data-study-action="temperature">${icon("thermometer")} Temperature</button>
+           <button class="opt-btn" data-study-action="heatflux">${icon("flame")} Heat Flux</button>
+           <button class="opt-btn" data-study-action="convection">${icon("wind")} Convection</button>`
+        : `<button class="opt-btn" data-study-action="support">${icon("anchor")} Fixed</button>
+           <button class="opt-btn" data-study-action="displacement">${icon("move-3d")} Displacement</button>
+           <button class="opt-btn" data-study-action="frictionless">${icon("move-horizontal")} Frictionless</button>
+           <button class="opt-btn" data-study-action="cylindrical">${icon("cylinder")} Cylindrical</button>
+           <button class="opt-btn" data-study-action="bonded">${icon("link")} Bonded</button>
+           <button class="opt-btn" data-study-action="force">${icon("arrow-down-to-line")} Force</button>
+           <button class="opt-btn" data-study-action="pressure">${icon("gauge")} Pressure</button>
+           <button class="opt-btn" data-study-action="moment">${icon("rotate-3d")} Moment</button>
+           <button class="opt-btn" data-study-action="gravity">${icon("earth")} Gravity</button>`;
     this.showPanel({
       icon: "activity",
       title: study.name,
-      sub: `Static Structural · ${statusLabel}`,
+      sub: `${analysisName} · ${statusLabel}`,
       okTitle: "Done",
       cancel: false,
       body:
@@ -3993,31 +5090,54 @@ export class App {
           `<div class="study-stats"><span>Part</span><span>${escapeHtml(part.name)}</span><span>Surface</span><span>${triangleCount.toLocaleString()} triangles</span></div>`,
         ) +
         pmSection(
+          "Analysis",
+          "activity",
+          pmField(
+            "Type",
+            `<select id="pm-study-type">
+              <option value="static" ${analysisType === "static" ? "selected" : ""}>Static Structural</option>
+              <option value="modal" ${analysisType === "modal" ? "selected" : ""}>Modal (frequencies)</option>
+              <option value="buckling" ${analysisType === "buckling" ? "selected" : ""}>Linear Buckling</option>
+              <option value="thermal" ${analysisType === "thermal" ? "selected" : ""}>Steady-State Thermal</option>
+            </select>`,
+          ) +
+            (analysisType === "modal"
+              ? pmField("Modes", numInput("pm-study-modes", study.modeCount ?? 6, "", 1))
+              : "") +
+            (analysisType === "thermal"
+              ? pmField("Ambient", numInput("pm-study-ambient", study.thermal?.ambient ?? 22, "°C", 1))
+              : ""),
+        ) +
+        pmSection(
           "Materials",
           "layers",
           pmField("Assignment", `<select id="pm-study-material">${materialOptions(study.materialId)}</select>`) +
-            `<div class="study-stats">
-              <span>Young's modulus</span><span>${material.E >= 1000 ? `${fmt(material.E / 1000, 1)} GPa` : `${fmt(material.E, 0)} MPa`}</span>
-              <span>Poisson's ratio</span><span>${material.nu}</span>
-              <span>Yield strength</span><span>${fmt(material.yield, 1)} MPa</span>
-              <span>Density</span><span>${fmt(material.density, 0)} kg/m³</span>
-            </div>`,
+            `<div class="study-stats">${materialProperties}</div>`,
         ) +
         pmSection(
           "Mesh",
           "grid-3x3",
           pmField("Element size", numInput("pm-study-mesh", study.meshSize, "mm", 0.2)) +
+            pmField(
+              "Element type",
+              `<select id="pm-study-mesh-kind">
+                <option value="hex" ${meshKind === "hex" ? "selected" : ""}>Hexahedral (fast preview)</option>
+                <option value="tet4" ${meshKind === "tet4" ? "selected" : ""}>Tet4 (linear)</option>
+                <option value="tet10" ${meshKind === "tet10" ? "selected" : ""}>Tet10 (quadratic)</option>
+              </select>`,
+            ) +
             stats +
-            `<div class="inline-options" style="margin-top:8px"><button class="opt-btn" data-study-action="mesh">${icon("grid-3x3")} Generate Mesh</button></div>`,
+            qualityHtml +
+            localSizingHtml +
+            `<div class="inline-options" style="margin-top:8px">
+              <button class="opt-btn" data-study-action="mesh">${icon("grid-3x3")} Generate Mesh</button>
+              <button class="opt-btn" data-study-action="local-sizing">${icon("crosshair")} Local Sizing</button>
+            </div>`,
         ) +
         pmSection(
           "Boundary Conditions",
           "anchor",
-          `<div class="inline-options">
-            <button class="opt-btn" data-study-action="support">${icon("anchor")} Fixed Support</button>
-            <button class="opt-btn" data-study-action="force">${icon("arrow-down-to-line")} Force</button>
-            <button class="opt-btn" data-study-action="pressure">${icon("gauge")} Pressure</button>
-          </div>
+          `<div class="inline-options">${bcButtons}</div>
           <div class="selection-list" id="pm-load-list" style="margin-top:8px"></div>
           <div class="inline-options" style="margin-top:8px"><button class="opt-btn" data-study-action="clear-loads">${icon("trash-2")} Clear All</button></div>`,
         ) +
@@ -4025,15 +5145,66 @@ export class App {
           "Solution",
           "play",
           `<div class="inline-options">
-            <button class="opt-btn active" data-study-action="solve">${icon("play")} Solve Static</button>
+            <button class="opt-btn active" data-study-action="solve">${icon("play")} ${
+              analysisType === "modal"
+                ? "Solve Modes"
+                : analysisType === "buckling"
+                  ? "Solve Buckling"
+                  : analysisType === "thermal"
+                    ? "Solve Thermal"
+                    : "Solve Static"
+            }</button>
             <button class="opt-btn" data-study-action="clear">${icon("refresh-cw")} Clear Results</button>
           </div>
-          ${resultStats}`,
+          ${resultSummaryLine}`,
         ) +
-        `<div class="hint">Unit system: <b>MMGS / NMM</b> (mm, N, MPa). The solver uses 8-node hexahedra with a Jacobi-preconditioned conjugate-gradient iteration.</div>`,
+        `<div class="hint">Unit system: <b>MMGS / NMM</b> (mm, N, MPa). Conformal <b>Tet4/Tet10</b> elements use a Jacobi-preconditioned conjugate-gradient solver; the hexahedral voxel mesh stays available as a fast preview.</div>`,
       onMount: (root) => {
         this.refreshPickLists(study);
         this.bindPickListRemoval(study);
+        root.querySelector<HTMLSelectElement>("#pm-study-type")?.addEventListener("change", (event) => {
+          const next = (event.target as HTMLSelectElement).value as AnalysisType;
+          const before = this.capture();
+          study.analysisType = next;
+          if (next === "thermal" && !study.thermal) study.thermal = { ambient: 22, convection: 10 };
+          if (next === "modal" && !study.modeCount) study.modeCount = 6;
+          this.invalidateStudy(study);
+          this.commit(before);
+          this.refreshTree();
+          this.openStudyPanel();
+        });
+        root.querySelector<HTMLSelectElement>("#pm-study-mesh-kind")?.addEventListener("change", (event) => {
+          const next = (event.target as HTMLSelectElement).value as FeaMeshKind;
+          const before = this.capture();
+          study.meshKind = next;
+          this.invalidateStudy(study);
+          this.commit(before);
+          this.refreshTree();
+          this.openStudyPanel();
+        });
+        root.querySelector<HTMLInputElement>("#pm-study-modes")?.addEventListener("change", (event) => {
+          const before = this.capture();
+          study.modeCount = clamp(Math.round(Number((event.target as HTMLInputElement).value) || 6), 1, 6);
+          this.invalidateStudy(study);
+          this.commit(before);
+          this.openStudyPanel();
+        });
+        root.querySelector<HTMLInputElement>("#pm-study-ambient")?.addEventListener("change", (event) => {
+          const before = this.capture();
+          study.thermal = { ambient: Number((event.target as HTMLInputElement).value) || 22, convection: study.thermal?.convection ?? 10 };
+          this.invalidateStudy(study);
+          this.commit(before);
+          this.openStudyPanel();
+        });
+        root.querySelectorAll<HTMLElement>("[data-remove-sizing]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const before = this.capture();
+            study.localSizing = (study.localSizing ?? []).filter((zone) => zone.id !== button.dataset.removeSizing);
+            this.invalidateStudy(study);
+            this.commit(before);
+            this.openStudyPanel();
+          });
+        });
         root.querySelector<HTMLSelectElement>("#pm-study-material")?.addEventListener("change", (event) => {
           const next = (event.target as HTMLSelectElement).value;
           const before = this.capture();
@@ -4060,9 +5231,19 @@ export class App {
             if (action === "mesh") void this.meshStudy();
             else if (action === "solve") void this.solveStudy();
             else if (action === "clear") this.clearStudyResults(study);
-            else if (action === "support") this.openSupportPick();
+            else if (action === "support") this.openSupportPick("fixed");
+            else if (action === "displacement") this.openSupportPick("displacement");
+            else if (action === "frictionless") this.openSupportPick("frictionless");
+            else if (action === "cylindrical") this.openSupportPick("cylindrical");
+            else if (action === "bonded") this.openSupportPick("bonded");
             else if (action === "force") this.openForcePick();
             else if (action === "pressure") this.openPressurePick();
+            else if (action === "moment") this.openMomentPick();
+            else if (action === "gravity") void this.openGravityDialog(study);
+            else if (action === "temperature") this.openThermalLoadPick("temperature");
+            else if (action === "heatflux") this.openThermalLoadPick("heatflux");
+            else if (action === "convection") this.openThermalLoadPick("convection");
+            else if (action === "local-sizing") this.openLocalSizingPick();
             else if (action === "clear-loads") {
               const before = this.capture();
               study.supports = [];
@@ -4080,17 +5261,28 @@ export class App {
     });
   }
 
-  private openSupportPick(): void {
+  private openSupportPick(kind: SupportKind = "fixed"): void {
     const study = this.activeStudy();
     if (!study) return;
     if (this.command) this.cancelCommand();
+    const title =
+      kind === "displacement"
+        ? "Displacement Support"
+        : kind === "frictionless"
+          ? "Frictionless Support"
+          : kind === "cylindrical"
+            ? "Cylindrical Support"
+            : kind === "bonded"
+              ? "Bonded Contact"
+              : "Fixed Support";
+    const dofs = { x: true, y: true, z: true };
     const addSupport = (pick: FacePick) => {
       if (pick.partId !== study.partId) {
         toast("Pick a face on the study part.", "warn");
         return;
       }
       if (study.supports.some((s) => s.faceIndex === pick.faceIndex)) {
-        toast("This face already has a fixed support.", "info");
+        toast("This face already has a support.", "info");
         return;
       }
       const before = this.capture();
@@ -4098,13 +5290,15 @@ export class App {
         id: uid("sup"),
         faceIndex: pick.faceIndex,
         face: { faceIndex: pick.faceIndex, surface: pick.face.surface, point: pick.face.point, normal: pick.face.normal },
+        kind,
+        dofs: kind === "displacement" ? { ...dofs } : undefined,
       });
       this.invalidateStudy(study);
       this.commit(before);
       this.refreshTree();
       this.refreshScene();
       this.refreshPickLists(study);
-      this.shell.setStatus(`Fixed support added · face ${pick.faceIndex + 1}`);
+      this.shell.setStatus(`${title} added · face ${pick.faceIndex + 1}`);
     };
     this.command = { kind: "support-pick", onFace: addSupport };
     this.viewport.setPickFilter("face");
@@ -4115,10 +5309,20 @@ export class App {
     this.selFaces = [];
     this.selectedFace = null;
     for (const pick of preselected) addSupport(pick);
-    this.shell.setHint("Click faces to add fixed supports. Press Esc or Done when finished.");
+    this.shell.setHint(`Click faces to add ${title.toLowerCase()}. Press Esc or Done when finished.`);
+    const description =
+      kind === "frictionless"
+        ? "The face normal direction is locked; the two in-plane directions remain free."
+        : kind === "cylindrical"
+          ? "Radial and axial motion relative to the detected cylinder axis is restrained."
+          : kind === "displacement"
+            ? "Selected axes are blocked for every node on the face."
+            : kind === "bonded"
+              ? "The face is bonded to the adjacent body: every translational dof is tied."
+              : "All three translational degrees of freedom of the nodes on these faces are locked.";
     this.showPanel({
       icon: "anchor",
-      title: "Fixed Support",
+      title,
       sub: "Select faces",
       okTitle: "Done",
       cancel: false,
@@ -4126,13 +5330,75 @@ export class App {
         pmSection(
           "Selected Faces",
           "anchor",
-          `<div class="selection-list" id="pm-support-list"></div>
-          <div class="hint" style="margin-top:6px">All three translational degrees of freedom of the nodes on these faces are locked.</div>`,
+          (kind === "displacement"
+            ? `<div class="dof-row">
+                <label><input type="checkbox" id="pm-dof-x" checked /> X</label>
+                <label><input type="checkbox" id="pm-dof-y" checked /> Y</label>
+                <label><input type="checkbox" id="pm-dof-z" checked /> Z</label>
+              </div>`
+            : "") +
+            `<div class="selection-list" id="pm-support-list"></div>
+          <div class="hint" style="margin-top:6px">${description}</div>`,
         ),
-      onMount: () => {
+      onMount: (root) => {
         this.refreshPickLists(study);
         this.bindPickListRemoval(study);
+        root.querySelector<HTMLInputElement>("#pm-dof-x")?.addEventListener("change", (event) => {
+          dofs.x = (event.target as HTMLInputElement).checked;
+        });
+        root.querySelector<HTMLInputElement>("#pm-dof-y")?.addEventListener("change", (event) => {
+          dofs.y = (event.target as HTMLInputElement).checked;
+        });
+        root.querySelector<HTMLInputElement>("#pm-dof-z")?.addEventListener("change", (event) => {
+          dofs.z = (event.target as HTMLInputElement).checked;
+        });
       },
+      onOk: () => this.finishCommand(),
+    });
+  }
+
+  private openLocalSizingPick(): void {
+    const study = this.activeStudy();
+    if (!study) return;
+    if (this.command) this.cancelCommand();
+    const addZone = (pick: FacePick) => {
+      if (pick.partId !== study.partId) {
+        toast("Pick a face on the study part.", "warn");
+        return;
+      }
+      void (async () => {
+        const size = await promptNumber({
+          title: "Local Mesh Sizing",
+          label: `Element size on face ${pick.faceIndex + 1}`,
+          value: Math.max(0.2, study.meshSize * 0.5),
+          unit: "mm",
+          min: 0.05,
+          step: 0.1,
+        });
+        if (size === null) return;
+        const before = this.capture();
+        study.localSizing = [...(study.localSizing ?? []).filter((zone) => zone.faceIndex !== pick.faceIndex), { id: uid("sizing"), faceIndex: pick.faceIndex, size }];
+        this.invalidateStudy(study);
+        this.commit(before);
+        this.refreshTree();
+        toast(`Local element size ${fmt(size, 2)} mm set on face ${pick.faceIndex + 1}.`, "success");
+        this.openStudyPanel();
+      })();
+    };
+    this.command = { kind: "support-pick", onFace: addZone };
+    this.viewport.setPickFilter("face");
+    this.shell.setHint("Click a face to refine the mesh locally. The smallest requested size seeds the volume mesh.");
+    this.showPanel({
+      icon: "crosshair",
+      title: "Local Mesh Sizing",
+      sub: "Select a face",
+      okTitle: "Done",
+      cancel: false,
+      body: pmSection(
+        "Refinement Zones",
+        "crosshair",
+        `<div class="hint">Pick a face, then enter a smaller element size for that region. The mesher keeps the grid conforming across neighbours.</div>`,
+      ),
       onOk: () => this.finishCommand(),
     });
   }
@@ -4237,6 +5503,187 @@ export class App {
           `<div class="selection-list" id="pm-load-list"></div>
           <div class="hint" style="margin-top:6px">Pressure acts along the face normal and produces consistent nodal loads on the boundary triangles.</div>`,
         ),
+      onMount: () => {
+        this.refreshPickLists(study);
+        this.bindPickListRemoval(study);
+      },
+      onOk: () => this.finishCommand(),
+    });
+  }
+
+  private openMomentPick(): void {
+    const study = this.activeStudy();
+    if (!study) return;
+    if (this.command) this.cancelCommand();
+    const addMoment = (pick: FacePick) => {
+      if (pick.partId !== study.partId) {
+        toast("Pick a face on the study part.", "warn");
+        return;
+      }
+      void (async () => {
+        const body = document.createElement("div");
+        body.innerHTML = `
+          <div class="field"><label>Moment</label><div class="input-wrap"><input id="moment-mag" type="number" step="100" value="10000" min="0.001" /><span class="unit">N·mm</span></div></div>
+          <div class="field"><label>Axis</label><select id="moment-axis">
+            <option value="x">Global X</option>
+            <option value="y">Global Y</option>
+            <option value="z" selected>Global Z</option>
+          </select></div>
+          <div class="hint">Face ${pick.faceIndex + 1} · the moment is distributed as a self-equilibrated nodal couple.</div>`;
+        const result = await openModal({
+          title: "Moment",
+          icon: "rotate-3d",
+          body,
+          width: 400,
+          actions: [
+            { label: "Cancel", value: "cancel", kind: "plain" },
+            { label: "Apply", value: "ok", kind: "primary" },
+          ],
+        });
+        if (result !== "ok") return;
+        const magnitude = Math.max(0.001, Number(body.querySelector<HTMLInputElement>("#moment-mag")?.value) || 10000);
+        const axis = body.querySelector<HTMLSelectElement>("#moment-axis")?.value ?? "z";
+        const before = this.capture();
+        study.loads.push({
+          id: uid("load"),
+          type: "moment",
+          faceIndex: pick.faceIndex,
+          face: { faceIndex: pick.faceIndex, surface: pick.face.surface, point: pick.face.point, normal: pick.face.normal },
+          magnitude,
+          direction: axis === "x" ? [1, 0, 0] : axis === "y" ? [0, 1, 0] : [0, 0, 1],
+          label: `Moment ${fmt(magnitude, 0)} N·mm (${axis.toUpperCase()})`,
+        });
+        this.invalidateStudy(study);
+        this.commit(before);
+        this.refreshTree();
+        this.refreshScene();
+        this.refreshPickLists(study);
+        toast(`Moment ${fmt(magnitude, 0)} N·mm added on face ${pick.faceIndex + 1}.`, "success");
+      })();
+    };
+    this.command = { kind: "pressure-pick", onFace: addMoment };
+    this.viewport.setPickFilter("face");
+    this.shell.setHint("Click a face to apply a moment. Press Esc or Done when finished.");
+    this.showPanel({
+      icon: "rotate-3d",
+      title: "Moment",
+      sub: "Select a face",
+      okTitle: "Done",
+      cancel: false,
+      body: pmSection(
+        "Applied Moments",
+        "rotate-3d",
+        `<div class="selection-list" id="pm-load-list"></div><div class="hint" style="margin-top:6px">A moment produces a force couple about the chosen global axis.</div>`,
+      ),
+      onMount: () => {
+        this.refreshPickLists(study);
+        this.bindPickListRemoval(study);
+      },
+      onOk: () => this.finishCommand(),
+    });
+  }
+
+  private async openGravityDialog(study: AnalysisStudy): Promise<void> {
+    const body = document.createElement("div");
+    body.innerHTML = `
+      <div class="field"><label>Acceleration</label><div class="input-wrap"><input id="gravity-mag" type="number" step="0.1" value="1" min="0.001" /><span class="unit">g</span></div></div>
+      <div class="field"><label>Direction</label><select id="gravity-dir">
+        <option value="yminus" selected>Global −Y</option>
+        <option value="zminus">Global −Z</option>
+        <option value="xplus">Global +X</option>
+      </select></div>
+      <div class="hint">Standard Earth gravity uses 9.81 m/s² and the material density for the inertial body load.</div>`;
+    const result = await openModal({
+      title: "Standard Earth Gravity",
+      icon: "earth",
+      body,
+      width: 400,
+      actions: [
+        { label: "Cancel", value: "cancel", kind: "plain" },
+        { label: "Apply", value: "ok", kind: "primary" },
+      ],
+    });
+    if (result !== "ok") return;
+    const magnitude = Math.max(0.001, Number(body.querySelector<HTMLInputElement>("#gravity-mag")?.value) || 1);
+    const dir = body.querySelector<HTMLSelectElement>("#gravity-dir")?.value ?? "yminus";
+    const before = this.capture();
+    study.loads.push({
+      id: uid("load"),
+      type: "gravity",
+      faceIndex: -1,
+      face: { faceIndex: -1, surface: "body", point: [0, 0, 0], normal: [0, -1, 0] },
+      magnitude,
+      direction: dir === "zminus" ? [0, 0, -1] : dir === "xplus" ? [1, 0, 0] : [0, -1, 0],
+      label: `Gravity ${fmt(magnitude, 2)} g`,
+    });
+    this.invalidateStudy(study);
+    this.commit(before);
+    this.refreshTree();
+    this.refreshScene();
+    this.refreshPickLists(study);
+    toast(`Gravity ${fmt(magnitude, 2)} g added.`, "success");
+  }
+
+  private openThermalLoadPick(type: "temperature" | "heatflux" | "convection"): void {
+    const study = this.activeStudy();
+    if (!study) return;
+    if (this.command) this.cancelCommand();
+    const title = type === "temperature" ? "Temperature" : type === "heatflux" ? "Heat Flux" : "Convection";
+    const addLoad = (pick: FacePick) => {
+      if (pick.partId !== study.partId) {
+        toast("Pick a face on the study part.", "warn");
+        return;
+      }
+      void (async () => {
+        const value = await promptNumber({
+          title,
+          label: type === "temperature" ? `Temperature on face ${pick.faceIndex + 1}` : type === "heatflux" ? `Heat flux on face ${pick.faceIndex + 1}` : `Film coefficient on face ${pick.faceIndex + 1}`,
+          value: type === "temperature" ? 100 : type === "heatflux" ? 0.05 : 0.01,
+          unit: type === "temperature" ? "°C" : type === "heatflux" ? "W/mm²" : "W/mm²·K",
+          min: 0,
+          step: type === "temperature" ? 5 : 0.001,
+        });
+        if (value === null) return;
+        const before = this.capture();
+        study.loads.push({
+          id: uid("load"),
+          type,
+          faceIndex: pick.faceIndex,
+          face: { faceIndex: pick.faceIndex, surface: pick.face.surface, point: pick.face.point, normal: pick.face.normal },
+          magnitude: value,
+          direction: [0, 0, 0],
+          secondary: type === "convection" ? study.thermal?.ambient ?? 22 : undefined,
+          label: `${title} ${fmt(value, type === "temperature" ? 1 : 3)} ${type === "temperature" ? "°C" : type === "heatflux" ? "W/mm²" : "W/mm²·K"}`,
+        });
+        this.invalidateStudy(study);
+        this.commit(before);
+        this.refreshTree();
+        this.refreshScene();
+        this.refreshPickLists(study);
+        toast(`${title} added on face ${pick.faceIndex + 1}.`, "success");
+      })();
+    };
+    this.command = { kind: "pressure-pick", onFace: addLoad };
+    this.viewport.setPickFilter("face");
+    this.shell.setHint(`Click a face to apply ${title.toLowerCase()}. Press Esc or Done when finished.`);
+    this.showPanel({
+      icon: type === "temperature" ? "thermometer" : type === "convection" ? "wind" : "flame",
+      title,
+      sub: "Select a face",
+      okTitle: "Done",
+      cancel: false,
+      body: pmSection(
+        "Thermal Loads",
+        "thermometer",
+        `<div class="selection-list" id="pm-load-list"></div>
+        <div class="hint" style="margin-top:6px">${
+          type === "temperature"
+            ? "A prescribed temperature fixes the boundary nodes."
+            : type === "heatflux"
+              ? "Heat flux enters through the selected boundary triangles."
+              : "Convection applies a film coefficient h and the ambient temperature."
+        }</div>`,
+      ),
       onMount: () => {
         this.refreshPickLists(study);
         this.bindPickListRemoval(study);
@@ -4377,16 +5824,17 @@ export class App {
       return;
     }
     this.shell.setKernel("FEA meshing", "busy");
-    this.shell.setStatus("Generating hexahedral mesh…");
+    this.shell.setStatus(`Generating ${study.meshKind === "hex" ? "hexahedral" : "tetrahedral"} mesh…`);
     try {
       const stats = await this.fea.mesh(
-        { positions: mesh.positions, indices: mesh.indices, meshSize: study.meshSize },
+        { positions: mesh.positions, indices: mesh.indices, meshSize: study.meshSize, meshKind: study.meshKind ?? "hex" },
         (phase, percent) => {
           this.shell.setKernel(`FEA ${Math.round(percent)}%`, "busy");
           this.shell.setStatus(`${phase}… ${Math.round(percent)}%`);
         },
       );
       study.meshStats = { nodes: stats.nodes, elements: stats.elements };
+      study.meshMetrics = stats.metrics;
       study.status = "meshed";
       study.error = undefined;
       this.refreshTree();
@@ -4411,12 +5859,17 @@ export class App {
       toast("The FEA solver is already running.", "warn");
       return;
     }
-    if (study.supports.length === 0) {
-      toast("Add at least one Fixed Support before solving.", "warn");
+    const analysisType = study.analysisType ?? "static";
+    if (study.supports.length === 0 && analysisType !== "thermal") {
+      toast("Add at least one support before solving.", "warn");
       return;
     }
-    if (study.loads.length === 0) {
-      toast("Add at least one Force or Pressure before solving.", "warn");
+    if (study.loads.length === 0 && analysisType !== "modal") {
+      toast(analysisType === "thermal" ? "Add a temperature, heat flux or convection load before solving." : "Add at least one load before solving.", "warn");
+      return;
+    }
+    if (analysisType === "modal" && study.supports.length === 0) {
+      toast("Add at least one support for the modal study.", "warn");
       return;
     }
     const mesh = this.meshForPart(study.partId);
@@ -4430,19 +5883,37 @@ export class App {
       faceIndex: load.faceIndex,
       magnitude: load.magnitude,
       direction: load.direction,
+      secondary: load.secondary,
     }));
     this.shell.setKernel("FEA 0%", "busy");
     this.shell.setStatus("Meshing and solving…");
     try {
       const outcome = await this.fea.solve(
         {
-          material: { E: material.E, nu: material.nu, yield: material.yield },
+          material: {
+            E: material.E,
+            nu: material.nu,
+            yield: material.yield,
+            density: material.density,
+            conductivity: material.conductivity,
+          },
           positions: mesh.positions,
           indices: mesh.indices,
           triFaceIds: mesh.triFaceIds,
           supportFaces: study.supports.map((support) => support.faceIndex),
+          supports: study.supports.map((support) => ({
+            faceIndex: support.faceIndex,
+            kind: support.kind ?? "fixed",
+            dofs: support.dofs,
+            values: support.values,
+          })),
           loads,
           meshSize: study.meshSize,
+          meshKind: study.meshKind ?? "hex",
+          analysisType,
+          localSizing: (study.localSizing ?? []).map((zone) => ({ faceIndex: zone.faceIndex, size: zone.size })),
+          modeCount: study.modeCount ?? 6,
+          ambient: study.thermal?.ambient ?? 22,
         },
         (phase, percent) => {
           this.shell.setKernel(`FEA ${Math.round(percent)}%`, "busy");
@@ -4453,19 +5924,49 @@ export class App {
       study.status = "solved";
       study.stale = false;
       study.meshStats = { nodes: outcome.nodes, elements: outcome.elements };
+      study.meshMetrics = outcome.result.meshMetrics;
       study.error = undefined;
+      study.resultSummary = {
+        maxDisplacement: outcome.result.maxDisplacement,
+        maxStress: outcome.result.maxStress,
+        safetyFactor: Number.isFinite(outcome.result.safetyFactor) ? outcome.result.safetyFactor : 0,
+        reactionX: outcome.result.reaction[0],
+        reactionY: outcome.result.reaction[1],
+        reactionZ: outcome.result.reaction[2],
+        f1: outcome.result.frequencies?.[0] ?? 0,
+        buckling: Number.isFinite(outcome.result.bucklingMultiplier ?? Infinity) ? outcome.result.bucklingMultiplier ?? 0 : 0,
+      };
       this.resultScale = 1;
-      this.activeResult = "stress";
+      this.resultView.setModeIndex(0);
+      const mode: ResultMode =
+        analysisType === "thermal"
+          ? "temperature"
+          : analysisType === "modal"
+            ? "mode"
+            : analysisType === "buckling"
+              ? "buckling"
+              : "stress";
+      this.activeResult = mode;
       this.toolbarMode = null;
       this.refreshScene();
-      this.showResult("stress");
+      this.showResult(mode);
       this.viewport.zoomFit(false);
       this.refreshTree();
-      toast(
-        `Solved in ${(outcome.result.solveMs / 1000).toFixed(2)} s · max ${fmt(outcome.result.maxStress, 2)} MPa · SF ${Number.isFinite(outcome.result.safetyFactor) ? fmt(outcome.result.safetyFactor, 2) : "∞"}`,
-        "success",
-        8000,
-      );
+      let summary: string;
+      if (analysisType === "modal") {
+        summary = `f₁ ${fmt(outcome.result.frequencies?.[0] ?? 0, 2)} Hz · ${outcome.result.frequencies?.length ?? 0} modes`;
+      } else if (analysisType === "thermal") {
+        const t = outcome.result.temperature;
+        let lo = Infinity;
+        let hi = -Infinity;
+        if (t) for (const value of t) { lo = Math.min(lo, value); hi = Math.max(hi, value); }
+        summary = `${fmt(lo, 1)} … ${fmt(hi, 1)} °C`;
+      } else if (analysisType === "buckling") {
+        summary = `load multiplier ${Number.isFinite(outcome.result.bucklingMultiplier ?? Infinity) ? fmt(outcome.result.bucklingMultiplier ?? 0, 3) : "∞"}`;
+      } else {
+        summary = `max ${fmt(outcome.result.maxStress, 2)} MPa · SF ${Number.isFinite(outcome.result.safetyFactor) ? fmt(outcome.result.safetyFactor, 2) : "∞"}`;
+      }
+      toast(`Solved in ${(outcome.result.solveMs / 1000).toFixed(2)} s · ${summary}`, "success", 8000);
       this.openStudyPanel();
     } catch (error) {
       study.status = "failed";
@@ -4513,6 +6014,10 @@ export class App {
     }
     this.activeResult = mode;
     this.resultView.setResult(result, this.materialForStudy(study).yield);
+    this.resultView.clearProbe();
+    this.probeText = "";
+    this.stopResultAnimation();
+    this.resultView.setAnimation(false);
     const display = this.renderResultUi(mode);
     if (!display) return;
     this.shell.showResultToolbar(this.resultToolbarHtml(mode));
@@ -4539,18 +6044,48 @@ export class App {
   }
 
   private resultToolbarHtml(mode: ResultMode): string {
+    const study = this.activeStudy();
+    const result = study ? this.feaResults.get(study.id) : undefined;
     const btn = (value: ResultMode, label: string, iconName: string) =>
       `<button class="mini-btn ${mode === value ? "active" : ""}" data-result-mode="${value}">${icon(iconName)} ${label}</button>`;
+    const hasTemperature = !!result?.temperature;
+    const hasModes = !!result?.modeShapes?.length;
+    const hasBuckling = result?.bucklingMode !== undefined;
+    const modeIndex = this.resultView.getModeIndex();
     return `
       <div class="rt-group">
         <span class="rt-label">Deform scale</span>
         <input id="rt-scale" type="range" min="20" max="400" step="10" value="${Math.round(this.resultScale * 100)}" />
         <span class="rt-value" id="rt-scale-value">${this.resultScale.toFixed(1)}×</span>
       </div>
-      <div class="rt-group">
+      <div class="rt-group rt-modes">
         ${btn("deformation", "Deformation", "activity")}
+        ${btn("directional-x", "UX", "move-horizontal")}
+        ${btn("directional-y", "UY", "move-vertical")}
+        ${btn("directional-z", "UZ", "move-3d")}
         ${btn("stress", "von Mises", "flame")}
+        ${btn("max-principal", "Max Principal", "arrow-up")}
+        ${btn("min-principal", "Min Principal", "arrow-down")}
+        ${btn("shear", "Shear", "split")}
         ${btn("safety", "Safety", "gauge")}
+        ${btn("reaction", "Reaction", "anchor")}
+        ${hasTemperature ? btn("temperature", "Temperature", "thermometer") : ""}
+        ${hasModes ? btn("mode", "Mode Shape", "audio-waveform") : ""}
+        ${hasBuckling ? btn("buckling", "Buckling", "arrow-down") : ""}
+      </div>
+      ${
+        hasModes && mode === "mode"
+          ? `<div class="rt-group"><span class="rt-label">Mode</span><select id="rt-mode-index">${(result?.frequencies ?? [])
+              .map((frequency, index) => `<option value="${index}" ${index === modeIndex ? "selected" : ""}>${index + 1} · ${frequency.toFixed(2)} Hz</option>`)
+              .join("")}</select></div>`
+          : ""
+      }
+      <div class="rt-group">
+        <button class="mini-btn" data-result-animate>${icon("play")} ${this.resultView.getAnimationState().active ? "Pause" : "Animate"}</button>
+        <button class="mini-btn ${this.resultView.isUndeformedWireframeVisible() ? "active" : ""}" data-result-undeformed>${icon("box")} Undeformed</button>
+        <button class="mini-btn ${this.resultView.isMinMaxVisible() ? "active" : ""}" data-result-minmax>${icon("flag")} Min/Max</button>
+        <button class="mini-btn ${this.resultProbeActive ? "active" : ""}" data-result-probe>${icon("crosshair")} Probe</button>
+        <span class="rt-value" id="rt-probe-value">${this.probeText}</span>
       </div>
       <div class="rt-group">
         <button class="mini-btn" data-result-body>${icon("box")} Show Body</button>
@@ -4569,12 +6104,69 @@ export class App {
     host.querySelectorAll<HTMLElement>("[data-result-mode]").forEach((button) => {
       button.addEventListener("click", () => this.showResult(button.dataset.resultMode as ResultMode));
     });
+    host.querySelector<HTMLSelectElement>("#rt-mode-index")?.addEventListener("change", (event) => {
+      this.resultView.setModeIndex(Number((event.target as HTMLSelectElement).value) || 0);
+      if (this.activeResult) this.showResult(this.activeResult);
+    });
+    host.querySelector<HTMLElement>("[data-result-animate]")?.addEventListener("click", () => {
+      const active = !this.resultView.getAnimationState().active;
+      this.resultView.setAnimation(active);
+      if (active) this.startResultAnimation();
+      else this.stopResultAnimation();
+      this.toolbarMode = null;
+      if (this.activeResult) this.shell.showResultToolbar(this.resultToolbarHtml(this.activeResult));
+      this.bindResultToolbar();
+    });
+    host.querySelector<HTMLElement>("[data-result-undeformed]")?.addEventListener("click", () => {
+      this.resultView.setUndeformedWireframe(!this.resultView.isUndeformedWireframeVisible());
+      this.toolbarMode = null;
+      if (this.activeResult) this.shell.showResultToolbar(this.resultToolbarHtml(this.activeResult));
+      this.bindResultToolbar();
+    });
+    host.querySelector<HTMLElement>("[data-result-minmax]")?.addEventListener("click", () => {
+      this.resultView.setMinMaxFlags(!this.resultView.isMinMaxVisible());
+      const extrema = this.resultView.getFieldExtrema();
+      if (extrema && this.resultView.isMinMaxVisible()) {
+        toast(`Min ${fmt(extrema.min, 3)} at node ${extrema.minNode + 1} · Max ${fmt(extrema.max, 3)} at node ${extrema.maxNode + 1}`, "info", 6000);
+      }
+      this.toolbarMode = null;
+      if (this.activeResult) this.shell.showResultToolbar(this.resultToolbarHtml(this.activeResult));
+      this.bindResultToolbar();
+    });
+    host.querySelector<HTMLElement>("[data-result-probe]")?.addEventListener("click", () => {
+      this.resultProbeActive = !this.resultProbeActive;
+      if (!this.resultProbeActive) {
+        this.resultView.clearProbe();
+        this.probeText = "";
+      }
+      this.toolbarMode = null;
+      if (this.activeResult) this.shell.showResultToolbar(this.resultToolbarHtml(this.activeResult));
+      this.bindResultToolbar();
+      this.shell.setHint(this.resultProbeActive ? "Click the result surface to pin a probe. Esc hides it." : "");
+    });
     host.querySelector<HTMLElement>("[data-result-body]")?.addEventListener("click", () => this.hideResult());
+  }
+
+  private startResultAnimation(): void {
+    this.stopResultAnimation();
+    this.animationStart = performance.now();
+    this.animationTimer = window.setInterval(() => {
+      const phase = ((performance.now() - this.animationStart) / 1800) % 1;
+      this.resultView.setAnimationPhase(phase);
+    }, 40);
+  }
+
+  private stopResultAnimation(): void {
+    if (this.animationTimer) window.clearInterval(this.animationTimer);
+    this.animationTimer = 0;
   }
 
   private hideResult(): void {
     this.activeResult = null;
     this.toolbarMode = null;
+    this.stopResultAnimation();
+    this.resultProbeActive = false;
+    this.probeText = "";
     this.resultView.clear();
     this.shell.showColorbar(null);
     this.shell.showResultToolbar(null);
@@ -5680,6 +7272,46 @@ export class App {
       case "tool-arc":
         this.setSketchTool("arc");
         break;
+      case "tool-slot":
+        this.setSketchTool("slot");
+        break;
+      case "tool-polygon":
+        this.setSketchTool("polygon");
+        break;
+      case "tool-spline":
+        this.setSketchTool("spline");
+        break;
+      case "sketch-fillet":
+      case "sketch-chamfer":
+        if (!this.editor.isActive) {
+          toast("Open a sketch first.", "info");
+          break;
+        }
+        void promptNumber({
+          title: action === "sketch-fillet" ? "Sketch Fillet" : "Sketch Chamfer",
+          label: action === "sketch-fillet" ? "Fillet radius" : "Chamfer distance",
+          value: this.editor.cornerSize,
+          unit: "mm",
+          min: 0.01,
+          step: 0.5,
+        }).then((value) => {
+          if (value === null) return;
+          this.editor.cornerSize = value;
+          if (this.editor.applySketchCorner(action === "sketch-fillet" ? "fillet" : "chamfer", value)) {
+            this.sketchDirty = true;
+            this.updateSketchPanelInfo();
+            this.refreshTree();
+            toast(`${action === "sketch-fillet" ? "Fillet" : "Chamfer"} ${fmt(value, 2)} mm applied.`, "success");
+          }
+        });
+        break;
+      case "sketch-pattern":
+        if (!this.editor.isActive) {
+          toast("Open a sketch first.", "info");
+          break;
+        }
+        void this.openSketchPattern();
+        break;
       case "tool-dimension":
         this.setSketchTool("dimension");
         break;
@@ -5764,6 +7396,30 @@ export class App {
       case "linear-pattern":
         this.openPattern();
         break;
+      case "circular-pattern":
+        this.openCircularPattern();
+        break;
+      case "sweep":
+        this.openSweep();
+        break;
+      case "loft":
+        this.openLoft();
+        break;
+      case "helix":
+        this.openHelix();
+        break;
+      case "hole-wizard":
+        this.openHoleWizard();
+        break;
+      case "draft":
+        this.openDraft();
+        break;
+      case "rib":
+        this.openRib();
+        break;
+      case "reference-geometry":
+        this.openReferenceGeometry();
+        break;
       case "section-view":
         this.openSection();
         break;
@@ -5828,6 +7484,12 @@ export class App {
         break;
       case "mate-distance":
         this.openMate("distance");
+        break;
+      case "mate-angle":
+        this.openMate("angle");
+        break;
+      case "exploded-view":
+        this.openExplodedView();
         break;
       case "resolve-mates":
         this.resolveMates();

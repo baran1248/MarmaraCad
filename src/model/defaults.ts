@@ -138,6 +138,13 @@ export function nextFeatureName(type: string, features: { type: string; name: st
     shell: "Shell",
     mirror: "Mirror",
     pattern: "LPattern",
+    sweep: "Sweep",
+    loft: "Loft",
+    circularPattern: "CPattern",
+    hole: "Hole",
+    draft: "Draft",
+    rib: "Rib",
+    helix: "Helix",
     imported: "Imported Body",
   };
   const prefix = base[type] ?? type;

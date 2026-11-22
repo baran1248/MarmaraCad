@@ -243,7 +243,11 @@ try {
     const front = [...mesh.edges]
       .filter((e) => xSpan(e) > 5 && zSpan(e) < 0.05 && ySpan(e) < 0.05)
       .sort((a, b) => b.points[0][2] - a.points[0][2])[0];
-    const p = front.points[Math.floor(front.points.length / 2)];
+    // True midpoint: the previous `points[floor(n/2)]` landed on the end vertex
+    // of a two-point edge, where a perpendicular edge competes for the pick.
+    const a = front.points[0];
+    const b = front.points[front.points.length - 1];
+    const p = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
     const s = vp.projectToScreen(p);
     return { x: rect.left + s.x, y: rect.top + s.y, span: xSpan(front), z: p[2] };
   });

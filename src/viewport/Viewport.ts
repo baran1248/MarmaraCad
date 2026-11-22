@@ -8,6 +8,8 @@ export type ViewName = "front" | "back" | "top" | "bottom" | "right" | "left" | 
 export type DisplayStyle = "shaded-edges" | "shaded" | "wireframe";
 export type PickFilter = "face" | "edge" | "vertex" | "all" | "none";
 export type NavScheme = "cad" | "legacy";
+export type ControlMode = "mouse" | "trackpad" | "pen";
+export type MousePreset = "solidworks" | "fusion" | "ansys";
 export type SectionAxis = "x" | "y" | "z";
 
 export interface SectionState {
@@ -120,6 +122,7 @@ export class Viewport {
   private bodies = new Map<string, BodyView>();
   private root = new THREE.Group();
   private planeGroup = new THREE.Group();
+  private referenceGroup = new THREE.Group();
   private sketchGroup = new THREE.Group();
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
@@ -131,6 +134,14 @@ export class Viewport {
   private displayStyle: DisplayStyle = "shaded-edges";
   private sketchPlane: SketchPlane | null = null;
   private navScheme: NavScheme = "cad";
+  private controlMode: ControlMode = "mouse";
+  private mousePreset: MousePreset = "solidworks";
+  private touchPointers = new Map<number, { x: number; y: number }>();
+  private penTimer = 0;
+  private penStart: { x: number; y: number } | null = null;
+  private customDrag: { kind: "orbit" | "pan"; x: number; y: number } | null = null;
+  private lastPinch = 0;
+  readonly debugControl = { orbits: 0, pans: 0, zooms: 0, pinches: 0, penDown: 0, touches: 0 };
   private fitted = false;
   private down: { x: number; y: number; button: number } | null = null;
   private band: { startX: number; startY: number; el: HTMLDivElement; crossing: boolean } | null = null;
@@ -165,6 +176,7 @@ export class Viewport {
     this.scene = new THREE.Scene();
     this.scene.add(this.root);
     this.scene.add(this.planeGroup);
+    this.scene.add(this.referenceGroup);
     this.scene.add(this.sketchGroup);
     this.scene.add(this.vertexGroup);
 
@@ -191,6 +203,8 @@ export class Viewport {
     this.renderer.domElement.addEventListener("pointerup", this.handlePointerUp);
     this.renderer.domElement.addEventListener("pointermove", this.handlePointerMove);
     this.renderer.domElement.addEventListener("pointerleave", this.handlePointerLeave);
+    this.renderer.domElement.addEventListener("pointercancel", this.handlePointerCancel);
+    this.renderer.domElement.style.touchAction = "none";
     this.renderer.domElement.addEventListener("wheel", this.handleWheel, { passive: false });
     this.renderer.domElement.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -210,40 +224,88 @@ export class Viewport {
     this.applyNavScheme();
   }
 
+  setControlMode(mode: ControlMode): void {
+    this.controlMode = mode;
+    this.touchPointers.clear();
+    this.customDrag = null;
+    this.applyNavScheme();
+  }
+
+  setMousePreset(preset: MousePreset): void {
+    this.mousePreset = preset;
+    this.applyNavScheme();
+  }
+
+  getControlState(): { mode: ControlMode; preset: MousePreset; navScheme: NavScheme } {
+    return { mode: this.controlMode, preset: this.mousePreset, navScheme: this.navScheme };
+  }
+
   private applyNavScheme(): void {
+    this.controls.enabled = this.controlMode === "mouse";
+    this.controls.enableZoom = false;
     if (this.sketchPlane) {
       this.controls.mouseButtons.LEFT = null as unknown as THREE.MOUSE;
       this.controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
       this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
       return;
     }
+    if (this.controlMode !== "mouse") {
+      // Touch/pen navigation is handled by the Pointer Events code below; the
+      // OrbitControls mouse mapping must not fight it.
+      this.controls.mouseButtons.LEFT = null as unknown as THREE.MOUSE;
+      this.controls.mouseButtons.MIDDLE = null as unknown as THREE.MOUSE;
+      this.controls.mouseButtons.RIGHT = null as unknown as THREE.MOUSE;
+      return;
+    }
     if (this.navScheme === "legacy") {
       this.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
       this.controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
       this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
-    } else {
-      this.controls.mouseButtons.LEFT = null as unknown as THREE.MOUSE;
-      this.controls.mouseButtons.MIDDLE = THREE.MOUSE.ROTATE;
-      this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+      return;
     }
-    this.controls.enableZoom = false;
+    this.controls.mouseButtons.LEFT = null as unknown as THREE.MOUSE;
+    this.controls.mouseButtons.RIGHT = null as unknown as THREE.MOUSE;
+    // Middle-button orbit/pan for all three presets is implemented in
+    // handlePointerDown (customDrag), so OrbitControls must not also react.
+    this.controls.mouseButtons.MIDDLE = null as unknown as THREE.MOUSE;
   }
 
-  /** Cursor-anchored dolly: the point under the pointer stays put while zooming. */
-  private handleWheel = (e: WheelEvent): void => {
-    e.preventDefault();
-    e.stopPropagation();
+  private orbitBy(dx: number, dy: number): void {
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const spherical = new THREE.Spherical().setFromVector3(offset);
+    spherical.theta -= dx * 0.005;
+    spherical.phi = clampNumber(spherical.phi - dy * 0.005, 0.05, Math.PI - 0.05);
+    offset.setFromSpherical(spherical);
+    this.camera.position.copy(this.controls.target).add(offset);
+    this.camera.up.set(0, 1, 0);
+    this.camera.lookAt(this.controls.target);
+    this.controls.update();
+    this.debugControl.orbits++;
+    this.onCameraChange?.();
+  }
+
+  private panBy(dx: number, dy: number): void {
+    const scale = this.worldPerPixel();
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+    const move = right.multiplyScalar(-dx * scale).add(up.multiplyScalar(dy * scale));
+    this.controls.target.add(move);
+    this.camera.position.add(move);
+    this.controls.update();
+    this.debugControl.pans++;
+    this.onCameraChange?.();
+  }
+
+  /** Cursor-anchored dolly shared by mouse wheel, pinch and keyboard zoom. */
+  zoomToward(clientX: number, clientY: number, factor: number): void {
     const before = this.camera.position.distanceTo(this.controls.target);
-    const factor = Math.exp(clampNumber(e.deltaY * 0.0011, -0.6, 0.6));
     const dist = clampNumber(before * factor, this.controls.minDistance, this.controls.maxDistance);
     const dir = this.camera.position.clone().sub(this.controls.target);
     if (dir.lengthSq() < 1e-9) dir.set(1, 0.8, 1);
     dir.normalize();
-
-    // World point under the cursor on the plane through the orbit target.
     const rect = this.renderer.domElement.getBoundingClientRect();
-    this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
       this.camera.position.clone().sub(this.controls.target).normalize(),
@@ -256,7 +318,32 @@ export class Viewport {
     }
     this.camera.position.copy(this.controls.target).addScaledVector(dir, dist);
     this.controls.update();
+    this.debugControl.zooms++;
     this.onCameraChange?.();
+  }
+
+  /** Wheel routing follows the Shapr3D control mode:
+   *  mouse = zoom, trackpad = two-finger orbit (Shift pan, Ctrl/pinch zoom),
+   *  pen = wheel zoom for hybrid pens that emit wheel events. */
+  private handleWheel = (e: WheelEvent): void => {
+    e.preventDefault();
+    e.stopPropagation();
+    const scale = e.deltaMode === 1 ? 18 : e.deltaMode === 2 ? 300 : 1;
+    const dx = e.deltaX * scale;
+    const dy = e.deltaY * scale;
+    if (this.controlMode === "trackpad" && !e.ctrlKey) {
+      if (e.shiftKey || Math.abs(dx) > Math.abs(dy) * 1.8) {
+        this.panBy(-dx * 0.9, -dy * 0.9);
+      } else {
+        this.orbitBy(dx * 0.55, dy * 0.55);
+      }
+      return;
+    }
+    const factor = Math.exp(clampNumber(dy * 0.0011, -0.6, 0.6));
+    this.zoomToward(e.clientX, e.clientY, factor);
+    // Ctrl+wheel is the trackpad pinch gesture; keep it visible to the debug
+    // hook and the status HUD alongside a plain wheel zoom.
+    if (e.ctrlKey) this.debugControl.pinches++;
   };
 
   /** Record the section state. The actual cut is produced on the CPU by
@@ -330,8 +417,69 @@ export class Viewport {
   }
 
   setPlanesVisible(visible: boolean): void {
+    this.planesVisibleState = visible;
     this.planeGroup.visible = visible;
+    this.referenceGroup.visible = visible;
   }
+
+  /** Show user-created reference planes and axes. */
+  setReferenceGeometry(
+    planes: { id: string; name: string; origin: Vec3; u: Vec3; v: Vec3; n: Vec3; visible: boolean }[],
+    axes: { id: string; origin: Vec3; direction: Vec3; visible: boolean }[],
+  ): void {
+    while (this.referenceGroup.children.length) {
+      const child = this.referenceGroup.children.pop()!;
+      const mesh = child as THREE.Mesh;
+      mesh.geometry?.dispose?.();
+      if (Array.isArray(mesh.material)) mesh.material.forEach((m) => m.dispose());
+      else (mesh.material as THREE.Material | undefined)?.dispose?.();
+    }
+    const size = 46;
+    for (const plane of planes) {
+      if (!plane.visible) continue;
+      const geometry = new THREE.PlaneGeometry(size, size);
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xb98b3f,
+        transparent: true,
+        opacity: 0.16,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      const u = new THREE.Vector3(...plane.u).normalize();
+      const v = new THREE.Vector3(...plane.v).normalize();
+      const n = new THREE.Vector3(...plane.n).normalize();
+      mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(u, v, n));
+      mesh.position.set(...plane.origin);
+      this.referenceGroup.add(mesh);
+      const border = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(-size / 2, -size / 2, 0),
+          new THREE.Vector3(size / 2, -size / 2, 0),
+          new THREE.Vector3(size / 2, size / 2, 0),
+          new THREE.Vector3(-size / 2, size / 2, 0),
+          new THREE.Vector3(-size / 2, -size / 2, 0),
+        ]),
+        new THREE.LineBasicMaterial({ color: 0xb98b3f, transparent: true, opacity: 0.75 }),
+      );
+      border.quaternion.copy(mesh.quaternion);
+      border.position.copy(mesh.position);
+      this.referenceGroup.add(border);
+    }
+    for (const axis of axes) {
+      if (!axis.visible) continue;
+      const dir = new THREE.Vector3(...axis.direction).normalize();
+      const origin = new THREE.Vector3(...axis.origin);
+      const geometry = new THREE.BufferGeometry().setFromPoints([
+        origin.clone().addScaledVector(dir, -size / 2),
+        origin.clone().addScaledVector(dir, size / 2),
+      ]);
+      this.referenceGroup.add(new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x8a5a2b })));
+    }
+    this.referenceGroup.visible = this.planesVisibleState;
+  }
+
+  private planesVisibleState = false;
 
   /** Replace the rendered bodies. Reuses bodies whose key matches to avoid flicker. */
   setBodies(list: SceneBody[]): void {
@@ -936,25 +1084,84 @@ export class Viewport {
   }
 
   private pickEdge(): EdgePick | null {
+    return this.pickEdges()[0] ?? null;
+  }
+
+  /** Every edge under the cursor, nearest first. Convert Entities needs this:
+   *  a click exactly on a corner can hit an edge that is perpendicular to the
+   *  sketch plane, and projecting that one would only yield a zero-length line. */
+  raycastEdgesAt(clientX: number, clientY: number): EdgePick[] {
+    this.updatePointerAt(clientX, clientY);
+    return this.pickEdges();
+  }
+
+  private pickEdges(): EdgePick[] {
     this.raycaster.params.Line = { threshold: Math.max(0.25, this.modelRadius() * 0.014) };
     const hits = this.raycaster.intersectObjects(this.edgeLines(), false);
+    const out: EdgePick[] = [];
+    const seen = new Set<string>();
     for (const hit of hits) {
       const line = hit.object as THREE.Line;
       if (!line.userData.pickEdge) continue;
       const key = line.userData.key as string;
       const view = this.bodies.get(key);
-      return {
+      const edgeIndex = line.userData.edgeIndex as number;
+      const id = `${key}:${edgeIndex}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({
         componentId: view?.componentId ?? null,
         partId: view?.partId ?? "",
-        edgeIndex: line.userData.edgeIndex as number,
+        edgeIndex,
         edge: line.userData.edge as EdgeInfo,
-      };
+      });
     }
-    return null;
+    return out;
   }
 
   private handlePointerDown = (e: PointerEvent): void => {
+    if (e.pointerType === "touch") {
+      this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      this.debugControl.touches++;
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+      } catch {
+        /* Synthetic pointer events have no active pointer to capture. */
+      }
+      if (this.touchPointers.size === 2) {
+        const [a, b] = [...this.touchPointers.values()];
+        this.lastPinch = Math.hypot(a.x - b.x, a.y - b.y);
+      }
+      e.preventDefault();
+      return;
+    }
+    if (e.pointerType === "pen") {
+      this.debugControl.penDown++;
+      this.penStart = { x: e.clientX, y: e.clientY };
+      this.cancelPenTimer();
+      // A pen barrel/side button and a press-and-hold open the context menu in
+      // exactly the same way as a right-click.
+      this.penTimer = window.setTimeout(() => {
+        this.penTimer = 0;
+        if (this.penStart) this.openContextMenu({ clientX: this.penStart.x, clientY: this.penStart.y } as MouseEvent);
+      }, 620);
+    }
     this.down = { x: e.clientX, y: e.clientY, button: e.button };
+    // In the CAD mouse scheme OrbitControls no longer drives the middle button:
+    // every preset route goes through customDrag, so the orbit/pan feel is
+    // identical across SolidWorks, Fusion and Ansys (and it is observable).
+    const cadMouse = this.controlMode === "mouse" && this.navScheme === "cad" && !this.sketchPlane;
+    const wantsPan = e.button === 1 && (e.ctrlKey || e.metaKey || (cadMouse && this.mousePreset === "fusion" && !e.shiftKey));
+    const wantsOrbit =
+      e.button === 1 &&
+      cadMouse &&
+      ((this.mousePreset === "fusion" && e.shiftKey) || (this.mousePreset !== "fusion" && !e.ctrlKey && !e.metaKey));
+    if ((wantsPan || wantsOrbit) && !this.sketchPlane) {
+      e.preventDefault();
+      this.controls.enabled = false;
+      this.customDrag = { kind: wantsPan ? "pan" : "orbit", x: e.clientX, y: e.clientY };
+      return;
+    }
     if (e.button === 0 && this.pickFilter !== "none" && !this.sketchPlane) {
       // A left drag on the canvas is a window/crossing selection in CAD mode;
       // orbit stays on the middle mouse button.
@@ -963,6 +1170,22 @@ export class Viewport {
   };
 
   private handlePointerUp = (e: PointerEvent): void => {
+    if (e.pointerType === "touch") {
+      this.touchPointers.delete(e.pointerId);
+      this.lastPinch = 0;
+      if (this.touchPointers.size === 0) this.down = null;
+      return;
+    }
+    if (this.penTimer) {
+      this.cancelPenTimer();
+      if (this.penStart && e.type === "pointerup") this.penStart = null;
+    }
+    if (this.customDrag) {
+      this.customDrag = null;
+      this.down = null;
+      this.controls.enabled = this.controlMode === "mouse";
+      return;
+    }
     if (!this.down || e.button !== 0) {
       this.down = null;
       if (this.band) this.cancelBand();
@@ -1119,6 +1342,26 @@ export class Viewport {
     this.onBoxSelect?.({ faces, edges, vertices, crossing });
   }
 
+  private cancelPenTimer(): void {
+    if (this.penTimer) {
+      window.clearTimeout(this.penTimer);
+      this.penTimer = 0;
+    }
+  }
+
+  private handlePointerCancel = (e: PointerEvent): void => {
+    this.touchPointers.delete(e.pointerId);
+    this.lastPinch = 0;
+    if (this.customDrag) {
+      this.customDrag = null;
+      this.controls.enabled = this.controlMode === "mouse";
+    }
+    this.cancelPenTimer();
+    this.penStart = null;
+    this.down = null;
+    if (this.band) this.cancelBand();
+  };
+
   private openContextMenu(e: MouseEvent): void {
     this.updatePointerAt(e.clientX, e.clientY);
     const vertex = this.pickVertex(e.clientX, e.clientY);
@@ -1132,6 +1375,41 @@ export class Viewport {
   }
 
   private handlePointerMove = (e: PointerEvent): void => {
+    if (e.pointerType === "pen" && this.penStart && Math.hypot(e.clientX - this.penStart.x, e.clientY - this.penStart.y) > 6) {
+      this.cancelPenTimer();
+      this.penStart = null;
+    }
+    if (e.pointerType === "touch") {
+      const before = this.touchPointers.get(e.pointerId);
+      if (!before) return;
+      this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.touchPointers.size >= 2) {
+        const [a, b] = [...this.touchPointers.values()];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        const midX = (a.x + b.x) / 2;
+        const midY = (a.y + b.y) / 2;
+        // Move the centroid while pinching: two-finger pan + zoom.
+        this.panBy(e.clientX - before.x, e.clientY - before.y);
+        if (this.lastPinch > 4 && dist > 4) {
+          this.zoomToward(midX, midY, this.lastPinch / dist);
+          this.debugControl.pinches++;
+        }
+        this.lastPinch = dist;
+      } else {
+        this.orbitBy(e.clientX - before.x, e.clientY - before.y);
+      }
+      e.preventDefault();
+      return;
+    }
+    if (this.customDrag) {
+      const dx = e.clientX - this.customDrag.x;
+      const dy = e.clientY - this.customDrag.y;
+      this.customDrag.x = e.clientX;
+      this.customDrag.y = e.clientY;
+      if (this.customDrag.kind === "pan") this.panBy(dx, dy);
+      else this.orbitBy(dx, dy);
+      return;
+    }
     if (this.band) {
       this.updateBand(e);
       return;

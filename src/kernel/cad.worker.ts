@@ -3,7 +3,7 @@
  * UI thread never blocks on the CAD kernel. */
 import { getOcct, occtCacheInfo } from "./occt";
 import type { ExportRequest, ImportRequest, KernelResponse, RebuildRequest } from "./protocol";
-import type { EdgeInfo, FaceInfo, Feature, MeshData, Part, RebuildPart, Sketch, SketchPlane, Vec3 } from "../model/types";
+import type { EdgeInfo, FaceInfo, Feature, MeshData, Part, RebuildPart, Sketch, SketchPlane, Vec2, Vec3 } from "../model/types";
 import { buildProfileGroups, planePoint, type ProfileGroup, type ProfileLoop } from "../sketch/geometry";
 
 let oc: any = null;
@@ -238,6 +238,319 @@ function patternFeature(shape: any, feature: Feature): any {
     copies.push(new oc.BRepBuilderAPI_Transform_2(shape, trsf, true).Shape());
   }
   return fuseShapes(copies);
+}
+
+/** Try a set of OCCT constructors; opencascade.js suffixes overloads with `_n`
+ *  and the numbering differs between releases. */
+function tryMake<T>(attempts: (() => T)[]): T {
+  let last: unknown = null;
+  for (const attempt of attempts) {
+    try {
+      const value = attempt();
+      if ((value as any)?.IsNull?.()) continue;
+      return value;
+    } catch (error) {
+      last = error;
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last ?? "OCCT operation failed."));
+}
+
+function tryCall(target: any, methods: string[], argsList: any[][]): any {
+  let last: unknown = null;
+  for (const method of methods) {
+    const fn = target?.[method];
+    if (typeof fn !== "function") continue;
+    for (const args of argsList) {
+      try {
+        return fn.apply(target, args);
+      } catch (error) {
+        last = error;
+      }
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last ?? "OCCT method failed."));
+}
+
+function basisFor(normal: Vec3): { u: Vec3; v: Vec3; n: Vec3 } {
+  const len = Math.hypot(...normal) || 1;
+  const n: Vec3 = [normal[0] / len, normal[1] / len, normal[2] / len];
+  const helper: Vec3 = Math.abs(n[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  const u: Vec3 = [
+    helper[1] * n[2] - helper[2] * n[1],
+    helper[2] * n[0] - helper[0] * n[2],
+    helper[0] * n[1] - helper[1] * n[0],
+  ];
+  const ul = Math.hypot(...u) || 1;
+  u[0] /= ul;
+  u[1] /= ul;
+  u[2] /= ul;
+  const v: Vec3 = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+  return { u, v, n };
+}
+
+/** A circular face on `planeNormal`, extruded into a solid along the normal. */
+function circleSolid(center: Vec3, planeNormal: Vec3, radius: number, height: number): any {
+  const ax = new oc.gp_Ax2_3(gpPnt(center), gpDir(planeNormal));
+  const circ = new oc.gp_Circ_2(ax, Math.max(1e-4, radius));
+  const edge = new oc.BRepBuilderAPI_MakeEdge_8(circ).Edge();
+  const wire = new oc.BRepBuilderAPI_MakeWire_2(edge).Wire();
+  const face = new oc.BRepBuilderAPI_MakeFace_15(wire, true).Face();
+  const prism = new oc.BRepPrimAPI_MakePrism_1(face, gpVec([
+    planeNormal[0] * height,
+    planeNormal[1] * height,
+    planeNormal[2] * height,
+  ]), false, true);
+  const shape = prism.Shape();
+  if (!shape || shape.IsNull()) throw new Error("Could not build the circular tool body.");
+  return shape;
+}
+
+function coneSolid(center: Vec3, planeNormal: Vec3, radius1: number, radius2: number, height: number): any {
+  const axis = new oc.gp_Ax2_3(gpPnt(center), gpDir(planeNormal));
+  const shape = tryMake<any>([
+    () => new oc.BRepPrimAPI_MakeCone_2(axis, radius1, radius2, height).Shape(),
+    () => new oc.BRepPrimAPI_MakeCone_1(radius1, radius2, height).Shape(),
+    () => new oc.BRepPrimAPI_MakeCone_3(axis, radius1, radius2, height, Math.PI * 2).Shape(),
+  ]);
+  return shape;
+}
+
+function polylineWire(points: Vec3[], closed: boolean): any {
+  if (points.length < 2) throw new Error("A sweep path needs at least two points.");
+  const poly = new oc.BRepBuilderAPI_MakePolygon_1();
+  for (const p of points) poly.Add_1(gpPnt(p));
+  if (closed) poly.Close();
+  if (!poly.IsDone()) throw new Error("Could not build the sweep path wire.");
+  return poly.Wire();
+}
+
+function faceFromLoopOnPlane(loop: ProfileLoop, plane: SketchPlane): any {
+  const wire = wireFromLoop(loop, plane, false);
+  return new oc.BRepBuilderAPI_MakeFace_15(wire, true).Face();
+}
+
+/** Sweep the profile sketch along the open path sketch. */
+function sweepFeature(part: RebuildPart, feature: Feature, shape: any): any {
+  const profile = part.sketches.find((s) => s.id === feature.sketchId);
+  const path = part.sketches.find((s) => s.id === feature.params.pathSketchId);
+  if (!profile) throw new Error("Sweep needs a profile sketch.");
+  if (!path) throw new Error("Sweep needs a path sketch. Create an open sketch and choose it as the path.");
+  const profileGroups = buildProfileGroups(profile);
+  if (profileGroups.groups.length === 0) throw new Error("The sweep profile sketch has no closed profile.");
+  const pathGroups = buildProfileGroups(path);
+  const chain = pathGroups.openChains[0];
+  if (!chain || chain.length < 2) throw new Error("The sweep path must be an open sketch curve.");
+  const points = chain.map((p) => planePoint(path.plane, p));
+  const spine = polylineWire(points, false);
+  const profileFace = faceFromLoopOnPlane(profileGroups.groups[0].outer, profile.plane);
+  const pipe = tryMake<any>([
+    () => {
+      const p = new oc.BRepOffsetAPI_MakePipe_1(spine, profileFace);
+      p.Build();
+      if (!p.IsDone()) throw new Error("Sweep failed.");
+      return p.Shape();
+    },
+    () => {
+      const p = new oc.BRepOffsetAPI_MakePipe_2(spine, profileFace, false);
+      p.Build();
+      if (!p.IsDone()) throw new Error("Sweep failed.");
+      return p.Shape();
+    },
+  ]);
+  return applyBoolean(shape, pipe, feature.params.operation === "cut" || feature.type === ("cut" as Feature["type"]));
+}
+
+/** Helical sweep with a circular wire cross-section (spring / thread body). */
+function helixFeature(feature: Feature, shape: any): any {
+  const diameter = Math.max(0.5, feature.params.helixDiameter ?? 20);
+  const pitch = Math.max(0.1, feature.params.helixPitch ?? 5);
+  const turns = Math.max(0.25, feature.params.helixTurns ?? 4);
+  const wireRadius = Math.max(0.05, feature.params.radius ?? 1.2);
+  const normal = feature.params.normal ?? [0, 1, 0];
+  const center = feature.params.center ?? [0, 0, 0];
+  const { u, v, n } = basisFor(normal);
+  const R = diameter / 2;
+  const hand = feature.params.helixHand === "left" ? -1 : 1;
+  const steps = Math.max(32, Math.ceil(turns * 32));
+  const points: Vec3[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = (i / steps) * turns;
+    const angle = hand * t * Math.PI * 2;
+    points.push([
+      center[0] + u[0] * Math.cos(angle) * R + v[0] * Math.sin(angle) * R + n[0] * pitch * t,
+      center[1] + u[1] * Math.cos(angle) * R + v[1] * Math.sin(angle) * R + n[1] * pitch * t,
+      center[2] + u[2] * Math.cos(angle) * R + v[2] * Math.sin(angle) * R + n[2] * pitch * t,
+    ]);
+  }
+  const spine = polylineWire(points, false);
+  const tangent: Vec3 = [
+    v[0] * R * Math.PI * 2 + n[0] * pitch,
+    v[1] * R * Math.PI * 2 + n[1] * pitch,
+    v[2] * R * Math.PI * 2 + n[2] * pitch,
+  ];
+  const start = points[0];
+  const ax = new oc.gp_Ax2_3(gpPnt(start), gpDir(tangent));
+  const circ = new oc.gp_Circ_2(ax, wireRadius);
+  const edge = new oc.BRepBuilderAPI_MakeEdge_8(circ).Edge();
+  const profileWire = new oc.BRepBuilderAPI_MakeWire_2(edge).Wire();
+  const profileFace = new oc.BRepBuilderAPI_MakeFace_15(profileWire, true).Face();
+  const coil = tryMake<any>([
+    () => {
+      const p = new oc.BRepOffsetAPI_MakePipe_1(spine, profileFace);
+      p.Build();
+      if (!p.IsDone()) throw new Error("Helix sweep failed.");
+      return p.Shape();
+    },
+    () => {
+      const p = new oc.BRepOffsetAPI_MakePipe_2(spine, profileFace, false);
+      p.Build();
+      if (!p.IsDone()) throw new Error("Helix sweep failed.");
+      return p.Shape();
+    },
+  ]);
+  return applyBoolean(shape, coil, false);
+}
+
+/** Loft through two or more closed profile sketches. */
+function loftFeature(part: RebuildPart, feature: Feature, shape: any): any {
+  const ids = feature.params.profileSketchIds ?? (feature.sketchId ? [feature.sketchId] : []);
+  const sketches = ids.map((id) => part.sketches.find((s) => s.id === id)).filter((s): s is Sketch => !!s);
+  if (sketches.length < 2) throw new Error("Loft needs at least two closed profile sketches.");
+  const wires = sketches.map((sketch) => {
+    const { groups, openChains } = buildProfileGroups(sketch);
+    if (openChains.length) throw new Error(`Loft section ${sketch.name} has an open contour.`);
+    if (!groups.length) throw new Error(`Loft section ${sketch.name} has no closed profile.`);
+    return wireFromLoop(groups[0].outer, sketch.plane, false);
+  });
+  const loft = tryMake<any>([
+    () => {
+      const t = new oc.BRepOffsetAPI_ThruSections_1(true, false, 1e-6);
+      for (const w of wires) t.AddWire(w);
+      t.Build();
+      if (!t.IsDone()) throw new Error("Loft failed. Check that the profiles are ordered and do not self-intersect.");
+      return t.Shape();
+    },
+    () => {
+      const t = new oc.BRepOffsetAPI_ThruSections_2(true, false);
+      for (const w of wires) t.AddWire(w);
+      t.Build();
+      if (!t.IsDone()) throw new Error("Loft failed.");
+      return t.Shape();
+    },
+  ]);
+  return applyBoolean(shape, loft, feature.params.operation === "cut");
+}
+
+/** Circular pattern of the whole accumulated body. */
+function circularPatternFeature(shape: any, feature: Feature): any {
+  const count = Math.max(2, Math.round(feature.params.circularCount ?? 4));
+  const total = feature.params.circularAngle ?? 360;
+  const axisName = feature.params.circularAxis ?? "y";
+  const dir: Vec3 = axisName === "x" ? [1, 0, 0] : axisName === "z" ? [0, 0, 1] : [0, 1, 0];
+  const box = bboxOf(shape);
+  const center: Vec3 = [(box.min[0] + box.max[0]) / 2, (box.min[1] + box.max[1]) / 2, (box.min[2] + box.max[2]) / 2];
+  const step = total >= 359.999 ? (Math.PI * 2) / count : (total * DEG) / Math.max(1, count - 1);
+  const copies: any[] = [shape];
+  for (let i = 1; i < count; i++) {
+    const trsf = new oc.gp_Trsf_1();
+    tryCall(trsf, ["SetRotation_1", "SetRotation"], [
+      [new oc.gp_Ax1_2(gpPnt(center), gpDir(dir)), step * i],
+    ]);
+    copies.push(new oc.BRepBuilderAPI_Transform_2(shape, trsf, true).Shape());
+  }
+  return fuseShapes(copies);
+}
+
+/** Hole Wizard: simple, counterbore or countersink cut through the selected face. */
+function holeFeature(shape: any, feature: Feature): any {
+  if (!shape) throw new Error("The Hole Wizard needs an existing body.");
+  const diameter = Math.max(0.1, feature.params.holeDiameter ?? 6);
+  const depth = Math.max(diameter, feature.params.holeDepth ?? 100);
+  const center = feature.params.center ?? [0, 0, 0];
+  const normal = feature.params.normal ?? [0, 1, 0];
+  const { n } = basisFor(normal);
+  const start: Vec3 = [center[0] + n[0] * 0.05, center[1] + n[1] * 0.05, center[2] + n[2] * 0.05];
+  const inward: Vec3 = [-n[0], -n[1], -n[2]];
+  const tools: any[] = [circleSolid(start, n, diameter / 2, depth)];
+  const type = feature.params.holeType ?? "simple";
+  if (type === "counterbore") {
+    const head = Math.max(diameter * 1.6, feature.params.holeHeadDiameter ?? diameter * 2);
+    tools.push(circleSolid(start, n, head / 2, Math.max(1, head * 0.35)));
+  } else if (type === "countersink") {
+    const head = Math.max(diameter * 1.6, feature.params.holeHeadDiameter ?? diameter * 2);
+    try {
+      tools.push(coneSolid(start, inward, head / 2, diameter / 2, Math.max(0.5, (head - diameter) / 2)));
+    } catch {
+      tools.push(circleSolid(start, n, head / 2, Math.max(1, head * 0.25)));
+    }
+  }
+  const tool = fuseShapes(tools);
+  return applyBoolean(shape, tool, true);
+}
+
+/** Draft the selected face against a neutral plane at the bottom of the body. */
+function draftFeature(shape: any, feature: Feature): any {
+  const angle = Math.abs(feature.params.draftAngle ?? 3) * DEG;
+  if (angle < 1e-5) throw new Error("Draft angle must be greater than zero.");
+  const faceIndex = feature.params.faceIndex ?? 0;
+  const faces: any[] = [];
+  const exp = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_FACE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
+  while (exp.More()) {
+    faces.push(oc.TopoDS.Face_1(exp.Current()));
+    exp.Next();
+  }
+  if (!faces[faceIndex]) throw new Error(`Face ${faceIndex + 1} no longer exists after the model change.`);
+  const normal = feature.params.normal ?? [0, 1, 0];
+  const box = bboxOf(shape);
+  const planePointAt: Vec3 = [0, box.min[1], 0];
+  const draft = tryMake<any>([() => new oc.BRepOffsetAPI_DraftAngle_1(shape), () => new oc.BRepOffsetAPI_DraftAngle_2(shape)]);
+  const pln = tryMake<any>([
+    () => new oc.gp_Pln_3(gpPnt(planePointAt), gpDir(normal)),
+    () => new oc.gp_Pln_2(gpPnt(planePointAt), gpDir(normal)),
+  ]);
+  tryCall(draft, ["Add_1", "Add_2", "Add"], [
+    [faces[faceIndex], gpDir(normal), angle, pln],
+    [faces[faceIndex], gpDir(normal), angle, pln, true],
+    [faces[faceIndex], gpDir(normal), angle, pln, false],
+  ]);
+  draft.Build();
+  if (!draft.IsDone()) throw new Error("Draft failed. Check the selected face and angle.");
+  return draft.Shape();
+}
+
+/** Rib: thicken the first open sketch chain into a thin wall and join it. */
+function ribFeature(sketch: Sketch, feature: Feature, shape: any): any {
+  const groups = buildProfileGroups(sketch);
+  const chain = groups.openChains[0];
+  if (!chain || chain.length < 2) throw new Error("The rib sketch must contain an open line or curve.");
+  const thickness = Math.max(0.2, feature.params.ribThickness ?? 3);
+  const height = Math.max(0.2, feature.params.depth ?? 10);
+  const half = thickness / 2;
+  const left: Vec2[] = [];
+  const right: Vec2[] = [];
+  for (let i = 0; i < chain.length; i++) {
+    const prev = chain[Math.max(0, i - 1)];
+    const next = chain[Math.min(chain.length - 1, i + 1)];
+    const dx = next.x - prev.x;
+    const dy = next.y - prev.y;
+    const len = Math.hypot(dx, dy) || 1;
+    left.push({ x: chain[i].x - (dy / len) * half, y: chain[i].y + (dx / len) * half });
+    right.push({ x: chain[i].x + (dy / len) * half, y: chain[i].y - (dx / len) * half });
+  }
+  const loop: Vec2[] = [...left, ...[...right].reverse()];
+  const poly = new oc.BRepBuilderAPI_MakePolygon_1();
+  for (const p of loop) poly.Add_1(gpPnt(planePoint(sketch.plane, p)));
+  poly.Close();
+  if (!poly.IsDone()) throw new Error("Could not build the rib profile.");
+  const face = new oc.BRepBuilderAPI_MakeFace_15(poly.Wire(), true).Face();
+  const prism = new oc.BRepPrimAPI_MakePrism_1(face, gpVec([
+    sketch.plane.n[0] * height,
+    sketch.plane.n[1] * height,
+    sketch.plane.n[2] * height,
+  ]), false, true);
+  const rib = prism.Shape();
+  return applyBoolean(shape, rib, false);
 }
 
 /** Unique topological edges of a shape.
@@ -685,6 +998,24 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
       } else if (feature.type === "pattern") {
         if (!shape) throw new Error("Linear pattern needs an existing body.");
         shape = patternFeature(shape, feature);
+      } else if (feature.type === "sweep") {
+        shape = sweepFeature(part, feature, shape);
+      } else if (feature.type === "helix") {
+        shape = helixFeature(feature, shape);
+      } else if (feature.type === "loft") {
+        shape = loftFeature(part, feature, shape);
+      } else if (feature.type === "circularPattern") {
+        if (!shape) throw new Error("Circular pattern needs an existing body.");
+        shape = circularPatternFeature(shape, feature);
+      } else if (feature.type === "hole") {
+        shape = holeFeature(shape, feature);
+      } else if (feature.type === "draft") {
+        if (!shape) throw new Error("Draft needs an existing body.");
+        shape = draftFeature(shape, feature);
+      } else if (feature.type === "rib") {
+        const sketch = part.sketches.find((s) => s.id === feature.sketchId);
+        if (!sketch) throw new Error("The rib sketch was deleted.");
+        shape = ribFeature(sketch, feature, shape);
       }
     } catch (e) {
       errors[feature.id] = e instanceof Error ? e.message : String(e);

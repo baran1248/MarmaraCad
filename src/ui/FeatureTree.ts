@@ -265,6 +265,34 @@ export class FeatureTree {
       html += planeRow("front", "Front Plane", "#7faed4");
       html += planeRow("top", "Top Plane", "#86b98e");
       html += planeRow("right", "Right Plane", "#cf9f7d");
+      for (const ref of part.referencePlanes ?? []) {
+        html += this.row(`refplane:${ref.id}`, {
+          kind: "refplane",
+          id: ref.id,
+          depth: 2,
+          label: ref.name,
+          iconName: "frame",
+          iconClass: "feature",
+          selected: ctx.selection === `refplane:${ref.id}`,
+          hidden: !ref.visible,
+          eye: ref.visible ? "on" : "off",
+          title: `${ref.name} — double-click to sketch on it`,
+          extra: `<span style="width:8px;height:8px;border-radius:2px;background:#c9a25e;display:inline-block;flex:0 0 auto"></span>`,
+        });
+      }
+      for (const axis of part.referenceAxes ?? []) {
+        html += this.row(`refaxis:${axis.id}`, {
+          kind: "refaxis",
+          id: axis.id,
+          depth: 2,
+          label: axis.name,
+          iconName: "axis-3d",
+          iconClass: "feature",
+          hidden: !axis.visible,
+          eye: axis.visible ? "on" : "off",
+          title: `${axis.name} — reference axis`,
+        });
+      }
     }
 
     // Material line, like SolidWorks' "Material <not specified>" row.
@@ -370,7 +398,21 @@ export class FeatureTree {
                       ? "arrow-right-left"
                       : f.type === "pattern"
                         ? "layout-grid"
-                        : "box";
+                        : f.type === "sweep"
+                          ? "waypoints"
+                          : f.type === "loft"
+                            ? "layers-3"
+                            : f.type === "circularPattern"
+                              ? "refresh-cw"
+                              : f.type === "hole"
+                                ? "circle-dot"
+                                : f.type === "draft"
+                                  ? "triangle"
+                                  : f.type === "rib"
+                                    ? "layout-grid"
+                                    : f.type === "helix"
+                                      ? "rotate-3d"
+                                      : "box";
       const params =
         f.type === "extrude" || f.type === "cut"
           ? `${f.params.depth ?? 0} mm`
@@ -386,7 +428,21 @@ export class FeatureTree {
                     ? `${f.params.mirrorPlane ?? "right"} plane`
                     : f.type === "pattern"
                       ? `${f.params.patternCount ?? 2} × ${f.params.patternSpacing ?? 10} mm`
-                      : "";
+                      : f.type === "sweep"
+                        ? "profile + path"
+                        : f.type === "loft"
+                          ? `${f.params.profileSketchIds?.length ?? 2} sections`
+                          : f.type === "circularPattern"
+                            ? `${f.params.circularCount ?? 4} × ${f.params.circularAngle ?? 360}°`
+                            : f.type === "hole"
+                              ? `Ø${f.params.holeDiameter ?? 6} ${f.params.holeType ?? "simple"}`
+                              : f.type === "draft"
+                                ? `${f.params.draftAngle ?? 3}°`
+                                : f.type === "rib"
+                                  ? `${f.params.ribThickness ?? 3} mm rib`
+                                  : f.type === "helix"
+                                    ? `Ø${f.params.helixDiameter ?? 20} · P${f.params.helixPitch ?? 5} · ${f.params.helixTurns ?? 4} turns`
+                                    : "";
       const rolledBack = part.rollbackIndex !== undefined && part.features.indexOf(f) >= part.rollbackIndex;
       html += this.row(key, {
         kind: "feature",

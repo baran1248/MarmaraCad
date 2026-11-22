@@ -123,6 +123,29 @@ function solveOne(
     return { position: [newPos.x, newPos.y, newPos.z], rotation: eulerFromQuaternion(newQ) };
   }
 
+  if (mate.type === "angle") {
+    if (moverRef.surface !== "plane" || anchorRef.surface !== "plane") {
+      mate.error = "Angle mates require two planar faces.";
+      return null;
+    }
+    const anchorN = aw.normal.clone().normalize();
+    const currentN = bw.normal.clone().normalize();
+    if (Math.abs(currentN.dot(anchorN)) > 0.999999) {
+      // Parallel faces: the angle is undefined, pick a perpendicular in-plane direction.
+      const helper = Math.abs(anchorN.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const perp = new THREE.Vector3().crossVectors(anchorN, helper).normalize();
+      currentN.addScaledVector(perp, 1e-3).normalize();
+    }
+    const target = Math.max(0.1, Math.min(179.9, mate.angle ?? 90)) * (Math.PI / 180);
+    const perp = currentN.clone().sub(anchorN.clone().multiplyScalar(currentN.dot(anchorN)));
+    if (perp.lengthSq() < 1e-12) perp.set(1, 0, 0);
+    perp.normalize();
+    const targetN = anchorN.clone().multiplyScalar(Math.cos(target)).addScaledVector(perp, Math.sin(target));
+    const qAlign = new THREE.Quaternion().setFromUnitVectors(currentN, targetN);
+    const newQ = qAlign.multiply(currentQ);
+    return { position: [mover.position[0], mover.position[1], mover.position[2]], rotation: eulerFromQuaternion(newQ) };
+  }
+
   if (moverRef.surface !== "plane" || anchorRef.surface !== "plane") {
     mate.error = "Coincident and distance mates need planar faces (or two cylinders for concentric).";
     return null;
@@ -148,6 +171,11 @@ function mateResidual(a: Component, ar: FaceRef, b: Component, br: FaceRef, mate
     const delta = bw.point.clone().sub(aw.point);
     const radial = delta.clone().sub(aw.axis.clone().multiplyScalar(delta.dot(aw.axis))).length();
     return radial + angle * 10;
+  }
+  if (mate.type === "angle") {
+    const dot = Math.max(-1, Math.min(1, aw.normal.dot(bw.normal)));
+    const angle = (Math.acos(dot) * 180) / Math.PI;
+    return Math.abs(angle - (mate.angle ?? 90));
   }
   const normalError = 1 - Math.abs(aw.normal.dot(bw.normal));
   const gap = Math.abs((mate.type === "distance" ? Math.abs(mate.distance ?? 0) : 0));
@@ -177,7 +205,14 @@ export function faceRefFromPick(
 }
 
 export function describeMate(mate: Mate): string {
-  const kind = mate.type === "concentric" ? "Concentric" : mate.type === "distance" ? `Distance ${mate.distance ?? 0} mm` : "Coincident";
+  const kind =
+    mate.type === "concentric"
+      ? "Concentric"
+      : mate.type === "distance"
+        ? `Distance ${mate.distance ?? 0} mm`
+        : mate.type === "angle"
+          ? `Angle ${mate.angle ?? 90}°`
+          : "Coincident";
   return `${kind} · faces ${mate.a.faceIndex + 1} ↔ ${mate.b.faceIndex + 1}`;
 }
 
@@ -186,7 +221,7 @@ export function newComponentTransform(): { position: Vec3; rotation: Vec3 } {
 }
 
 export function mateTypeLabel(type: Mate["type"]): string {
-  return type === "concentric" ? "Concentric" : type === "distance" ? "Distance" : "Coincident";
+  return type === "concentric" ? "Concentric" : type === "distance" ? "Distance" : type === "angle" ? "Angle" : "Coincident";
 }
 
 export function isNearlyEqualRotation(a: Vec3, b: Vec3): boolean {

@@ -297,6 +297,275 @@ export function buildVoxelMesh(sourcePositions: Float32Array, sourceIndices: Uin
   };
 }
 
+export interface TetMeshData {
+  positions: Float32Array;
+  /** 4 or 10 node indices per element, depending on `kind`. */
+  tets: Uint32Array;
+  /** Exterior triangles indexing into positions (corner nodes). */
+  surface: Uint32Array;
+  h: number;
+  nodeCount: number;
+  elementCount: number;
+  bounds: { min: [number, number, number]; max: [number, number, number] };
+  warnings: string[];
+  kind: "tet4" | "tet10";
+  metrics: { minAspect: number; avgAspect: number; minJacobian: number; avgJacobian: number };
+}
+
+/** Local mesh sizing zones from the study UI. The mesher uses the smallest
+ *  requested size as a seed and keeps the resulting grid conforming. */
+export interface LocalSizingSpec {
+  faceIndex: number;
+  size: number;
+}
+
+const HEX_FACE_LOCAL: [number, number, number, number][] = [
+  [0, 3, 2, 1],
+  [4, 5, 6, 7],
+  [0, 1, 5, 4],
+  [1, 2, 6, 5],
+  [2, 3, 7, 6],
+  [3, 0, 4, 7],
+];
+
+const HEX_NEIGHBOUR: [number, number, number][] = [
+  [0, 0, -1],
+  [0, 0, 1],
+  [0, -1, 0],
+  [1, 0, 0],
+  [0, 1, 0],
+  [-1, 0, 0],
+];
+
+function signedTetVolume(
+  a: [number, number, number],
+  b: [number, number, number],
+  c: [number, number, number],
+  d: [number, number, number],
+): number {
+  return tetVolume(a, b, c, d);
+}
+
+/** Conforming tetrahedral mesh. Every voxel is split into 24 tetrahedra through
+ *  its centre and its six shared face centres. Adjacent voxels reuse the same
+ *  face-centre node and the same four boundary triangles, so the mesh is
+ *  watertight even across the stair-stepped OCCT surface.
+ *
+ *  `kind` selects linear Tet4 or quadratic Tet10 (mid-edge nodes are shared
+ *  between neighbouring elements). */
+export function buildTetMesh(
+  sourcePositions: Float32Array,
+  sourceIndices: Uint32Array,
+  meshSize: number,
+  kind: "tet4" | "tet10" = "tet10",
+  localSizing: LocalSizingSpec[] = [],
+): TetMeshData {
+  const warnings: string[] = [];
+  let effective = Math.max(0.05, meshSize);
+  if (localSizing.length) {
+    const smallest = Math.min(...localSizing.map((l) => Math.max(0.05, l.size)));
+    if (smallest < effective) {
+      effective = smallest;
+      warnings.push(`Local sizing applied: the seed element size is ${smallest.toFixed(2)} mm.`);
+    }
+  }
+  const maxTets = 140000;
+  let voxel = buildVoxelMesh(sourcePositions, sourceIndices, effective);
+  let guard = 0;
+  while (voxel.elementCount * 24 > maxTets && guard++ < 12) {
+    effective = voxel.h * 1.28;
+    voxel = buildVoxelMesh(sourcePositions, sourceIndices, effective);
+  }
+  warnings.push(...voxel.warnings);
+  if (voxel.elementCount * 24 > maxTets) {
+    warnings.push("The model was coarsened to keep the tetrahedral mesh solvable.");
+  }
+
+  const h = voxel.h;
+  const min = voxel.bounds.min;
+  const max = voxel.bounds.max;
+  const dimX = Math.max(1, Math.round((max[0] - min[0]) / h));
+  const dimY = Math.max(1, Math.round((max[1] - min[1]) / h));
+  const dimZ = Math.max(1, Math.round((max[2] - min[2]) / h));
+  const cellKey = (i: number, j: number, k: number) => (k * dimY + j) * dimX + i;
+  const occupied = new Uint8Array(dimX * dimY * dimZ);
+  const cellCorners = new Map<number, number[]>();
+  const cellIJK = new Map<number, [number, number, number]>();
+  const hexCount = voxel.hexes.length / 8;
+  for (let e = 0; e < hexCount; e++) {
+    const o = e * 8;
+    const n0 = voxel.hexes[o];
+    const i = Math.round((voxel.positions[n0 * 3] - min[0]) / h);
+    const j = Math.round((voxel.positions[n0 * 3 + 1] - min[1]) / h);
+    const k = Math.round((voxel.positions[n0 * 3 + 2] - min[2]) / h);
+    const key = cellKey(i, j, k);
+    occupied[key] = 1;
+    cellCorners.set(key, [voxel.hexes[o], voxel.hexes[o + 1], voxel.hexes[o + 2], voxel.hexes[o + 3], voxel.hexes[o + 4], voxel.hexes[o + 5], voxel.hexes[o + 6], voxel.hexes[o + 7]]);
+    cellIJK.set(key, [i, j, k]);
+  }
+
+  const positions: number[] = [];
+  const cornerMap = new Int32Array(voxel.nodeCount).fill(-1);
+  const faceCentreMap = new Map<string, number>();
+  const cellCentreMap = new Map<number, number>();
+  const newNode = (x: number, y: number, z: number): number => {
+    positions.push(x, y, z);
+    return positions.length / 3 - 1;
+  };
+  const cornerNode = (id: number): number => {
+    let mapped = cornerMap[id];
+    if (mapped < 0) {
+      mapped = newNode(voxel.positions[id * 3], voxel.positions[id * 3 + 1], voxel.positions[id * 3 + 2]);
+      cornerMap[id] = mapped;
+    }
+    return mapped;
+  };
+  const faceCentre = (corners: number[]): number => {
+    const key = [...corners].sort((a, b) => a - b).join(",");
+    const existing = faceCentreMap.get(key);
+    if (existing !== undefined) return existing;
+    let x = 0, y = 0, z = 0;
+    for (const c of corners) {
+      x += voxel.positions[c * 3];
+      y += voxel.positions[c * 3 + 1];
+      z += voxel.positions[c * 3 + 2];
+    }
+    const id = newNode(x / 4, y / 4, z / 4);
+    faceCentreMap.set(key, id);
+    return id;
+  };
+  const cellCentre = (key: number, corners: number[]): number => {
+    const existing = cellCentreMap.get(key);
+    if (existing !== undefined) return existing;
+    let x = 0, y = 0, z = 0;
+    for (const c of corners) {
+      x += voxel.positions[c * 3];
+      y += voxel.positions[c * 3 + 1];
+      z += voxel.positions[c * 3 + 2];
+    }
+    const id = newNode(x / 8, y / 8, z / 8);
+    cellCentreMap.set(key, id);
+    return id;
+  };
+
+  const tetCornerIds: number[] = [];
+  const surface: number[] = [];
+  const coordOf = (id: number): [number, number, number] => [positions[id * 3], positions[id * 3 + 1], positions[id * 3 + 2]];
+  const pushTet = (a: number, b: number, c: number, d: number) => {
+    const vol = signedTetVolume(coordOf(a), coordOf(b), coordOf(c), coordOf(d));
+    if (Math.abs(vol) < 1e-14) return;
+    if (vol > 0) tetCornerIds.push(a, b, c, d);
+    else tetCornerIds.push(a, c, b, d);
+  };
+
+  for (const [key, localCorners] of cellCorners) {
+    const [i, j, k] = cellIJK.get(key)!;
+    const corners = localCorners.map(cornerNode);
+    const centre = cellCentre(key, localCorners);
+    for (let f = 0; f < 6; f++) {
+      const local = HEX_FACE_LOCAL[f];
+      const ids = [corners[local[0]], corners[local[1]], corners[local[2]], corners[local[3]]];
+      const fc = faceCentre(local.map((q) => localCorners[q]));
+      for (let t = 0; t < 4; t++) {
+        pushTet(centre, fc, ids[t], ids[(t + 1) % 4]);
+      }
+      const n = HEX_NEIGHBOUR[f];
+      const ni = i + n[0], nj = j + n[1], nk = k + n[2];
+      const inside = ni >= 0 && nj >= 0 && nk >= 0 && ni < dimX && nj < dimY && nk < dimZ;
+      if (!inside || !occupied[cellKey(ni, nj, nk)]) {
+        for (let t = 0; t < 4; t++) {
+          surface.push(ids[t], ids[(t + 1) % 4], fc);
+        }
+      }
+    }
+  }
+
+  let tets: Uint32Array;
+  const tet4Count = tetCornerIds.length / 4;
+  if (kind === "tet10") {
+    const edgeMap = new Map<string, number>();
+    const midNode = (a: number, b: number): number => {
+      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      const existing = edgeMap.get(key);
+      if (existing !== undefined) return existing;
+      const id = newNode(
+        (positions[a * 3] + positions[b * 3]) / 2,
+        (positions[a * 3 + 1] + positions[b * 3 + 1]) / 2,
+        (positions[a * 3 + 2] + positions[b * 3 + 2]) / 2,
+      );
+      edgeMap.set(key, id);
+      return id;
+    };
+    tets = new Uint32Array(tet4Count * 10);
+    const edges: [number, number][] = [
+      [0, 1],
+      [1, 2],
+      [2, 0],
+      [0, 3],
+      [1, 3],
+      [2, 3],
+    ];
+    for (let e = 0; e < tet4Count; e++) {
+      const o = e * 4;
+      const a = tetCornerIds[o], b = tetCornerIds[o + 1], c = tetCornerIds[o + 2], d = tetCornerIds[o + 3];
+      const nodes = [a, b, c, d, midNode(a, b), midNode(b, c), midNode(c, a), midNode(a, d), midNode(b, d), midNode(c, d)];
+      tets.set(nodes, e * 10);
+    }
+  } else {
+    tets = new Uint32Array(tetCornerIds);
+  }
+
+  let minAspect = Infinity;
+  let maxAspect = 0;
+  let aspectSum = 0;
+  let minJacobian = Infinity;
+  let jacobianSum = 0;
+  for (let e = 0; e < tet4Count; e++) {
+    const o = e * 4;
+    const ids = [tetCornerIds[o], tetCornerIds[o + 1], tetCornerIds[o + 2], tetCornerIds[o + 3]];
+    const pts = ids.map(coordOf);
+    let maxEdge = 0;
+    let minEdge = Infinity;
+    for (let a = 0; a < 4; a++) {
+      for (let b = a + 1; b < 4; b++) {
+        const len = Math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1], pts[a][2] - pts[b][2]);
+        if (len > maxEdge) maxEdge = len;
+        if (len < minEdge) minEdge = len;
+      }
+    }
+    const volume = Math.abs(signedTetVolume(pts[0], pts[1], pts[2], pts[3]));
+    const aspect = minEdge > 1e-12 ? maxEdge / minEdge : Infinity;
+    const jacobian = maxEdge > 1e-12 ? (6 * volume) / (maxEdge * maxEdge * maxEdge) : 0;
+    minAspect = Math.min(minAspect, aspect);
+    maxAspect = Math.max(maxAspect, aspect);
+    aspectSum += aspect;
+    minJacobian = Math.min(minJacobian, jacobian);
+    jacobianSum += jacobian;
+  }
+  if (!Number.isFinite(minAspect)) minAspect = 0;
+  if (!Number.isFinite(minJacobian)) minJacobian = 0;
+  const metrics = {
+    minAspect,
+    avgAspect: tet4Count ? aspectSum / tet4Count : 0,
+    minJacobian,
+    avgJacobian: tet4Count ? jacobianSum / tet4Count : 0,
+  };
+  if (metrics.minJacobian < 0.01) warnings.push("Some tetrahedra are badly shaped; refine the mesh or simplify the geometry.");
+
+  return {
+    positions: new Float32Array(positions),
+    tets,
+    surface: new Uint32Array(surface),
+    h,
+    nodeCount: positions.length / 3,
+    elementCount: tet4Count,
+    bounds: { min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] },
+    warnings,
+    kind,
+    metrics,
+  };
+}
+
 export function hexVolume(coords: [number, number, number][]): number {
   // Split into five tetrahedra around node 0 and sum absolute volumes.
   const tets: [number, number, number, number][] = [

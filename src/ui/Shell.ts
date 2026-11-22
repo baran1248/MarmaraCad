@@ -209,6 +209,8 @@ export class Shell {
   onLanguageToggle: () => void = () => undefined;
   onShortcut: (action: string) => void = () => undefined;
   onNavScheme: (scheme: "cad" | "legacy") => void = () => undefined;
+  onControlMode: (mode: "mouse" | "trackpad" | "pen") => void = () => undefined;
+  onMousePreset: (preset: "solidworks" | "fusion" | "ansys") => void = () => undefined;
   onSnapSettings: (settings: Partial<Record<"endpoint" | "midpoint" | "center" | "origin" | "quadrant" | "intersection" | "perpendicular" | "tangent" | "grid", boolean>>) => void = () => undefined;
 
   private panelBody: HTMLElement;
@@ -244,6 +246,8 @@ export class Shell {
   private snapOn = true;
   private language: "en" | "tr" = "en";
   private massRows: MassRow[] | null = null;
+  private controlMode: "mouse" | "trackpad" | "pen" = "mouse";
+  private mousePreset: "solidworks" | "fusion" | "ansys" = "solidworks";
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -343,6 +347,17 @@ export class Shell {
           <div class="status-msg" id="status-msg">Starting…</div>
           <div class="status-item mono" id="status-cursor" style="display:none"></div>
           <div class="status-item" id="status-selection" style="display:none"></div>
+          <div class="control-switcher" id="control-switcher" title="Navigation / input mode">
+            <span class="cs-label">Navigate</span>
+            <button data-control-mode="mouse" class="active">Mouse</button>
+            <button data-control-mode="trackpad">Trackpad</button>
+            <button data-control-mode="pen">Pen</button>
+            <select id="mouse-preset" title="Mouse preset">
+              <option value="solidworks">SolidWorks</option>
+              <option value="fusion">Fusion</option>
+              <option value="ansys">Ansys</option>
+            </select>
+          </div>
           <div class="status-item">mm</div>
           <div class="status-item" id="status-kernel"><span class="status-dot" id="status-dot"></span><span id="status-kernel-text">OCCT</span></div>
         </footer>
@@ -399,6 +414,7 @@ export class Shell {
     });
 
     this.bindChrome();
+    this.restoreControlMode();
     this.modeTabs.querySelectorAll<HTMLElement>("[data-mode]").forEach((btn) => {
       btn.addEventListener("click", () => this.onModeChange(btn.dataset.mode as WorkspaceMode));
     });
@@ -461,6 +477,12 @@ export class Shell {
       btn.addEventListener("click", () => this.onDisplayStyle(btn.dataset.style as DisplayStyle));
     });
     this.planesBtn.addEventListener("click", () => this.onPlanesToggle(!this.displayState.planes));
+    this.root.querySelectorAll<HTMLElement>("[data-control-mode]").forEach((btn) => {
+      btn.addEventListener("click", () => this.setControlMode(btn.dataset.controlMode as "mouse" | "trackpad" | "pen"));
+    });
+    this.root.querySelector<HTMLSelectElement>("#mouse-preset")?.addEventListener("change", (event) => {
+      this.setMousePreset((event.target as HTMLSelectElement).value as "solidworks" | "fusion" | "ansys");
+    });
     this.menuLayer.addEventListener("click", (e) => {
       if (e.target === this.menuLayer) this.closeMenu();
     });
@@ -514,6 +536,66 @@ export class Shell {
   setDocument(doc: ProjectDocument): void {
     this.docNameEl.textContent = doc.name;
     this.docSubEl.textContent = doc.mode === "part" ? (doc.parts.find((p) => p.id === doc.activePartId)?.name ?? "Part") : doc.mode;
+  }
+
+  private restoreControlMode(): void {
+    let mode: "mouse" | "trackpad" | "pen" = "mouse";
+    let preset: "solidworks" | "fusion" | "ansys" = "solidworks";
+    try {
+      const savedMode = localStorage.getItem("marmaracad.controlMode");
+      if (savedMode === "mouse" || savedMode === "trackpad" || savedMode === "pen") mode = savedMode;
+      const savedPreset = localStorage.getItem("marmaracad.mousePreset");
+      if (savedPreset === "solidworks" || savedPreset === "fusion" || savedPreset === "ansys") preset = savedPreset;
+    } catch {
+      /* private mode / blocked storage */
+    }
+    this.controlMode = mode;
+    this.mousePreset = preset;
+    this.refreshControlMode();
+    this.onControlMode(mode);
+    this.onMousePreset(preset);
+  }
+
+  setControlMode(mode: "mouse" | "trackpad" | "pen"): void {
+    this.controlMode = mode;
+    try {
+      localStorage.setItem("marmaracad.controlMode", mode);
+    } catch {
+      /* ignore */
+    }
+    this.refreshControlMode();
+    this.onControlMode(mode);
+  }
+
+  setMousePreset(preset: "solidworks" | "fusion" | "ansys"): void {
+    this.mousePreset = preset;
+    try {
+      localStorage.setItem("marmaracad.mousePreset", preset);
+    } catch {
+      /* ignore */
+    }
+    const select = this.root.querySelector<HTMLSelectElement>("#mouse-preset");
+    if (select) select.value = preset;
+    this.onMousePreset(preset);
+  }
+
+  private refreshControlMode(): void {
+    this.root.querySelectorAll<HTMLElement>("[data-control-mode]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.controlMode === this.controlMode);
+    });
+    const select = this.root.querySelector<HTMLSelectElement>("#mouse-preset");
+    if (select) {
+      select.value = this.mousePreset;
+      select.style.display = this.controlMode === "mouse" ? "" : "none";
+    }
+  }
+
+  get inputMode(): "mouse" | "trackpad" | "pen" {
+    return this.controlMode;
+  }
+
+  get inputPreset(): "solidworks" | "fusion" | "ansys" {
+    return this.mousePreset;
   }
 
   setMode(mode: WorkspaceMode): void {

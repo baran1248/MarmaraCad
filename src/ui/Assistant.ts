@@ -71,6 +71,15 @@ Allowed actions and params:
 - section: {axis:"x"|"y"|"z",offset}
 - drawing: {} - generate the technical drawing.
 - fea: {material?,meshSize?,force?,pressure?,direction?:"down"|"up"|"x"|"zdown"|"normal"|[x,y,z]} - create/setup a static study; the fixed support goes on the lowest X or Z face and the force/pressure on the opposite end.
+- reference-plane: {mode?:"offset"|"angle"|"mid",base?:"front"|"top"|"right",value?} - create reference geometry.
+- circular-pattern: {axis?:"x"|"y"|"z",count?,angle?} - circular pattern of the body.
+- sweep: {sketch?,pathSketch?} - sweep a profile along a path sketch.
+- loft: {sketches?:string[]} - loft between two or more section sketches.
+- hole: {diameter?,depth?,type?:"simple"|"counterbore"|"countersink",faceIndex?} - Hole Wizard on the active body.
+- exploded-view: {amount?} - set the assembly explode slider (0..1).
+- modal: {material?,meshSize?,modes?} - modal study with the first natural frequencies.
+- thermal: {material?,meshSize?,temperature?,ambient?} - steady-state thermal study.
+- buckling: {material?,meshSize?,force?} - linear buckling study with a compressive end load.
 - action: {name:"zoom-fit"|"mass-props"|"interference"|"toolbox-bolt"|"new-sketch"} - run an app command.
 Keep models small and printable. If the request is ambiguous, ask a question in "message" and return an empty commands array.
 Current document: "${doc.name}", ${doc.parts.length} part(s), mode ${doc.mode}. Active part features: ${
