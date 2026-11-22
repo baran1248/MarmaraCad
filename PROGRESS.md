@@ -243,11 +243,28 @@ Live: https://baran1248.github.io/MarmaraCad/
       applier
 
 ### Verification
-- [x] `npm test` — 23/23 unit + analytical tests
-- [x] `npm run test:e2e` — full browser suite including the new ribbon, control-mode, Tet10 and
-      multiphysics suites
-- [x] `npm run test:ui` — visual QA pass
-- [x] Live GitHub Pages verification
+- [x] `npm test` — 23/23 unit + analytical tests (6 files, 109 s); includes the cantilever
+      δ = 1.942 mm vs 2.000 mm analytical and σ = 600 MPa regression, Tet4 vs Tet10 perforated
+      plate, modal f₁, 1-D thermal and buckling cases
+- [x] `npx tsc --noEmit` — 0 errors; `npm run build` — production build OK
+- [x] `npm run test:e2e` — 30/30 suites, exit 0, zero console/page errors
+- [x] `npm run test:ui` — PASS (icon hydration, overflow, legend, 17.6 % sketch raster proof)
+- [x] Live GitHub Pages verification after deploy run `44987902857` (commit `8633305`):
+      boot 5.98 s / WebGPU / kernel 65.86 MB, sample 98,507 mm³ · 13 faces · 30 edges,
+      STEP 37,607 bytes, FEA 4,854 nodes / 3,352 hexahedra → 0.102 mm / 61.35 MPa / SF 4.07 in
+      833 PCG iterations, zero console errors
+- [x] Live phase-3 suites: ribbon 7/7 (128 px ribbon, zero overlap at 1440 and 1024 px),
+      control modes 14/14 (presets, trackpad gestures, pen, persistence across reload),
+      Tet10 result surface (tip deflection within 10 % of FL³/3EI, reaction balancing the
+      applied 1000 N, 3,441-node reaction field, probe readout, animation, undeformed
+      wireframe, min/max flags, reaction colour bar) and multiphysics
+      (modal 856.6 Hz = 5.06 % vs Euler–Bernoulli, thermal 50.000 °C mid-span, buckling
+      λ = 48.22 against P_cr = 41.12 kN)
+- [x] Regression fix found by the suite: the Rectangle tool attached the second click's snap
+      point to the derived corner (p2) instead of the clicked corner (p3), so a snapped rectangle
+      could collapse into a diagonal with a duplicate vertex; Convert Entities now also skips
+      edges whose projection onto the sketch plane is a single point (a corner click can pick an
+      edge normal to the plane)
 
 ## Verification log
 - Phase-2 verification (local dev server, headless Chrome, all measured from the live document):
