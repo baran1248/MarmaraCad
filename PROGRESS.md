@@ -266,6 +266,95 @@ Live: https://baran1248.github.io/MarmaraCad/
       edges whose projection onto the sketch plane is a single point (a corner click can pick an
       edge normal to the plane)
 
+## Phase 4 — Shapr3D navigation, direct Push/Pull, sheet metal, configurations & live assembly
+
+### Trackpad / pen navigation (Shapr3D)
+- [x] The old `Math.abs(dx) > Math.abs(dy) * 1.8` wheel shortcut is gone: a horizontal
+      two-finger scroll orbits instead of being hijacked into a pan
+- [x] Navigation settings popover (`#nav-settings`) with speed (0.25–2.5×), inertia/damping
+      (0–0.95), orbit X/Y inversion and pan inversion, persisted in
+      `localStorage["marmaracad.navigation"]` and re-applied to the camera at boot
+- [x] Trackpad scheme "Two-finger: Orbit" / "Two-finger: Pan"; Shift swaps the roles
+      (Orbit scheme → Shift pans, Pan scheme → Shift orbits), Ctrl+wheel / pinch zooms at the cursor
+- [x] Inertia glide (`applyInertia`) in the render loop, cancelled by any new gesture or view change
+- [x] Touch: one finger orbits, two fingers pan around their midpoint + pinch zoom, three-finger
+      horizontal swipe = Undo / Redo, one-finger double-tap = Normal To the tapped face, ViewCube
+      double-tap = Zoom to Fit
+- [x] Pen (`pointerType === "pen"`) never moves the camera: 4 px tremor dead-zone, then draw/select/
+      push-pull; barrel button opens the context menu immediately, press-and-hold after 620 ms
+- [x] Debug counters `orbits / pans / zooms / pinches / penDown / touches / gizmoDrags` exposed via
+      `window.__marmaracad.control()` for the regression suite
+
+### Direct modelling (Push/Pull & edge handles)
+- [x] Selecting a planar face draws a 3-D arrow along its normal plus a live millimetre label and a
+      translucent preview of the new material
+- [x] Releasing the arrow creates a normal parametric feature: outwards = Boss-Extrude (join),
+      inwards = Cut-Extrude; the feature lands in the tree and participates in Undo/Redo
+- [x] `Enter` with an active face handle opens the numeric Push/Pull panel (positive pulls, negative
+      pushes) for keyboard-driven editing
+- [x] Selecting one straight edge shows a blue fillet/chamfer knob: up-right grows the radius
+      (Fillet), down-left switches to Chamfer; releasing creates the parametric feature
+- [x] Face-boundary extraction (`faceBoundaryLoops`) turns the tessellated cap into the sketch profile
+      of the direct edit, so the pushed/pulled face keeps its real outline
+
+### Sheet Metal
+- [x] `Sheet Metal` CommandManager tab: Base Flange, Edge Flange, Flatten, Export DXF, Sheet Settings
+- [x] Base Flange: closed profile → plate of thickness `t`; open sketch → thin band swept by the
+      open-sketch width; bend radius `R` and K-Factor (default `0.44`) stored on the part
+- [x] Edge Flange: wall swept along the picked straight edge with a real bend cylinder (90°/45°/135°,
+      length, `R`, `K`); the flange records its blank placement (side/from/to) for the flat pattern
+- [x] Flatten replaces the bent body with the developed blank and draws the bend lines as dashed
+      segments (geometry-baked dashes because the WebGPU backend has no `LineDashedMaterial`)
+- [x] Flat-pattern DXF: AutoCAD R12, `OUTLINE` + `BEND` (DASHED) layers, header extents, pure ASCII
+- [x] Kernel features `baseFlange` / `edgeFlange` build with OCCT prisms and booleans; the flat
+      pattern is built from the same pure `flatPattern()` recipe used by the DXF and the tests
+- [x] `.mcad.json` keeps `sheetMetal` and every flange recipe; loading restores the flat pattern and
+      its bend lines
+- [x] AI actions `sheet-metal-flange` and `flatten` (the flange picks the longest straight edge)
+
+### Configurations
+- [x] Configurations section in the FeatureManager with a `+` button and per-variant rows; the panel
+      lists, creates, copies and deletes variants
+- [x] A configuration stores the global variable expressions (`L`, `W`, `D`, …) and the suppression
+      state of every feature; activating one rewrites the variables, re-solves the sketches, marks the
+      suppressed features and rebuilds, so the model and Mass Properties follow
+- [x] Double-clicking a configuration row in the tree activates and rebuilds that variant
+- [x] New variants copy the active one and become active immediately (so the variable editor edits
+      the new variant, not the one it was copied from)
+- [x] `.mcad.json` stores all configurations plus the active id; the loader normalises them
+- [x] AI action `configuration` (name, variables, suppression, copyFrom)
+
+### Live assembly drag
+- [x] Floating components can be dragged directly in Assembly mode (left button, camera-plane delta)
+- [x] Every pointer frame re-projects the move through the mate solver (6 iterations): Coincident /
+      Concentric / Distance / Angle stay satisfied while the free DOFs still move
+- [x] Dragging a component whose axis is mated concentric leaves the radial residual at 0.000 mm
+      while the component slides 12.28 mm along the free axis; the drag commits one undo step
+
+### AI, tests & fixes
+- [x] Assistant system prompt and `applyAiCommand` know `sheet-metal-flange`, `flatten`,
+      `configuration` and `push-pull`
+- [x] New vitest suites: `tests/sheetMetal.test.ts` (12 tests: BA formula, developed length, flat
+      pattern on four sides, R12 DXF structure/extents/ASCII, recipe) and
+      `tests/configurations.test.ts` (7 tests: capture/apply/copy/remove/summary, no suppression
+      leakage between variants)
+- [x] New Playwright suite `tests/e2e-phase4.mjs` (53 checks): trackpad orbit regression, Pan scheme,
+      Shift swap, ctrl/pinch zoom, two-finger pan+pinch, three-finger undo/redo, pen dead-zone and
+      tap-to-select, push/pull +15 mm (boss, 168,000 mm³), inward cut, Enter value, edge-handle R6
+      fillet, base/edge flange, BA flat pattern (23,123.82 mm³ analytical), DXF structure, `.mcad.json`
+      round-trip, configurations (48,000 ↔ 144,000 mm³ + mass card), AI actions, live mate drag
+- [x] Real bugs found and fixed by the suite:
+  - WebGPU has no `LineDashedMaterial` (it throws `Uniform "null" not declared.` every frame):
+    bend lines now bake the dashes into the geometry with `LineBasicMaterial`
+  - navigation preferences were read by the Shell but never handed to the viewport at boot; the
+    restored speed/inertia/invert values now apply on load
+  - adding a configuration kept the previous variant active, so the editor overwrote it; the new
+    variant becomes active
+  - configuration apply evaluated the variables before writing the variant's expressions; the order
+    is now apply → evaluate → rebuild
+  - the AI sheet-metal action skipped the rebuild when an empty sketch mesh existed, so no edges
+    were found and the edge flange was silently omitted
+
 ## Verification log
 - Phase-2 verification (local dev server, headless Chrome, all measured from the live document):
   - Ctrl+click builds a 3-edge selection that Fillet consumes (`3 EDGE(S)`), volume 19,935.62 mm³
@@ -405,3 +494,38 @@ Live: https://baran1248.github.io/MarmaraCad/
   `[-1,0,0]` and one 250 N `[0,-1,0]` load on the opposite face. AI `pattern(3 × 40) + mirror`
   yields 20,000 mm³ over x −90…90; AI `mate(coincident)` pairs Box/Lid and seats the lid at
   y = 30.000.
+
+### Phase 4 verification (local dev server, headless Chrome, WebGPU)
+- `npm test`: 8 files / 42 tests passed (adds `tests/sheetMetal.test.ts` 12 and
+  `tests/configurations.test.ts` 7); `npx tsc --noEmit` clean; `npm run build` 1594 modules,
+  11.08 s.
+- `npm run test:e2e`: the whole 31-suite chain exits 0 (26 `RESULT PASS` reports, 0 `FAIL`);
+  `e2e-phase4.mjs` reports `RESULT PASS 53/53`.
+- Measured by `e2e-phase4.mjs` on the live document:
+  - Trackpad: dx 120 / dy 10 orbits (the old 1.8 ratio hijack is gone: pans stay 0); vertical
+    scroll orbits too; Shift pans; Ctrl+wheel zooms once (zooms 0 -> 1, pinches 0 -> 1); the "Pan"
+    scheme pans and Shift + Pan orbits.
+  - Touch: two fingers move pan 19 -> 80 and pinches 1 -> 3 in the same gesture; a three-finger
+    swipe undoes (2 -> 1 feature) and redoes (1 -> 2).
+  - Pen: 4 px tremor never orbits (orbits 73 -> 73) but arms the band (`penArmed` true); tapping a
+    planar face selects it (1 face) and shows the push/pull arrow (`gizmo.kind = "face"`).
+  - Push/Pull: 80 x 60 x 20 block = 96,000 mm3; +15 mm -> 167,999.956 mm3 (0 % error) and a
+    second `extrude` feature with `pushPull: true`; inward drag -> cut; Ctrl+Z x2 back to 96,000;
+    Enter +5 mm -> 120,000 mm3.
+  - Edge handle: R6 drag on a 20 mm vertical edge -> 95,845.49 mm3
+    (96,000 - (36 - 9*pi) * 20 = 95,845.49) and a parametric `fillet` feature with radius 6.000.
+  - Sheet metal: 120 x 80 x t2 Base Flange = 19,200 mm3; a 90 deg / 20 mm / R2 edge flange stores
+    `side: "right", from: -40, to: 40` and grows the body to 23,151.83 mm3; flatten = 23,123.823 mm3,
+    exactly `developedChain` with BA = (pi/180)*90*(2 + 0.44*2) = 4.5239 mm; the bend lines are 70
+    vertices on `LineBasicMaterial` (no WebGPU `null` uniform errors).
+  - DXF: 1,196 bytes, `AC1009` header, 9 `LINE` entities, `OUTLINE` + `BEND` on the `DASHED`
+    layer, 84.5239 mm developed extent, pure ASCII.
+  - Configurations: Default 48,000 mm3 and Config 2 144,000 mm3 (D 20 -> 60) with the Mass card
+    following; double-clicking a row restores the model; both variants and the active id survive
+    the `.mcad.json` round-trip (sheet metal + flanges too).
+  - Live assembly drag: six pointer frames keep the concentric mate at radial residual 0.000 mm and
+    axis cross 0.000 mm while the component slides 12.28 mm along the free axis; one undo step.
+- Real bugs the new suites caught and fixed: WebGPU `LineDashedMaterial` (`Uniform "null" not
+  declared.`) -> geometry-baked dashes; navigation preferences read but never handed to the viewport
+  at boot; new configurations losing activation; configuration apply order (apply -> evaluate);
+  AI sheet-metal action rebuilding before picking the edge flange edge.

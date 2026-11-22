@@ -23,8 +23,23 @@ visualisation — executes on the user's own CPU/GPU.
 - Sketch tools: Slot (straight / arc), Polygon (3–12 sides, inscribed / circumscribed), Spline,
   Sketch Fillet / Chamfer and Circular Sketch Pattern — all OSnap and Dynamic Input aware.
 - Mouse / Trackpad / Pen control modes with SolidWorks, Fusion and Ansys mouse presets, persisted in
-  `localStorage`; two-finger trackpad orbit/pan/pinch and pen pressure-free draw/select with a
-  barrel-button context menu.
+  `localStorage`; two-finger trackpad orbit/pan/pinch (choose Orbit or Pan for two fingers, Shift swaps
+  the roles), a speed / inertia / invert navigation popover, three-finger swipe Undo/Redo, touch
+  double-tap Normal To and ViewCube double-tap Zoom to Fit. The pen never moves the camera: a 4 px
+  dead-zone guards draw/select/push-pull, and the barrel button or a press-and-hold opens the context
+  menu.
+- Direct modelling with Shapr3D-style handles: select a planar face to get a Push/Pull arrow with a live
+  millimetre label (pull = Boss-Extrude, push = Cut-Extrude, `Enter` for a typed value) and a straight
+  edge to get a Fillet/Chamfer knob. The result is a normal parametric feature in the tree and in
+  Undo/Redo.
+- Sheet Metal: Base Flange (closed profile or open sketch band), Edge Flange along a straight edge with
+  a real bend cylinder (90°/45°/135°), K-Factor bend allowance `BA = π/180 · θ · (R + K·t)`, a flat
+  pattern with dashed bend lines, `.dxf` (AutoCAD R12) flat-pattern export and sheet settings.
+- Named Configurations per part (`Default`, `Short`, `Long`, `M6`, `M8`…): each stores the global
+  variable expressions and feature suppression; activating one rebuilds the model and Mass Properties,
+  and everything is saved in `.mcad.json`.
+- Live assembly drag: floating components follow the pointer while Coincident / Concentric / Distance /
+  Angle mates are re-projected every frame, so only the free degrees of freedom move.
 - Multi-select with Ctrl/Shift-click, window (left→right) and crossing (right→left) selection,
   All / Faces / Edges / Vertices pick filters, and loop / tangency selection from the context menu.
 - SolidWorks-style dynamic input while drawing (type length/angle, `Tab`, `Enter`) and object snaps
@@ -62,7 +77,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 30 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 31 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -85,6 +100,8 @@ selector, the `?` guide, and the Gemini assistant with a mocked API. The newest 
 overlap guard (`e2e-hud.mjs`), per-generation Gemini thinking config with AI-driven FEA supports/loads
 and AI cut/revolve/mirror/pattern/mate commands, the drawing dimension placement check, and Turkish
 Assembly/mass-card/menu labels.
+
+The phase-4 suites add e2e-phase4.mjs: the horizontal-trackpad orbit regression (dx 120 / dy 10 must orbit, not pan), the Pan scheme with Shift swap, Ctrl/pinch zoom, two-finger pan+pinch, three-finger Undo/Redo, pen dead-zone and tap-to-select, Push/Pull +15 mm (168,000 mm³) with an inward cut and Enter value, the edge-handle R6 fillet, Base/Edge Flange with the BA flat pattern (23,123.82 mm³ analytical) and a valid R12 .dxf, configurations (48,000 ↔ 144,000 mm³ with the Mass card), .mcad.json round-trips, the AI sheet-metal/config/push-pull actions and a live concentric-mate drag with a 0.000 mm radial residual.
 
 The phase-3 suites add the ribbon caption-lane guard (`e2e-ribbon.mjs`, `getBoundingClientRect()` at
 1440 and 1024 px), the control-mode matrix (`e2e-controlmodes.mjs`: presets, trackpad gestures, pen and

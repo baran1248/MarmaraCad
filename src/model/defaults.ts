@@ -145,6 +145,9 @@ export function nextFeatureName(type: string, features: { type: string; name: st
     draft: "Draft",
     rib: "Rib",
     helix: "Helix",
+    baseFlange: "BaseFlange",
+    edgeFlange: "EdgeFlange",
+    pushPull: "PushPull",
     imported: "Imported Body",
   };
   const prefix = base[type] ?? type;

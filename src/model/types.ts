@@ -108,6 +108,8 @@ export type FeatureType =
   | "draft"
   | "rib"
   | "helix"
+  | "baseFlange"
+  | "edgeFlange"
   | "imported";
 
 export type BooleanOp = "new" | "join" | "cut";
@@ -163,6 +165,18 @@ export interface FeatureParams {
   /** Expression evaluated at rebuild time, e.g. "L / 2". */
   depthExpression?: string;
   radiusExpression?: string;
+  /** Sheet metal (base / edge flange). */
+  sheetThickness?: number;
+  bendRadius?: number;
+  kFactor?: number;
+  flangeLength?: number;
+  flangeAngle?: number;
+  /** Straight edge used by the edge flange (index into the body edge list). */
+  edgeIndex?: number;
+  /** Open-sketch base flange width (mm). */
+  sheetWidth?: number;
+  /** Direct-edit marker (push/pull gesture). */
+  pushPull?: boolean;
 }
 
 export interface ReferencePlane {
@@ -226,6 +240,44 @@ export interface Part {
   referenceAxes?: ReferenceAxis[];
   /** Exploded-view slider state (0 = assembled, 1 = fully exploded). */
   explode?: number;
+  /** Sheet-metal defaults + flange recipes used by the flat pattern / DXF. */
+  sheetMetal?: SheetMetalState;
+  /** Named part variants (variables + suppression state). */
+  configurations?: Configuration[];
+  activeConfigurationId?: string;
+}
+
+export interface SheetMetalFlange {
+  id: string;
+  featureId: string;
+  edgeIndex: number;
+  angle: number;
+  length: number;
+  radius: number;
+  thickness: number;
+  kFactor: number;
+  /** Flat-pattern placement, in the base sketch's 2-D frame. */
+  side?: "left" | "right" | "bottom" | "top";
+  from?: number;
+  to?: number;
+}
+
+export interface SheetMetalState {
+  thickness: number;
+  radius: number;
+  kFactor: number;
+  /** Flat-pattern preview: the body rebuilds as the developed blank. */
+  flattened?: boolean;
+  flanges: SheetMetalFlange[];
+}
+
+export interface Configuration {
+  id: string;
+  name: string;
+  /** Global variable overrides, name → expression ("L": "160"). */
+  variables: Record<string, string>;
+  /** Feature ids suppressed in this configuration. */
+  suppressed: string[];
 }
 
 export interface Component {
@@ -407,6 +459,7 @@ export interface RebuildPart {
   assetFormat?: ImportedAsset["format"];
   assetRev?: string;
   rollbackIndex?: number;
+  sheetMetal?: SheetMetalState;
 }
 
 export interface AssemblyTransform {

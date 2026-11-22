@@ -1,5 +1,5 @@
 import type { ProjectDocument, WorkspaceMode } from "../model/types";
-import type { DisplayStyle, ViewName } from "../viewport/Viewport";
+import type { DisplayStyle, NavigationSettings, ViewName } from "../viewport/Viewport";
 import type { TreeContext, TreeHandlers } from "./FeatureTree";
 import { FeatureTree } from "./FeatureTree";
 import { CommandManager, type CommandTab } from "./CommandManager";
@@ -211,6 +211,7 @@ export class Shell {
   onNavScheme: (scheme: "cad" | "legacy") => void = () => undefined;
   onControlMode: (mode: "mouse" | "trackpad" | "pen") => void = () => undefined;
   onMousePreset: (preset: "solidworks" | "fusion" | "ansys") => void = () => undefined;
+  onNavigationSettings: (settings: NavigationSettings) => void = () => undefined;
   onSnapSettings: (settings: Partial<Record<"endpoint" | "midpoint" | "center" | "origin" | "quadrant" | "intersection" | "perpendicular" | "tangent" | "grid", boolean>>) => void = () => undefined;
 
   private panelBody: HTMLElement;
@@ -248,6 +249,14 @@ export class Shell {
   private massRows: MassRow[] | null = null;
   private controlMode: "mouse" | "trackpad" | "pen" = "mouse";
   private mousePreset: "solidworks" | "fusion" | "ansys" = "solidworks";
+  private navigation: NavigationSettings = {
+    speed: 1,
+    damping: 0.82,
+    invertOrbitX: false,
+    invertOrbitY: false,
+    invertPan: false,
+    trackpadScheme: "orbit",
+  };
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -357,6 +366,21 @@ export class Shell {
               <option value="fusion">Fusion</option>
               <option value="ansys">Ansys</option>
             </select>
+            <button class="cs-settings" id="nav-settings-btn" title="Navigation settings (speed, damping, invert)" aria-label="Navigation settings">${icon("settings")}</button>
+          </div>
+          <div class="nav-settings" id="nav-settings" hidden>
+            <div class="ns-head">${icon("sliders-horizontal")}<span>Navigation</span></div>
+            <label class="ns-row"><span>Speed</span><input type="range" id="ns-speed" min="0.25" max="2.5" step="0.05" value="1" /><b id="ns-speed-val">1.00×</b></label>
+            <label class="ns-row"><span>Inertia</span><input type="range" id="ns-damping" min="0" max="0.95" step="0.01" value="0.82" /><b id="ns-damping-val">0.82</b></label>
+            <div class="ns-scheme">
+              <span>Two-finger trackpad</span>
+              <label><input type="radio" name="ns-trackpad" value="orbit" checked /> Orbit</label>
+              <label><input type="radio" name="ns-trackpad" value="pan" /> Pan</label>
+            </div>
+            <label class="ns-check"><input type="checkbox" id="ns-invert-x" /> Invert orbit X</label>
+            <label class="ns-check"><input type="checkbox" id="ns-invert-y" /> Invert orbit Y</label>
+            <label class="ns-check"><input type="checkbox" id="ns-invert-pan" /> Invert pan</label>
+            <div class="ns-hint">Shift swaps orbit and pan · pinch always zooms at the cursor.</div>
           </div>
           <div class="status-item">mm</div>
           <div class="status-item" id="status-kernel"><span class="status-dot" id="status-dot"></span><span id="status-kernel-text">OCCT</span></div>
@@ -404,6 +428,19 @@ export class Shell {
     this.viewCube = new ViewCube(this.getId("viewcube"));
     this.viewCube.onView = (name) => this.onView(name);
     this.viewCube.onHome = () => this.onView("iso");
+    // Shapr3D: double-tap (or double-click) the ViewCube fits the model.
+    const cubeEl = this.getId("viewcube");
+    let cubeTap = 0;
+    cubeEl.addEventListener("dblclick", () => this.onZoomFit());
+    cubeEl.addEventListener("pointerup", () => {
+      const now = performance.now();
+      if (now - cubeTap < 340) {
+        cubeTap = 0;
+        this.onZoomFit();
+      } else {
+        cubeTap = now;
+      }
+    });
 
     this.tree = new FeatureTree(this.panelBody, {
       select: (kind, id, additive) => this.onTreeSelect(kind, id, additive),
@@ -483,6 +520,7 @@ export class Shell {
     this.root.querySelector<HTMLSelectElement>("#mouse-preset")?.addEventListener("change", (event) => {
       this.setMousePreset((event.target as HTMLSelectElement).value as "solidworks" | "fusion" | "ansys");
     });
+    this.bindNavigationSettings();
     this.menuLayer.addEventListener("click", (e) => {
       if (e.target === this.menuLayer) this.closeMenu();
     });
@@ -546,14 +584,99 @@ export class Shell {
       if (savedMode === "mouse" || savedMode === "trackpad" || savedMode === "pen") mode = savedMode;
       const savedPreset = localStorage.getItem("marmaracad.mousePreset");
       if (savedPreset === "solidworks" || savedPreset === "fusion" || savedPreset === "ansys") preset = savedPreset;
+      const savedNav = localStorage.getItem("marmaracad.navigation");
+      if (savedNav) {
+        const parsed = JSON.parse(savedNav) as Partial<NavigationSettings>;
+        this.navigation = {
+          speed: typeof parsed.speed === "number" ? parsed.speed : this.navigation.speed,
+          damping: typeof parsed.damping === "number" ? parsed.damping : this.navigation.damping,
+          invertOrbitX: parsed.invertOrbitX === true,
+          invertOrbitY: parsed.invertOrbitY === true,
+          invertPan: parsed.invertPan === true,
+          trackpadScheme: parsed.trackpadScheme === "pan" ? "pan" : "orbit",
+        };
+      }
     } catch {
       /* private mode / blocked storage */
     }
     this.controlMode = mode;
     this.mousePreset = preset;
     this.refreshControlMode();
+    this.refreshNavigationInputs();
     this.onControlMode(mode);
     this.onMousePreset(preset);
+    this.onNavigationSettings({ ...this.navigation });
+  }
+
+  /** Speed / damping / invert / trackpad-scheme popover in the status bar. */
+  private bindNavigationSettings(): void {
+    const button = this.root.querySelector<HTMLElement>("#nav-settings-btn");
+    const popover = this.root.querySelector<HTMLElement>("#nav-settings");
+    if (!button || !popover) return;
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      popover.hidden = !popover.hidden;
+      button.classList.toggle("active", !popover.hidden);
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (popover.hidden) return;
+      const target = event.target as Node;
+      if (!popover.contains(target) && !button.contains(target)) {
+        popover.hidden = true;
+        button.classList.remove("active");
+      }
+    });
+    const speed = this.root.querySelector<HTMLInputElement>("#ns-speed");
+    const damping = this.root.querySelector<HTMLInputElement>("#ns-damping");
+    speed?.addEventListener("input", () => this.updateNavigation({ speed: Number(speed.value) }));
+    damping?.addEventListener("input", () => this.updateNavigation({ damping: Number(damping.value) }));
+    this.root.querySelectorAll<HTMLInputElement>('input[name="ns-trackpad"]').forEach((radio) => {
+      radio.addEventListener("change", () => {
+        if (radio.checked) this.updateNavigation({ trackpadScheme: radio.value === "pan" ? "pan" : "orbit" });
+      });
+    });
+    const bindCheck = (id: string, key: "invertOrbitX" | "invertOrbitY" | "invertPan") => {
+      const input = this.root.querySelector<HTMLInputElement>(`#${id}`);
+      input?.addEventListener("change", () => this.updateNavigation({ [key]: input.checked } as Partial<NavigationSettings>));
+    };
+    bindCheck("ns-invert-x", "invertOrbitX");
+    bindCheck("ns-invert-y", "invertOrbitY");
+    bindCheck("ns-invert-pan", "invertPan");
+  }
+
+  private updateNavigation(patch: Partial<NavigationSettings>): void {
+    this.navigation = { ...this.navigation, ...patch };
+    this.refreshNavigationInputs();
+    try {
+      localStorage.setItem("marmaracad.navigation", JSON.stringify(this.navigation));
+    } catch {
+      /* ignore */
+    }
+    this.onNavigationSettings({ ...this.navigation });
+  }
+
+  private refreshNavigationInputs(): void {
+    const speed = this.root.querySelector<HTMLInputElement>("#ns-speed");
+    const damping = this.root.querySelector<HTMLInputElement>("#ns-damping");
+    if (speed) speed.value = String(this.navigation.speed);
+    if (damping) damping.value = String(this.navigation.damping);
+    const speedVal = this.root.querySelector<HTMLElement>("#ns-speed-val");
+    const dampingVal = this.root.querySelector<HTMLElement>("#ns-damping-val");
+    if (speedVal) speedVal.textContent = `${this.navigation.speed.toFixed(2)}×`;
+    if (dampingVal) dampingVal.textContent = this.navigation.damping.toFixed(2);
+    this.root.querySelectorAll<HTMLInputElement>('input[name="ns-trackpad"]').forEach((radio) => {
+      radio.checked = radio.value === this.navigation.trackpadScheme;
+    });
+    const x = this.root.querySelector<HTMLInputElement>("#ns-invert-x");
+    const y = this.root.querySelector<HTMLInputElement>("#ns-invert-y");
+    const pan = this.root.querySelector<HTMLInputElement>("#ns-invert-pan");
+    if (x) x.checked = this.navigation.invertOrbitX;
+    if (y) y.checked = this.navigation.invertOrbitY;
+    if (pan) pan.checked = this.navigation.invertPan;
+  }
+
+  get navigationSettings(): NavigationSettings {
+    return { ...this.navigation };
   }
 
   setControlMode(mode: "mouse" | "trackpad" | "pen"): void {

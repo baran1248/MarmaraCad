@@ -8,6 +8,7 @@ import type {
   Feature,
   FeaMeshKind,
   FeaNodeResult,
+  FaceInfo,
   Mate,
   MeshData,
   Part,
@@ -16,6 +17,7 @@ import type {
   ReferencePlane,
   Sketch,
   SketchPlane,
+  SheetMetalState,
   SupportKind,
   Vec2,
   Vec3,
@@ -38,6 +40,7 @@ import {
   type DisplayStyle,
   type EdgePick,
   type FacePick,
+  type GizmoDragEvent,
   type PickFilter,
   type SceneBody,
   type SectionState,
@@ -45,7 +48,7 @@ import {
   type ViewName,
 } from "./viewport/Viewport";
 import { SketchEditor, type SketchTool } from "./sketch/SketchEditor";
-import { profileSummary } from "./sketch/geometry";
+import { profileSummary, planePoint } from "./sketch/geometry";
 import { dimensionValue } from "./sketch/solver";
 import { cadClient } from "./kernel/CadClient";
 import { cloneDocument, parseProject, serializeProject } from "./io/project";
@@ -58,6 +61,23 @@ import { faceRefFromPick, solveMates } from "./assembly/mates";
 import { MATERIALS, materialById, partMaterial } from "./analysis/materials";
 import { applyVariables, evaluateExpression, makeVariable, standardVariables, variableValues } from "./model/variables";
 import { createFastenerPart, METRIC_SIZES } from "./model/toolbox";
+import {
+  DEFAULT_BEND_RADIUS,
+  DEFAULT_K_FACTOR,
+  DEFAULT_SHEET_THICKNESS,
+  flatPattern,
+  flatPatternDxf,
+  nearestSide,
+  sheetMetalRecipe,
+  type FlatPattern,
+} from "./model/sheetMetal";
+import {
+  activeConfiguration,
+  addConfiguration,
+  applyConfiguration,
+  ensureConfigurations,
+  removeConfiguration,
+} from "./model/configurations";
 import { buildDrawingSvg, downloadDrawingPdf } from "./drawing/technicalDrawing";
 import { Assistant, type AiCommand } from "./ui/Assistant";
 import { alertDialog, confirmDialog, openModal, promptNumber, toast } from "./ui/Modal";
@@ -175,6 +195,7 @@ export class App {
   private assistant: Assistant;
   private measurePicks: { kind: "face" | "edge" | "vertex"; label: string; point: Vec3; normal?: Vec3; length?: number }[] = [];
   private lastPointer = { x: 0, y: 0 };
+  private componentDragBefore: ProjectDocument | null = null;
   private expanded = new Set<string>(["origin"]);
   private planesVisible = false;
   private displayStyle: DisplayStyle = "shaded-edges";
@@ -272,6 +293,7 @@ export class App {
     this.bindShell();
     this.viewport.setControlMode(this.shell.inputMode);
     this.viewport.setMousePreset(this.shell.inputPreset);
+    this.viewport.setNavigationSettings(this.shell.navigationSettings);
     this.bindViewport();
     this.bindKeys();
 
@@ -329,6 +351,7 @@ export class App {
       this.shell.setPickFilter("all");
       this.viewport.setPickFilter("all");
       this.shell.setCommandTab(this.doc.mode === "assembly" ? "assembly" : this.doc.mode === "analysis" ? "analysis" : "features");
+      this.viewport.setComponentDragEnabled(this.doc.mode === "assembly");
       this.refreshTree();
       this.updateMassCard();
       await this.rebuild();
@@ -418,6 +441,9 @@ export class App {
       const label = preset === "solidworks" ? "SolidWorks" : preset === "fusion" ? "Fusion 360" : "Ansys";
       this.shell.setStatus(`Mouse preset · ${label} · MMB orbit, Ctrl+MMB pan, wheel zoom, RMB menu`);
     };
+    this.shell.onNavigationSettings = (settings) => {
+      this.viewport.setNavigationSettings(settings);
+    };
     this.viewport.onCameraChange = () => this.shell.setViewCubeSynced(this.viewport.camera);
   }
 
@@ -430,6 +456,16 @@ export class App {
     this.viewport.onPickFilterChanged = (filter) => this.shell.setPickFilter(filter);
     this.viewport.onHoverFace = () => undefined;
     this.viewport.onHoverEdge = () => undefined;
+    this.viewport.onTouchDoubleTap = (pick) => {
+      if (pick) this.lookNormalToFace(pick);
+      else this.viewport.zoomFit();
+    };
+    this.viewport.onThreeFingerSwipe = (direction) => {
+      if (direction < 0) this.undo();
+      else this.redo();
+    };
+    this.viewport.onGizmoDrag = (event) => this.handleGizmoDrag(event);
+    this.viewport.onComponentDrag = (event) => this.handleComponentDrag(event);
     // Capture modifier state before the viewport consumes the pointer event.
     document.addEventListener(
       "pointerdown",
@@ -494,6 +530,16 @@ export class App {
         event.preventDefault();
         this.panelRoot.querySelector<HTMLElement>("[data-pm-ok]")?.click();
         return;
+      }
+      // Push/Pull by value: Enter with a face handle active opens the numeric
+      // panel (drag is the other route to the same parametric feature).
+      if (event.key === "Enter" && !this.panelRoot && !this.editor.isActive && !this.command) {
+        const gizmo = this.viewport.getActiveGizmo();
+        if (gizmo?.kind === "face" && gizmo.face) {
+          event.preventDefault();
+          this.openPushPullValue(gizmo.face);
+          return;
+        }
       }
       const ctrl = event.ctrlKey || event.metaKey;
       if (ctrl && event.key === "8") {
@@ -722,6 +768,8 @@ export class App {
     this.shell.setCommandTab(this.doc.mode === "assembly" ? "assembly" : this.doc.mode === "analysis" ? "analysis" : "features");
     this.shell.setDisplayState(this.displayStyle, this.planesVisible);
     this.viewport.setPlanesVisible(this.planesVisible);
+    this.viewport.setComponentDragEnabled(this.doc.mode === "assembly");
+    this.viewport.clearGizmo();
     this.refreshTree();
     this.updateMassCard();
     this.touchDocument();
@@ -859,6 +907,7 @@ export class App {
         assetFormat: part.asset?.format,
         assetRev: part.asset?.rev,
         rollbackIndex: part.rollbackIndex,
+        sheetMetal: part.sheetMetal,
       }));
     if (cadParts.length === 0) {
       this.refreshScene();
@@ -887,6 +936,7 @@ export class App {
       }
       if (messages.length) toast(messages[0], "warn", 6000);
       this.refreshScene();
+      this.refreshBendLines();
       this.shell.setStatus(`Rebuilt in ${result.kernelMs} ms · ${this.viewport.bodyCount} body(ies)`);
       this.refreshTree();
       this.updateMassCard();
@@ -1107,6 +1157,8 @@ export class App {
     this.shell.setMode(mode);
     this.shell.setCommandTab(mode === "assembly" ? "assembly" : mode === "analysis" ? "analysis" : "features");
     this.shell.setDocument(this.doc);
+    this.viewport.setComponentDragEnabled(mode === "assembly");
+    this.viewport.clearGizmo();
     this.refreshScene();
     this.refreshTree();
     this.touchDocument();
@@ -1192,6 +1244,20 @@ export class App {
   }
 
   private async treeOpen(kind: string, id: string): Promise<void> {
+    if (kind === "configuration") {
+      const part = this.activePart();
+      if (!part) return;
+      const before = this.capture();
+      if (applyConfiguration(part, this.doc, id)) {
+        applyVariables(this.doc);
+        this.commit(before);
+        this.refreshTree();
+        await this.rebuild();
+        this.updateMassCard();
+        this.shell.setStatus(`Configuration “${part.configurations?.find((c) => c.id === id)?.name ?? id}” active`);
+      }
+      return;
+    }
     if (kind === "plane") {
       this.startSketch(basePlane(id as "front" | "top" | "right"));
       return;
@@ -1314,6 +1380,10 @@ export class App {
       await this.newSketchCommand();
       return;
     }
+    if (action === "configurations" || action === "configuration-add") {
+      this.openConfigurations();
+      return;
+    }
     if (action === "sample") {
       await this.loadSample();
       return;
@@ -1400,6 +1470,7 @@ export class App {
     }
     this.selectedFace = this.selFaces[this.selFaces.length - 1] ?? null;
     this.syncSelection();
+    this.refreshDirectGizmo();
   }
 
   private handleEdgePick(pick: EdgePick | null): void {
@@ -1421,6 +1492,7 @@ export class App {
       this.selVertices = [];
     }
     this.syncSelection();
+    this.refreshDirectGizmo();
   }
 
   private handleVertexPick(pick: VertexPick | null): void {
@@ -1454,6 +1526,7 @@ export class App {
     this.viewport.setSelectedEdges([]);
     this.viewport.setSelectedVertices([]);
     this.shell.setSelection(null);
+    this.viewport.clearGizmo();
     this.shell.setStatus("Ready");
   }
 
@@ -1483,8 +1556,52 @@ export class App {
     );
   }
 
-  private applyBoxSelection(selection: BoxSelection): void {
-    const filter = this.viewport.getPickFilter();
+  /** Numeric Push/Pull panel opened by Enter while a face handle is visible. */
+  private openPushPullValue(pick: FacePick): void {
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "move-3d",
+      title: "Push / Pull",
+      sub: `Face ${pick.faceIndex + 1} · ${pick.face.surface}`,
+      body:
+        pmSection(
+          "Offset",
+          "move-3d",
+          pmField("Distance", numInput("pm-pushpull-distance", 10, "mm", 0.1)) +
+            `<div class="hint">Positive pulls the face outwards (boss), negative pushes it inwards (cut). The result is a normal parametric feature and can be undone with Ctrl+Z.</div>`,
+        ),
+      onOk: () => {
+        const distance = readNumber(this.panelRoot ?? document, "pm-pushpull-distance", 10);
+        if (Math.abs(distance) < 0.05) {
+          toast("Enter a non-zero distance.", "warn");
+          return;
+        }
+        this.pushPullFromFace(pick, distance);
+      },
+    });
+  }
+
+  /** Show the Shapr3D direct-modeling handle for the current selection:
+   *  a push/pull arrow on one planar face, a fillet/chamfer knob on one edge. */
+  private refreshDirectGizmo(): void {
+    if (this.doc.mode !== "part" || this.editor.isActive || this.command) {
+      this.viewport.clearGizmo();
+      return;
+    }
+    const face = this.selFaces.length === 1 ? this.selFaces[0] : null;
+    if (face && face.face.surface === "plane") {
+      this.viewport.showFaceGizmo(face);
+      return;
+    }
+    const edge = !face && this.selEdges.length === 1 ? this.selEdges[0] : null;
+    if (edge) {
+      this.viewport.showEdgeGizmo(edge);
+      return;
+    }
+    this.viewport.clearGizmo();
+  }
+
+  private applyBoxSelection(selection: BoxSelection): void {    const filter = this.viewport.getPickFilter();
     const additive = this.pickMods.additive;
     const faces = filter === "face" || filter === "all" ? selection.faces : [];
     const edges = filter === "edge" ? selection.edges : [];
@@ -1683,6 +1800,252 @@ export class App {
     }
     this.viewport.setView("front");
     this.shell.setStatus("Normal to front plane");
+  }
+
+  /** Shapr3D touch double-tap: look straight at the tapped face. */
+  private lookNormalToFace(pick: FacePick): void {
+    this.viewport.normalTo(pick.face.point, pick.face.normal);
+    this.shell.setStatus(`Normal to face ${pick.faceIndex + 1}`);
+  }
+
+  /**
+   * Live assembly drag. The pointer delta moves the component freely, then the
+   * mate solver projects it back onto the constraint manifold: a concentric
+   * mate keeps the axis (radial residual ≈ 0) and leaves sliding/rotation along
+   * it, a coincident mate keeps the face plane and leaves in-plane motion.
+   */
+  private handleComponentDrag(event: { componentId: string; delta: Vec3; done: boolean; start: boolean }): void {
+    if (this.doc.mode !== "assembly") return;
+    const component = this.doc.components.find((c) => c.id === event.componentId);
+    if (!component || component.fixed) return;
+    if (event.start) {
+      this.componentDragBefore = this.capture();
+      return;
+    }
+    if (event.done) {
+      const before = this.componentDragBefore;
+      this.componentDragBefore = null;
+      if (before) {
+        this.commit(before);
+        this.resolveMates();
+        this.refreshTree();
+      }
+      return;
+    }
+    component.position = [
+      component.position[0] + event.delta[0],
+      component.position[1] + event.delta[1],
+      component.position[2] + event.delta[2],
+    ];
+    // Multiple projection passes converge for chained mates without fighting
+    // the drag: each pass only removes the residual the constraints forbid.
+    if (this.doc.mates.length) solveMates(this.doc, { iterations: 6 });
+    this.refreshScene();
+    this.shell.setStatus(
+      `Dragging ${component.name} · ${this.doc.mates.length ? `${this.doc.mates.length} mate(s) projected` : "free component"}`,
+    );
+  }
+
+  // ------------------------------------------------------- direct modelling
+
+  private handleGizmoDrag(event: GizmoDragEvent): void {
+    if (event.kind === "face" && event.face) {
+      if (!event.done) {
+        this.shell.setStatus(
+          `${event.distance >= 0 ? "Pull" : "Push"} ${Math.abs(event.distance).toFixed(2)} mm — release to create the feature`,
+        );
+        return;
+      }
+      this.pushPullFromFace(event.face, event.distance);
+      return;
+    }
+    if (event.kind === "edge" && event.edge) {
+      if (!event.done) {
+        this.shell.setStatus(
+          event.distance >= 0
+            ? `Fillet radius ${event.distance.toFixed(2)} mm — release to apply`
+            : `Chamfer ${Math.abs(event.distance).toFixed(2)} mm — release to apply`,
+        );
+        return;
+      }
+      this.filletFromEdgeDrag(event.edge, event.distance);
+    }
+  }
+
+  /** Turn the picked planar face into a sketch on its plane and extrude/cut it.
+   *  The result is a normal parametric feature (depth editable in the tree). */
+  private pushPullFromFace(pick: FacePick, distance: number): void {
+    const part = this.activePart();
+    if (!part || this.doc.mode !== "part") return;
+    const amount = Math.abs(distance);
+    if (amount < 0.05) return;
+    if (pick.face.surface !== "plane") {
+      toast("Push/Pull needs a planar face.", "warn");
+      return;
+    }
+    const mesh = this.meshForPart(part.id);
+    if (!mesh) return;
+    const loops = this.faceBoundaryLoops(mesh, pick.face);
+    if (loops.length === 0) {
+      toast("The face boundary could not be projected into a sketch.", "warn");
+      return;
+    }
+    const normal = pick.face.normal;
+    const helper: Vec3 = Math.abs(normal[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+    const nVec = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize();
+    const uVec = new THREE.Vector3(helper[0], helper[1], helper[2]).cross(nVec).normalize();
+    const vVec = new THREE.Vector3().crossVectors(nVec, uVec).normalize();
+    const u: Vec3 = [uVec.x, uVec.y, uVec.z];
+    const v: Vec3 = [vVec.x, vVec.y, vVec.z];
+    const origin = pick.face.point;
+    const plane: SketchPlane = {
+      kind: "face",
+      name: `Face ${pick.faceIndex + 1}`,
+      origin,
+      u,
+      v,
+      n: normal,
+      faceIndex: pick.faceIndex,
+    };
+    const toSketch = (p: Vec3): Vec2 => {
+      const d = new THREE.Vector3(p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]);
+      return { x: d.dot(uVec), y: d.dot(vVec) };
+    };
+    const before = this.capture();
+    const sketch: Sketch = {
+      id: uid("sk"),
+      name: nextSketchName(part.sketches),
+      plane,
+      points: [],
+      entities: [],
+      constraints: [],
+      visible: true,
+    };
+    for (const loop of loops) {
+      const ids: string[] = [];
+      for (const p of loop) {
+        const pt = toSketch(p);
+        const id = uid("pt");
+        sketch.points.push({ id, x: pt.x, y: pt.y });
+        ids.push(id);
+      }
+      for (let i = 0; i < ids.length; i++) {
+        sketch.entities.push({ id: uid("ln"), kind: "line", p1: ids[i], p2: ids[(i + 1) % ids.length] });
+      }
+    }
+    part.sketches.push(sketch);
+    const type = distance >= 0 ? "extrude" : "cut";
+    const feature: Feature = {
+      id: uid("feat"),
+      type,
+      name: nextFeatureName("pushPull", part.features),
+      sketchId: sketch.id,
+      params: {
+        depth: amount,
+        direction: distance >= 0 ? 1 : -1,
+        operation: distance >= 0 ? "join" : "cut",
+        // Marks the feature so the UI can label it as a direct edit.
+        pushPull: true,
+      },
+    };
+    part.features.push(feature);
+    this.selection = { kind: "feature", id: feature.id };
+    this.commit(before);
+    this.viewport.clearGizmo();
+    this.finishCommand();
+    this.refreshTree();
+    void this.rebuild().then(() => {
+      this.updateMassCard();
+      this.shell.setStatus(
+        `${distance >= 0 ? "Pulled" : "Pushed"} face ${pick.faceIndex + 1} by ${amount.toFixed(2)} mm · ${feature.name}`,
+      );
+    });
+  }
+
+  /** Boundary loops (world space) of one tessellated face. */
+  private faceBoundaryLoops(mesh: MeshData, face: FaceInfo): Vec3[][] {
+    const start = face.triStart;
+    const count = face.triCount;
+    const edges = new Map<string, { a: number; b: number; count: number }>();
+    for (let t = start; t < start + count; t++) {
+      const i0 = mesh.indices[t * 3];
+      const i1 = mesh.indices[t * 3 + 1];
+      const i2 = mesh.indices[t * 3 + 2];
+      const tri = [i0, i1, i2];
+      for (let e = 0; e < 3; e++) {
+        const a = tri[e];
+        const b = tri[(e + 1) % 3];
+        const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+        const found = edges.get(key);
+        if (found) found.count++;
+        else edges.set(key, { a, b, count: 1 });
+      }
+    }
+    const next = new Map<number, number[]>();
+    for (const edge of edges.values()) {
+      if (edge.count !== 1) continue;
+      if (!next.has(edge.a)) next.set(edge.a, []);
+      if (!next.has(edge.b)) next.set(edge.b, []);
+      next.get(edge.a)!.push(edge.b);
+      next.get(edge.b)!.push(edge.a);
+    }
+    const point = (index: number): Vec3 => [mesh.positions[index * 3], mesh.positions[index * 3 + 1], mesh.positions[index * 3 + 2]];
+    const loops: Vec3[][] = [];
+    const visited = new Set<string>();
+    for (const [startVertex, neighbours] of next) {
+      for (const first of neighbours) {
+        const key = startVertex < first ? `${startVertex}:${first}` : `${first}:${startVertex}`;
+        if (visited.has(key)) continue;
+        const loop: Vec3[] = [];
+        let current = startVertex;
+        let guard = 0;
+        visited.add(key);
+        loop.push(point(current));
+        let prev = startVertex;
+        let cursor = first;
+        while (guard++ < 10000) {
+          loop.push(point(cursor));
+          const options = next.get(cursor) ?? [];
+          const following = options.find((n) => n !== prev && !visited.has(cursor < n ? `${cursor}:${n}` : `${n}:${cursor}`));
+          visited.add(cursor < prev ? `${cursor}:${prev}` : `${prev}:${cursor}`);
+          if (following === undefined) break;
+          prev = cursor;
+          cursor = following;
+          if (cursor === startVertex) break;
+        }
+        if (loop.length >= 3) loops.push(loop);
+      }
+    }
+    return loops;
+  }
+
+  /** Direct fillet (positive drag) or chamfer (negative drag) on one edge. */
+  private filletFromEdgeDrag(pick: EdgePick, distance: number): void {
+    const part = this.activePart();
+    if (!part || this.doc.mode !== "part") return;
+    const amount = Math.abs(distance);
+    if (amount < 0.05) return;
+    const before = this.capture();
+    const type = distance >= 0 ? "fillet" : "chamfer";
+    const feature: Feature = {
+      id: uid("feat"),
+      type,
+      name: nextFeatureName(type, part.features),
+      params:
+        type === "fillet"
+          ? { radius: amount, edgeIndices: [pick.edgeIndex] }
+          : { distance: amount, edgeIndices: [pick.edgeIndex] },
+    };
+    part.features.push(feature);
+    this.selection = { kind: "feature", id: feature.id };
+    this.commit(before);
+    this.viewport.clearGizmo();
+    this.finishCommand();
+    this.refreshTree();
+    void this.rebuild().then(() => {
+      this.updateMassCard();
+      this.shell.setStatus(`${type === "fillet" ? "Fillet" : "Chamfer"} ${amount.toFixed(2)} mm · ${feature.name}`);
+    });
   }
 
   private openShortcutBar(): void {
@@ -2525,6 +2888,102 @@ export class App {
       case "buckling":
         await this.setupFeaFromAi({ ...params, analysis: command.action });
         return true;
+      case "sheet-metal-flange": {
+        if (!active) return false;
+        this.ensureSheetMetal(active);
+        const sheet = active.sheetMetal!;
+        const thickness = Math.max(0.1, num("thickness", sheet.thickness));
+        const radius = Math.max(0.05, num("radius", sheet.radius));
+        const kFactor = clamp(num("kFactor", sheet.kFactor), 0, 0.5);
+        const sketch = this.defaultSketchForFeature(active);
+        if (!sketch) return false;
+        active.sheetMetal = { thickness, radius, kFactor, flattened: false, flanges: [] };
+        active.features.push({
+          id: uid("feat"),
+          type: "baseFlange",
+          name: nextFeatureName("baseFlange", active.features),
+          sketchId: sketch.id,
+          params: { sheetThickness: thickness, bendRadius: radius, kFactor, sheetWidth: num("width", 40) },
+        });
+        if (params.edgeFlange !== false) {
+          // A sketch rebuild can leave an empty mesh behind: it has no edges, so
+          // rebuild once after the base flange before picking the outer edge.
+          const existing = this.meshForPart(active.id);
+          if (!existing || existing.edges.length === 0) await this.rebuild();
+          const mesh = this.meshForPart(active.id);
+          const edges = mesh?.edges ?? [];
+          // Use the longest straight edge: on a plate that is an outer boundary
+          // edge, never one of the thin thickness edges.
+          let straight = -1;
+          let longest = 0;
+          edges.forEach((edge, index) => {
+            if (edge.points.length >= 2 && edge.length > longest) {
+              longest = edge.length;
+              straight = index;
+            }
+          });
+          if (straight >= 0) {
+            const edgePick: EdgePick = { componentId: null, partId: active.id, edgeIndex: straight, edge: edges[straight] };
+            const angle = clamp(num("angle", 90), 1, 179);
+            const length = Math.max(0.1, num("length", 20));
+            active.features.push({
+              id: uid("feat"),
+              type: "edgeFlange",
+              name: nextFeatureName("edgeFlange", active.features),
+              params: { edgeIndex: straight, flangeAngle: angle, flangeLength: length, bendRadius: radius, sheetThickness: thickness, kFactor },
+            });
+            active.sheetMetal.flanges.push({
+              id: uid("flange"),
+              featureId: active.features[active.features.length - 1].id,
+              edgeIndex: straight,
+              angle,
+              length,
+              radius,
+              thickness,
+              kFactor,
+              ...this.flangeFlatPlacement(active, edgePick),
+            });
+          }
+        }
+        return true;
+      }
+      case "flatten": {
+        if (!active?.sheetMetal) return false;
+        active.sheetMetal.flattened = params.enabled !== false;
+        return true;
+      }
+      case "configuration": {
+        if (!active) return false;
+        const configs = ensureConfigurations(active);
+        const copyFrom = text("copyFrom");
+        const source = copyFrom ? configs.find((c) => c.name === copyFrom || c.id === copyFrom) : undefined;
+        const config = addConfiguration(active, text("name", `Config ${configs.length + 1}`), source);
+        const variables = params.variables;
+        if (variables && typeof variables === "object") {
+          for (const [name, expression] of Object.entries(variables as Record<string, unknown>)) {
+            config.variables[name] = String(expression);
+          }
+        }
+        if (Array.isArray(params.suppress)) {
+          config.suppressed = (params.suppress as unknown[]).map(String);
+        }
+        this.doc.variables ??= [];
+        applyConfiguration(active, this.doc, config.id);
+        applyVariables(this.doc);
+        return true;
+      }
+      case "push-pull": {
+        if (!active) return false;
+        if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
+        const mesh = this.meshForPart(active.id);
+        if (!mesh) return false;
+        const faceIndex = num("faceIndex", -1);
+        const face = mesh.faces.find((f) => f.index === faceIndex) ?? mesh.faces.find((f) => f.surface === "plane");
+        if (!face) return false;
+        const pick: FacePick = { componentId: null, partId: active.id, faceIndex: face.index, face };
+        this.pushPullFromFace(pick, num("distance", 5));
+        return true;
+      }
       case "mate":
         return this.createMateFromAi(params);
       case "material": {
@@ -2891,9 +3350,9 @@ export class App {
       this.shell.setMode("assembly");
       this.shell.setCommandTab("assembly");
       this.shell.setDocument(this.doc);
+      this.viewport.setComponentDragEnabled(true);
     }
-    const report = solveMates(this.doc);
-    if (report.errors) toast(`${report.errors} mate(s) could not be resolved.`, "warn");
+    const report = solveMates(this.doc);    if (report.errors) toast(`${report.errors} mate(s) could not be resolved.`, "warn");
     return true;
   }
 
@@ -3658,6 +4117,10 @@ export class App {
           "move-3d",
           pmField("Depth", numInput("pm-depth", depth, "mm", 0.01)) +
             pmField(
+              "Variable",
+              `<input id="pm-depth-expression" class="pm-input" placeholder="e.g. L / 2" value="${escapeHtml(params.depthExpression ?? "")}" />`,
+            ) +
+            pmField(
               "Direction",
               `<select id="pm-direction"><option value="1" ${direction === 1 ? "selected" : ""}>Normal to sketch</option><option value="-1" ${direction === -1 ? "selected" : ""}>Reverse</option></select>`,
             ) +
@@ -3700,6 +4163,7 @@ export class App {
           direction: Number(readText(this.panelRoot ?? document, "pm-direction", "1")) === -1 ? (-1 as const) : (1 as const),
           symmetric: readChecked(this.panelRoot ?? document, "pm-symmetric"),
           operation: isCut ? ("cut" as const) : (readText(this.panelRoot ?? document, "pm-operation", "join") as "join" | "new"),
+          depthExpression: readText(this.panelRoot ?? document, "pm-depth-expression", "").trim() || undefined,
         };
         const before = this.capture();
         if (existing) {
@@ -4414,8 +4878,437 @@ export class App {
     });
   }
 
-  private editFeature(feature: Feature): void {
-    if (this.editor.isActive) {
+  // ------------------------------------------------------------- sheet metal
+
+  private ensureSheetMetal(part: Part): SheetMetalState {
+    part.sheetMetal ??= {
+      thickness: DEFAULT_SHEET_THICKNESS,
+      radius: DEFAULT_BEND_RADIUS,
+      kFactor: DEFAULT_K_FACTOR,
+      flattened: false,
+      flanges: [],
+    };
+    return part.sheetMetal;
+  }
+
+  private openBaseFlange(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to create a sheet-metal body.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    const sketch = this.defaultSketchForFeature(part);
+    if (!sketch) {
+      void alertDialog("Base Flange", "<p>Draw an open or closed sketch first, then run Base Flange.</p>", "layers");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    const sheet = this.ensureSheetMetal(part);
+    const sketchOptions = part.sketches
+      .map((s) => {
+        const summary = profileSummary(s);
+        const open = summary.closed ? "" : " — open";
+        return `<option value="${s.id}" ${s.id === sketch.id ? "selected" : ""}>${escapeHtml(s.name)}${open}</option>`;
+      })
+      .join("");
+    this.showPanel({
+      icon: "layers",
+      title: "Base Flange",
+      sub: "Sheet-metal plate from a sketch",
+      body:
+        pmSection(
+          "Profile",
+          "drafting-compass",
+          pmField("Sketch", `<select id="pm-sheet-sketch">${sketchOptions}</select>`) +
+            `<div class="hint">A closed profile becomes a plate; an open profile becomes a thin band swept by the width.</div>`,
+        ) +
+        pmSection(
+          "Sheet Metal",
+          "layers",
+          pmField("Thickness", numInput("pm-sheet-thickness", sheet.thickness, "mm", 0.1)) +
+            pmField("Bend radius", numInput("pm-sheet-radius", sheet.radius, "mm", 0.1)) +
+            pmField("K-Factor", numInput("pm-sheet-k", sheet.kFactor, "", 0.01, "0.01")) +
+            pmField("Open-sketch width", numInput("pm-sheet-width", 40, "mm", 1)),
+        ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const sketchId = readText(root, "pm-sheet-sketch", sketch.id);
+        const target = part.sketches.find((s) => s.id === sketchId);
+        if (!target) {
+          toast("Select a sketch for the base flange.", "warn");
+          return;
+        }
+        const thickness = Math.max(0.1, readNumber(root, "pm-sheet-thickness", sheet.thickness));
+        const radius = Math.max(0.05, readNumber(root, "pm-sheet-radius", sheet.radius));
+        const kFactor = Math.max(0, Math.min(0.5, readNumber(root, "pm-sheet-k", sheet.kFactor)));
+        const width = Math.max(1, readNumber(root, "pm-sheet-width", 40));
+        const before = this.capture();
+        part.sheetMetal = { thickness, radius, kFactor, flattened: false, flanges: [] };
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "baseFlange",
+          name: nextFeatureName("baseFlange", part.features),
+          sketchId: target.id,
+          params: { sheetThickness: thickness, bendRadius: radius, kFactor, sheetWidth: width },
+        };
+        part.features.push(feature);
+        part.rollbackIndex = undefined;
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild().then(() => {
+          this.updateMassCard();
+          this.shell.setStatus(`Base flange ${thickness.toFixed(2)} mm · K ${kFactor.toFixed(2)}`);
+        });
+      },
+    });
+  }
+
+  private openEdgeFlange(): void {
+    if (this.doc.mode !== "part") {
+      toast("Switch to Part mode to modify the sheet-metal part.", "warn");
+      return;
+    }
+    const part = this.activePart();
+    if (!part) return;
+    const sheet = part.sheetMetal;
+    if (!sheet || !part.features.some((f) => f.type === "baseFlange")) {
+      toast("Create a Base Flange first.", "warn");
+      return;
+    }
+    const edge = this.selEdges[0];
+    if (!edge) {
+      toast("Select a straight edge of the sheet body, then run Edge Flange.", "warn");
+      return;
+    }
+    if (this.command) this.cancelCommand();
+    this.showPanel({
+      icon: "workflow",
+      title: "Edge Flange",
+      sub: `Edge ${edge.edgeIndex + 1} · ${fmt(edge.edge.length, 1)} mm`,
+      body: pmSection(
+        "Flange",
+        "workflow",
+        pmField("Angle", numInput("pm-flange-angle", 90, "°", 1)) +
+          pmField("Length", numInput("pm-flange-length", 20, "mm", 0.5)) +
+          pmField("Bend radius", numInput("pm-flange-radius", sheet.radius, "mm", 0.1)) +
+          pmField("K-Factor", numInput("pm-flange-k", sheet.kFactor, "", 0.01, "0.01")) +
+          `<div class="hint">The wall is swept along the picked edge with a real bend of radius R. Flatten uses BA = (π/180)·θ·(R + K·t).</div>`,
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const angle = clamp(readNumber(root, "pm-flange-angle", 90), 1, 179);
+        const length = Math.max(0.1, readNumber(root, "pm-flange-length", 20));
+        const radius = Math.max(0.05, readNumber(root, "pm-flange-radius", sheet.radius));
+        const kFactor = clamp(readNumber(root, "pm-flange-k", sheet.kFactor), 0, 0.5);
+        const before = this.capture();
+        const feature: Feature = {
+          id: uid("feat"),
+          type: "edgeFlange",
+          name: nextFeatureName("edgeFlange", part.features),
+          params: {
+            edgeIndex: edge.edgeIndex,
+            flangeAngle: angle,
+            flangeLength: length,
+            bendRadius: radius,
+            sheetThickness: sheet.thickness,
+            kFactor,
+          },
+        };
+        part.features.push(feature);
+        part.sheetMetal = {
+          ...sheet,
+          radius,
+          kFactor,
+          flanges: [
+            ...sheet.flanges,
+            {
+              id: uid("flange"),
+              featureId: feature.id,
+              edgeIndex: edge.edgeIndex,
+              angle,
+              length,
+              radius,
+              thickness: sheet.thickness,
+              kFactor,
+              ...this.flangeFlatPlacement(part, edge),
+            },
+          ],
+        };
+        this.selection = { kind: "feature", id: feature.id };
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild().then(() => {
+          this.updateMassCard();
+          this.refreshBendLines();
+          this.shell.setStatus(`Edge flange ${angle.toFixed(0)}° × ${length.toFixed(1)} mm`);
+        });
+      },
+    });
+  }
+
+  /** Project the picked edge into the base sketch frame for the flat pattern. */
+  private flangeFlatPlacement(part: Part, edge: EdgePick): { side: "left" | "right" | "bottom" | "top"; from: number; to: number } {
+    const base = part.features.find((f) => f.type === "baseFlange");
+    const sketch = base ? part.sketches.find((s) => s.id === base.sketchId) : part.sketches[0];
+    if (!sketch) return { side: "right", from: 0, to: 0 };
+    const points = sketch.points;
+    const min = { x: Math.min(...points.map((p) => p.x)), y: Math.min(...points.map((p) => p.y)) };
+    const max = { x: Math.max(...points.map((p) => p.x)), y: Math.max(...points.map((p) => p.y)) };
+    const to2d = (p: Vec3): Vec2 => {
+      const dx = p[0] - sketch.plane.origin[0];
+      const dy = p[1] - sketch.plane.origin[1];
+      const dz = p[2] - sketch.plane.origin[2];
+      return {
+        x: dx * sketch.plane.u[0] + dy * sketch.plane.u[1] + dz * sketch.plane.u[2],
+        y: dx * sketch.plane.v[0] + dy * sketch.plane.v[1] + dz * sketch.plane.v[2],
+      };
+    };
+    const a = to2d(edge.edge.points[0]);
+    const b = to2d(edge.edge.points[edge.edge.points.length - 1]);
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const side = nearestSide({ min, max }, mid);
+    const horizontal = side === "top" || side === "bottom";
+    const from = horizontal ? Math.min(a.x, b.x) : Math.min(a.y, b.y);
+    const to = horizontal ? Math.max(a.x, b.x) : Math.max(a.y, b.y);
+    return { side, from, to };
+  }
+
+  private openSheetSettings(): void {
+    const part = this.activePart();
+    if (!part || !part.sheetMetal) {
+      toast("Create a base flange first.", "warn");
+      return;
+    }
+    const sheet = part.sheetMetal;
+    this.showPanel({
+      icon: "settings",
+      title: "Sheet Settings",
+      sub: "Thickness, bend radius and K-Factor",
+      body: pmSection(
+        "Defaults",
+        "settings",
+        pmField("Thickness", numInput("pm-sheet-thickness", sheet.thickness, "mm", 0.1)) +
+          pmField("Bend radius", numInput("pm-sheet-radius", sheet.radius, "mm", 0.1)) +
+          pmField("K-Factor", numInput("pm-sheet-k", sheet.kFactor, "", 0.01, "0.01")),
+      ),
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const before = this.capture();
+        sheet.thickness = Math.max(0.1, readNumber(root, "pm-sheet-thickness", sheet.thickness));
+        sheet.radius = Math.max(0.05, readNumber(root, "pm-sheet-radius", sheet.radius));
+        sheet.kFactor = clamp(readNumber(root, "pm-sheet-k", sheet.kFactor), 0, 0.5);
+        for (const feature of part.features) {
+          if (feature.type === "baseFlange" || feature.type === "edgeFlange") {
+            feature.params.sheetThickness = sheet.thickness;
+            feature.params.bendRadius = sheet.radius;
+            feature.params.kFactor = sheet.kFactor;
+          }
+        }
+        for (const flange of sheet.flanges) {
+          flange.thickness = sheet.thickness;
+          flange.radius = sheet.radius;
+          flange.kFactor = sheet.kFactor;
+        }
+        this.commit(before);
+        this.finishCommand();
+        void this.rebuild().then(() => this.refreshBendLines());
+      },
+    });
+  }
+
+  private sheetMetalPattern(part: Part): FlatPattern | null {
+    const recipe = sheetMetalRecipe(part);
+    if (!recipe) return null;
+    return flatPattern(recipe.base, recipe.flanges);
+  }
+
+  private toggleFlatten(): void {
+    const part = this.activePart();
+    if (!part) return;
+    if (!part.sheetMetal || !part.features.some((f) => f.type === "baseFlange")) {
+      toast("Flatten needs a sheet-metal body (Base Flange).", "warn");
+      return;
+    }
+    const before = this.capture();
+    part.sheetMetal.flattened = !part.sheetMetal.flattened;
+    this.commit(before);
+    void this.rebuild().then(() => {
+      this.refreshBendLines();
+      this.updateMassCard();
+      this.shell.setStatus(part.sheetMetal?.flattened ? "Flat pattern · bend lines dashed" : "Bent sheet-metal body");
+    });
+  }
+
+  /** Draw dashed bend lines when the flat pattern is active. */
+  private refreshBendLines(): void {
+    const part = this.activePart();
+    if (!part || !part.sheetMetal?.flattened) {
+      this.viewport.setBendLines([]);
+      return;
+    }
+    const pattern = this.sheetMetalPattern(part);
+    const base = part.features.find((f) => f.type === "baseFlange");
+    const sketch = base ? part.sketches.find((s) => s.id === base.sketchId) : undefined;
+    const sheet = part.sheetMetal;
+    if (!pattern || !sketch || !sheet) {
+      this.viewport.setBendLines([]);
+      return;
+    }
+    const lift: Vec3 = [
+      sketch.plane.n[0] * (sheet.thickness + 0.02),
+      sketch.plane.n[1] * (sheet.thickness + 0.02),
+      sketch.plane.n[2] * (sheet.thickness + 0.02),
+    ];
+    const world = (p: Vec2): Vec3 => {
+      const w = planePoint(sketch.plane, p);
+      return [w[0] + lift[0], w[1] + lift[1], w[2] + lift[2]];
+    };
+    this.viewport.setBendLines(pattern.bendLines.map((bend) => [world(bend.a), world(bend.b)] as [Vec3, Vec3]));
+  }
+
+  private exportFlatPatternDxf(): void {
+    const part = this.activePart();
+    if (!part) return;
+    const pattern = this.sheetMetalPattern(part);
+    if (!pattern) {
+      toast("Create a Base Flange before exporting a flat pattern.", "warn");
+      return;
+    }
+    const dxf = flatPatternDxf(pattern);
+    const blob = new Blob([dxf], { type: "application/dxf" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${part.name.replace(/\s+/g, "-")}-flat.dxf`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+    this.shell.setStatus(`Flat pattern DXF exported · ${pattern.regions.length} regions · ${pattern.bendLines.length} bend lines`);
+  }
+
+  // --------------------------------------------------------- configurations
+
+  private openConfigurations(): void {
+    const part = this.activePart();
+    if (!part) return;
+    const configs = ensureConfigurations(part);
+    if (this.command) this.cancelCommand();
+    const rows = configs
+      .map(
+        (config) => `<div class="config-row" data-config-id="${config.id}">
+          <button class="config-name ${config.id === part.activeConfigurationId ? "active" : ""}" data-config-activate="${config.id}">
+            ${icon(config.id === part.activeConfigurationId ? "check-circle-2" : "circle")}
+            <span>${escapeHtml(config.name)}</span>
+          </button>
+          <button class="mini-btn" data-config-copy="${config.id}" title="Copy">${icon("plus")}</button>
+          <button class="mini-btn" data-config-delete="${config.id}" title="Delete">${icon("trash-2")}</button>
+        </div>`,
+      )
+      .join("");
+    const active = activeConfiguration(part);
+    const variables = Object.entries(active?.variables ?? {});
+    if (variables.length === 0) {
+      for (const variable of this.doc.variables ?? []) variables.push([variable.name, variable.expression]);
+    }
+    const variableText = variables.map(([name, expression]) => `${name} = ${expression}`).join("\n");
+    const featureRows = part.features
+      .map(
+        (feature) => `<label class="config-check"><input type="checkbox" data-config-suppress="${feature.id}" ${active?.suppressed.includes(feature.id) ? "checked" : ""} /> ${escapeHtml(feature.name)}</label>`,
+      )
+      .join("");
+    this.showPanel({
+      icon: "layers-3",
+      title: "Configurations",
+      sub: `${configs.length} variants · double-click a name to activate`,
+      body:
+        pmSection("Configurations", "layers-3", `<div class="config-list">${rows}</div><button class="mini-btn" data-config-add>${icon("plus")} New configuration</button>`) +
+        pmSection(
+          "Variables",
+          "equal",
+          `<textarea id="pm-config-vars" rows="4" spellcheck="false" placeholder="L = 160">${escapeHtml(variableText)}</textarea>` +
+            `<div class="hint">One NAME = expression per line. Activating the variant rewrites the global variables and rebuilds the model.</div>`,
+        ) +
+        pmSection("Suppressed features", "eye-off", featureRows || `<div class="hint">No features yet.</div>`),
+      onMount: (root) => {
+        root.querySelectorAll<HTMLElement>("[data-config-activate]").forEach((button) => {
+          const activate = () => {
+            const id = button.dataset.configActivate ?? "";
+            const before = this.capture();
+            if (applyConfiguration(part, this.doc, id)) {
+              applyVariables(this.doc);
+              this.commit(before);
+              this.finishCommand();
+              this.refreshTree();
+              void this.rebuild().then(() => this.updateMassCard());
+              toast(`Configuration “${part.configurations?.find((c) => c.id === id)?.name ?? id}” active`, "info");
+              this.openConfigurations();
+            }
+          };
+          button.addEventListener("click", activate);
+          button.addEventListener("dblclick", activate);
+        });
+        root.querySelectorAll<HTMLElement>("[data-config-add]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const created = addConfiguration(part, `Config ${(part.configurations?.length ?? 0) + 1}`);
+            // A brand-new variant becomes the active one so the variable editor
+            // below edits the new configuration, not the one it was copied from.
+            part.activeConfigurationId = created.id;
+            this.openConfigurations();
+          });
+        });
+        root.querySelectorAll<HTMLElement>("[data-config-copy]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const source = part.configurations?.find((c) => c.id === button.dataset.configCopy);
+            const copy = addConfiguration(part, `${source?.name ?? "Config"} copy`, source);
+            part.activeConfigurationId = copy.id;
+            this.openConfigurations();
+          });
+        });
+        root.querySelectorAll<HTMLElement>("[data-config-delete]").forEach((button) => {
+          button.addEventListener("click", () => {
+            if (removeConfiguration(part, button.dataset.configDelete ?? "")) this.openConfigurations();
+            else toast("At least one configuration is required.", "warn");
+          });
+        });
+      },
+      onOk: () => {
+        const root = this.panelRoot ?? document;
+        const id = activeConfiguration(part)?.id;
+        if (!id) return;
+        const config = part.configurations?.find((c) => c.id === id);
+        if (!config) return;
+        const textarea = root.querySelector<HTMLTextAreaElement>("#pm-config-vars");
+        const variables: Record<string, string> = {};
+        for (const line of (textarea?.value ?? "").split(/\r?\n/)) {
+          const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$/.exec(line);
+          if (match) variables[match[1]] = match[2];
+        }
+        const suppress = new Set<string>();
+        root.querySelectorAll<HTMLInputElement>("[data-config-suppress]").forEach((input) => {
+          if (input.checked) suppress.add(input.dataset.configSuppress ?? "");
+        });
+        const before = this.capture();
+        config.variables = variables;
+        config.suppressed = [...suppress].filter(Boolean);
+        part.activeConfigurationId = config.id;
+        // Apply the variant first (it writes the variable expressions and the
+        // suppression flags), then evaluate them so the feature parameters and
+        // sketch dimensions actually follow before the rebuild.
+        applyConfiguration(part, this.doc, config.id);
+        applyVariables(this.doc);
+        this.commit(before);
+        this.finishCommand();
+        this.refreshTree();
+        void this.rebuild().then(() => this.updateMassCard());
+        this.shell.setStatus(`Configuration “${config.name}” saved`);
+      },
+    });
+  }
+
+  private editFeature(feature: Feature): void {    if (this.editor.isActive) {
       toast("Finish the sketch first.", "warn");
       return;
     }
@@ -4493,6 +5386,7 @@ export class App {
     this.shell.setMode("assembly");
     this.shell.setCommandTab("assembly");
     this.shell.setDocument(this.doc);
+    this.viewport.setComponentDragEnabled(true);
     this.refreshScene();
     this.refreshTree();
     this.updateMassCard();
@@ -4614,6 +5508,7 @@ export class App {
       this.shell.setMode("assembly");
       this.shell.setCommandTab("assembly");
       this.shell.setDocument(this.doc);
+      this.viewport.setComponentDragEnabled(true);
       this.refreshScene();
       this.refreshTree();
     }
@@ -7416,6 +8311,24 @@ export class App {
         break;
       case "rib":
         this.openRib();
+        break;
+      case "base-flange":
+        this.openBaseFlange();
+        break;
+      case "edge-flange":
+        this.openEdgeFlange();
+        break;
+      case "flatten":
+        this.toggleFlatten();
+        break;
+      case "export-dxf":
+        this.exportFlatPatternDxf();
+        break;
+      case "sheet-settings":
+        this.openSheetSettings();
+        break;
+      case "configuration-add":
+        this.openConfigurations();
         break;
       case "reference-geometry":
         this.openReferenceGeometry();

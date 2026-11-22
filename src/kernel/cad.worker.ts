@@ -5,6 +5,7 @@ import { getOcct, occtCacheInfo } from "./occt";
 import type { ExportRequest, ImportRequest, KernelResponse, RebuildRequest } from "./protocol";
 import type { EdgeInfo, FaceInfo, Feature, MeshData, Part, RebuildPart, Sketch, SketchPlane, Vec2, Vec3 } from "../model/types";
 import { buildProfileGroups, planePoint, type ProfileGroup, type ProfileLoop } from "../sketch/geometry";
+import { flatPattern, sheetMetalRecipe } from "../model/sheetMetal";
 
 let oc: any = null;
 let bootMs = 0;
@@ -202,8 +203,161 @@ function bboxOf(shape: any): { min: Vec3; max: Vec3 } {
   };
 }
 
-/** Constant-wall shell. Uses a shrunken bounding box cut through the +Y face,
- *  which is exact for the prismatic parts this course models (box, plate,
+/** Build a planar face from an ordered 3-D point loop. */
+function faceFromPoints(points: Vec3[]): any {
+  if (points.length < 3) throw new Error("A flange profile needs at least three points.");
+  const poly = new oc.BRepBuilderAPI_MakePolygon_1();
+  for (const p of points) poly.Add_1(gpPnt(p));
+  poly.Close();
+  if (!poly.IsDone()) throw new Error("Could not close the sheet-metal profile.");
+  const mf = new oc.BRepBuilderAPI_MakeFace_15(poly.Wire(), true);
+  const face = mf.Face();
+  if (!face || face.IsNull()) throw new Error("OCCT could not build the sheet-metal face.");
+  return face;
+}
+
+/** Base Flange: extrude the sketch profile by the sheet thickness. Open
+ *  sketches become a thin band (offset by ±t/2) extruded by `sheetWidth`. */
+function baseFlangeFeature(sketch: Sketch, feature: Feature, shape: any): any {
+  const t = Math.max(0.05, feature.params.sheetThickness ?? 2);
+  const { groups, openChains } = buildProfileGroups(sketch);
+  if (groups.length > 0) {
+    const faces = facesFromSketch(sketch);
+    const tools = faces.map((face) => {
+      const prism = new oc.BRepPrimAPI_MakePrism_1(face, gpVec([sketch.plane.n[0] * t, sketch.plane.n[1] * t, sketch.plane.n[2] * t]), false, true);
+      const s = prism.Shape();
+      if (!s || s.IsNull()) throw new Error("Base flange extrude failed.");
+      return s;
+    });
+    return applyBoolean(shape, fuseShapes(tools), false);
+  }
+  if (openChains.length === 0) throw new Error("Base Flange needs a sketch (open or closed).");
+  const chain = openChains[0];
+  const width = Math.max(1, feature.params.sheetWidth ?? 40);
+  // Offset the open chain by ±t/2 in the sketch plane, then extrude the band.
+  const offset = (sign: number): Vec2[] =>
+    chain.map((p, i) => {
+      const prev = chain[Math.max(0, i - 1)];
+      const next = chain[Math.min(chain.length - 1, i + 1)];
+      const dx = next.x - prev.x;
+      const dy = next.y - prev.y;
+      const len = Math.hypot(dx, dy) || 1;
+      return { x: p.x + (-dy / len) * (t / 2) * sign, y: p.y + (dx / len) * (t / 2) * sign };
+    });
+  const ring = [...offset(1), ...offset(-1).reverse()];
+  if (ring.length < 3) throw new Error("The open sketch is too short for a base flange.");
+  const face = faceFromPoints(ring.map((p) => planePoint(sketch.plane, p)));
+  const prism = new oc.BRepPrimAPI_MakePrism_1(face, gpVec([sketch.plane.n[0] * width, sketch.plane.n[1] * width, sketch.plane.n[2] * width]), false, true);
+  const tool = prism.Shape();
+  if (!tool || tool.IsNull()) throw new Error("Base flange extrude failed.");
+  return applyBoolean(shape, tool, false);
+}
+
+/** Edge Flange: a bent wall swept along the picked straight edge, with the
+ *  inner bend radius R and sheet thickness t. */
+function edgeFlangeFeature(part: RebuildPart, feature: Feature, shape: any): any {
+  if (!shape || shape.IsNull()) throw new Error("Add a base flange before creating an edge flange.");
+  const t = Math.max(0.05, feature.params.sheetThickness ?? 2);
+  const radius = Math.max(0.05, feature.params.bendRadius ?? 2);
+  const angle = Math.max(1, Math.min(179, feature.params.flangeAngle ?? 90)) * DEG;
+  const length = Math.max(0.1, feature.params.flangeLength ?? 20);
+  const index = feature.params.edgeIndex ?? 0;
+  const edges = collectEdges(shape);
+  const edge = edges[index];
+  if (!edge) throw new Error(`Edge ${index + 1} no longer exists after the model change.`);
+  const curve = new oc.BRepAdaptor_Curve_2(edge);
+  const first = curve.FirstParameter();
+  const last = curve.LastParameter();
+  const a = curve.Value(first);
+  const b = curve.Value(last);
+  const A: Vec3 = [a.X(), a.Y(), a.Z()];
+  const B: Vec3 = [b.X(), b.Y(), b.Z()];
+  const edgeLen = Math.hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]);
+  if (edgeLen < 1e-3) throw new Error("Pick a straight edge with non-zero length.");
+  const e: Vec3 = [(B[0] - A[0]) / edgeLen, (B[1] - A[1]) / edgeLen, (B[2] - A[2]) / edgeLen];
+
+  // Sheet plane normal: the base flange sketch's normal (the flange curls out
+  // of the sheet), and the in-plane direction away from the blank.
+  const base = part.features.find((f) => f.type === "baseFlange");
+  const baseSketch = base ? part.sketches.find((s) => s.id === base.sketchId) : undefined;
+  let n: Vec3 = baseSketch ? [...baseSketch.plane.n] : [0, 0, 1];
+  // x points away from the base sketch's bbox centre, in the sheet plane.
+  let x: Vec3 = [
+    e[1] * n[2] - e[2] * n[1],
+    e[2] * n[0] - e[0] * n[2],
+    e[0] * n[1] - e[1] * n[0],
+  ];
+  const xl = Math.hypot(x[0], x[1], x[2]) || 1;
+  x = [x[0] / xl, x[1] / xl, x[2] / xl];
+  const mid: Vec3 = [(A[0] + B[0]) / 2, (A[1] + B[1]) / 2, (A[2] + B[2]) / 2];
+  const bb = bboxOf(shape);
+  const cx: Vec3 = [(bb.min[0] + bb.max[0]) / 2, (bb.min[1] + bb.max[1]) / 2, (bb.min[2] + bb.max[2]) / 2];
+  const outward = (mid[0] - cx[0]) * x[0] + (mid[1] - cx[1]) * x[1] + (mid[2] - cx[2]) * x[2];
+  if (outward < 0) {
+    x = [-x[0], -x[1], -x[2]];
+    n = [-n[0], -n[1], -n[2]];
+  }
+  const at = (px: number, py: number): Vec3 => [
+    mid[0] + x[0] * px + n[0] * py,
+    mid[1] + x[1] * px + n[1] * py,
+    mid[2] + x[2] * px + n[2] * py,
+  ];
+  // Mid-surface bend radius and centre, then inner/outer arcs.
+  const rm = radius + t / 2;
+  const center: Vec2 = { x: 0, y: rm };
+  const pointAt = (r: number, phi: number): Vec2 => ({
+    x: center.x + r * Math.sin(phi),
+    y: center.y - r * Math.cos(phi),
+  });
+  const dir: Vec2 = { x: Math.cos(angle), y: Math.sin(angle) };
+  const profile: Vec3[] = [];
+  profile.push(at(0, t / 2));
+  for (let i = 1; i <= 12; i++) {
+    const phi = (angle * i) / 12;
+    const p = pointAt(radius, phi);
+    profile.push(at(p.x, p.y));
+  }
+  const endInner = pointAt(radius, angle);
+  const endOuter = pointAt(radius + t, angle);
+  if (length > 1e-3) {
+    profile.push(at(endInner.x + dir.x * length, endInner.y + dir.y * length));
+    profile.push(at(endOuter.x + dir.x * length, endOuter.y + dir.y * length));
+  } else {
+    profile.push(at(endOuter.x, endOuter.y));
+  }
+  for (let i = 12; i >= 0; i--) {
+    const phi = (angle * i) / 12;
+    const p = pointAt(radius + t, phi);
+    profile.push(at(p.x, p.y));
+  }
+  profile.push(at(0, -t / 2));
+  const face = faceFromPoints(profile);
+  const prism = new oc.BRepPrimAPI_MakePrism_1(face, gpVec([e[0] * edgeLen, e[1] * edgeLen, e[2] * edgeLen]), false, true);
+  const tool = prism.Shape();
+  if (!tool || tool.IsNull()) throw new Error("Edge flange build failed.");
+  return applyBoolean(shape, tool, false);
+}
+
+/** Flat pattern body: every blank/flange region extruded by the thickness. */
+function flatPatternFeature(part: RebuildPart): any {
+  const recipe = sheetMetalRecipe(part);
+  if (!recipe) throw new Error("The flat pattern needs a base flange.");
+  const base = part.features.find((f) => f.type === "baseFlange");
+  const sketch = base ? part.sketches.find((s) => s.id === base.sketchId) : part.sketches[0];
+  if (!sketch) throw new Error("The base flange sketch is missing.");
+  const pattern = flatPattern(recipe.base, recipe.flanges);
+  const t = Math.max(0.05, recipe.thickness);
+  const tools = pattern.regions.map((region) => {
+    const face = faceFromPoints(region.points.map((p) => planePoint(sketch.plane, p)));
+    const prism = new oc.BRepPrimAPI_MakePrism_1(face, gpVec([sketch.plane.n[0] * t, sketch.plane.n[1] * t, sketch.plane.n[2] * t]), false, true);
+    const s = prism.Shape();
+    if (!s || s.IsNull()) throw new Error("Flat pattern extrude failed.");
+    return s;
+  });
+  return fuseShapes(tools);
+}
+
+/** Constant-wall shell. Uses a shrunken bounding box cut through the +Y face, *  which is exact for the prismatic parts this course models (box, plate,
  *  enclosure) and keeps the operation inside the OCCT bindings that are
  *  available in opencascade.js. */
 function shellFeature(shape: any, feature: Feature): any {
@@ -966,6 +1120,23 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
   }
   shape = baseImported;
 
+  // Flat-pattern preview replaces the bent body: every blank/flange region is
+  // extruded by the sheet thickness, exactly like the DXF outline.
+  if (!baseImported && part.sheetMetal?.flattened && part.features.some((f) => f.type === "baseFlange")) {
+    try {
+      shape = flatPatternFeature(part);
+    } catch (e) {
+      errors["flatten"] = e instanceof Error ? e.message : String(e);
+      shape = null;
+    }
+    if (shape && !shape.IsNull()) {
+      partShapes.set(part.id, shape);
+      const mesh = tessellate(shape, quality);
+      mesh.warnings = [...mesh.warnings, ...Object.values(errors)];
+      return { mesh, errors };
+    }
+  }
+
   const rollback = part.rollbackIndex ?? part.features.length;
   for (let featureIndex = 0; featureIndex < part.features.length; featureIndex++) {
     const feature = part.features[featureIndex];
@@ -1016,6 +1187,12 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
         const sketch = part.sketches.find((s) => s.id === feature.sketchId);
         if (!sketch) throw new Error("The rib sketch was deleted.");
         shape = ribFeature(sketch, feature, shape);
+      } else if (feature.type === "baseFlange") {
+        const sketch = part.sketches.find((s) => s.id === feature.sketchId);
+        if (!sketch) throw new Error("The base flange sketch was deleted.");
+        shape = baseFlangeFeature(sketch, feature, shape);
+      } else if (feature.type === "edgeFlange") {
+        shape = edgeFlangeFeature(part, feature, shape);
       }
     } catch (e) {
       errors[feature.id] = e instanceof Error ? e.message : String(e);

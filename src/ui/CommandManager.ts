@@ -1,6 +1,6 @@
 import { hydrateIcons, icon } from "./icons";
 
-export type CommandTab = "sketch" | "features" | "assembly" | "evaluate" | "analysis";
+export type CommandTab = "sketch" | "features" | "sheetmetal" | "assembly" | "evaluate" | "analysis";
 
 interface CmdItem {
   action: string;
@@ -145,6 +145,27 @@ const TABS: TabDef[] = [
         items: [
           { action: "isometric", label: "Isometric", icon: "box" },
           { action: "zoom-fit", label: "Zoom Fit", icon: "maximize" },
+        ],
+      },
+    ],
+  },
+  {
+    id: "sheetmetal",
+    label: "Sheet Metal",
+    groups: [
+      {
+        name: "Sheet Metal",
+        items: [
+          { action: "base-flange", label: "Base Flange", icon: "layers", primary: true },
+          { action: "edge-flange", label: "Edge Flange", icon: "workflow" },
+          { action: "flatten", label: "Flatten", icon: "rotate-ccw" },
+        ],
+      },
+      {
+        name: "Flat Pattern",
+        items: [
+          { action: "export-dxf", label: "Export DXF", icon: "file-down" },
+          { action: "sheet-settings", label: "Sheet Settings", icon: "settings" },
         ],
       },
     ],
@@ -375,7 +396,14 @@ const TR_LABELS: Record<string, string> = {
   "Safety Factor": "Emniyet Katsayısı",
 };
 
-const TAB_LABELS: Record<CommandTab, string> = { sketch: "Sketch", features: "Features", assembly: "Assembly", evaluate: "Evaluate", analysis: "Analysis" };
+const TAB_LABELS: Record<CommandTab, string> = {
+  sketch: "Sketch",
+  features: "Features",
+  sheetmetal: "Sheet Metal",
+  assembly: "Assembly",
+  evaluate: "Evaluate",
+  analysis: "Analysis",
+};
 
 export class CommandManager {
   private tabsEl: HTMLElement;

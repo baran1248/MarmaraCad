@@ -490,8 +490,38 @@ export class FeatureTree {
     }
 
     html += `<div class="tree-note">${icon("info")} &nbsp;${part.features.filter((f) => !f.suppressed && f.type !== "imported").length} feature(s) · ${part.sketches.length} sketch(es)</div>`;
+    html += this.configurationsBlock(ctx, part, expand);
     if (part.asset && part.asset.format !== "step" && part.asset.format !== "iges") {
       html += `<div class="tree-note">Mesh-only imported body — boolean features are unavailable.</div>`;
+    }
+    return html;
+  }
+
+  /** Configurations section shown under every part tree. */
+  private configurationsBlock(ctx: TreeContext, part: Part, expand: (key: string, fallback?: boolean) => boolean): string {
+    const open = expand("configurations", true);
+    const configs = part.configurations ?? [];
+    let html = `<div class="tree-section-head" data-tree-action="configurations">
+      ${icon("layers-3")}<span>Configurations</span>
+      <button class="tree-section-add" data-tree-action="configuration-add" title="Add configuration">${icon("plus")}</button>
+    </div>`;
+    if (!open) return html;
+    if (configs.length === 0) {
+      html += `<div class="tree-note">No configurations yet. Click + to create one.</div>`;
+      return html;
+    }
+    for (const config of configs) {
+      html += this.row(`configuration:${config.id}`, {
+        kind: "configuration",
+        id: config.id,
+        depth: 1,
+        label: config.name,
+        iconName: config.id === part.activeConfigurationId ? "check-circle-2" : "circle",
+        selected: ctx.selection === `configuration:${config.id}`,
+        title: `${config.name} — double-click to activate`,
+        sub: `${Object.keys(config.variables).length ? `${Object.keys(config.variables).length} var` : ""}${config.suppressed.length ? ` · ${config.suppressed.length} sup` : ""}`,
+        eye: null,
+      });
     }
     return html;
   }

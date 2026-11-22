@@ -11,6 +11,40 @@ export type NavScheme = "cad" | "legacy";
 export type ControlMode = "mouse" | "trackpad" | "pen";
 export type MousePreset = "solidworks" | "fusion" | "ansys";
 export type SectionAxis = "x" | "y" | "z";
+/** Shapr3D trackpad default: two fingers always orbit, or always pan. */
+export type TrackpadScheme = "orbit" | "pan";
+
+export interface NavigationSettings {
+  /** Multiplier applied to every orbit / pan / zoom gesture (0.25 – 3). */
+  speed: number;
+  /** Inertia retention per frame (0 = off, 0.92 = long glide). */
+  damping: number;
+  invertOrbitX: boolean;
+  invertOrbitY: boolean;
+  invertPan: boolean;
+  /** Two-finger trackpad scroll performs orbit (default) or pan. */
+  trackpadScheme: TrackpadScheme;
+}
+
+export const DEFAULT_NAVIGATION: NavigationSettings = {
+  speed: 1,
+  damping: 0.82,
+  invertOrbitX: false,
+  invertOrbitY: false,
+  invertPan: false,
+  trackpadScheme: "orbit",
+};
+
+export type NavSettingKey = keyof NavigationSettings;
+
+export interface GizmoDragEvent {
+  kind: "face" | "edge";
+  /** Signed millimetres: positive pulls outwards / grows the fillet. */
+  distance: number;
+  done: boolean;
+  face?: FacePick;
+  edge?: EdgePick;
+}
 
 export interface SectionState {
   enabled: boolean;
@@ -118,12 +152,48 @@ export class Viewport {
   onCameraChange: (() => void) | null = null;
   onFrame: (() => void) | null = null;
   onPickFilterChanged: ((filter: PickFilter) => void) | null = null;
+  /** Direct push/pull and edge-handle drags (face normal / fillet radius). */
+  onGizmoDrag: ((event: GizmoDragEvent) => void) | null = null;
+  /** One-finger double-tap on a face (Shapr3D "Normal To"). */
+  onTouchDoubleTap: ((pick: FacePick | null) => void) | null = null;
+  /** Three-finger horizontal swipe: -1 left (undo), +1 right (redo). */
+  onThreeFingerSwipe: ((direction: -1 | 1) => void) | null = null;
+  /** Assembly drag of a floating component (world delta in mm). */
+  onComponentDrag: ((event: { componentId: string; delta: Vec3; done: boolean; start: boolean }) => void) | null = null;
 
   private bodies = new Map<string, BodyView>();
   private root = new THREE.Group();
   private planeGroup = new THREE.Group();
   private referenceGroup = new THREE.Group();
+  private bendGroup = new THREE.Group();
+  private gizmoGroup = new THREE.Group();
   private sketchGroup = new THREE.Group();
+  private nav: NavigationSettings = { ...DEFAULT_NAVIGATION };
+  private inertia = { orbitX: 0, orbitY: 0, panX: 0, panY: 0 };
+  private lastTick = 0;
+  private gizmo: {
+    kind: "face" | "edge";
+    face?: FacePick;
+    edge?: EdgePick;
+    origin: THREE.Vector3;
+    dir: THREE.Vector3;
+    startX: number;
+    startY: number;
+    distance: number;
+    /** Screen-space pixels per millimetre at the gizmo. */
+    pxPerMm: number;
+    screenDir: THREE.Vector2;
+    object: THREE.Object3D;
+    label: HTMLDivElement;
+  } | null = null;
+  private gizmoPreview: THREE.Mesh | null = null;
+  private gizmoDragging = false;
+  private componentDragEnabled = false;
+  private bendLines: THREE.LineSegments | null = null;
+  private touchTap: { time: number; x: number; y: number } | null = null;
+  private swipe: { ids: number[]; startX: number; startY: number; fired: boolean } | null = null;
+  private penArmed = false;
+  private dragComponent: { id: string; lastX: number; lastY: number; moved: boolean } | null = null;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
   private pickFilter: PickFilter = "face";
@@ -141,7 +211,7 @@ export class Viewport {
   private penStart: { x: number; y: number } | null = null;
   private customDrag: { kind: "orbit" | "pan"; x: number; y: number } | null = null;
   private lastPinch = 0;
-  readonly debugControl = { orbits: 0, pans: 0, zooms: 0, pinches: 0, penDown: 0, touches: 0 };
+  readonly debugControl = { orbits: 0, pans: 0, zooms: 0, pinches: 0, penDown: 0, touches: 0, gizmoDrags: 0 };
   private fitted = false;
   private down: { x: number; y: number; button: number } | null = null;
   private band: { startX: number; startY: number; el: HTMLDivElement; crossing: boolean } | null = null;
@@ -177,6 +247,8 @@ export class Viewport {
     this.scene.add(this.root);
     this.scene.add(this.planeGroup);
     this.scene.add(this.referenceGroup);
+    this.scene.add(this.bendGroup);
+    this.scene.add(this.gizmoGroup);
     this.scene.add(this.sketchGroup);
     this.scene.add(this.vertexGroup);
 
@@ -228,6 +300,7 @@ export class Viewport {
     this.controlMode = mode;
     this.touchPointers.clear();
     this.customDrag = null;
+    this.clearGizmo();
     this.applyNavScheme();
   }
 
@@ -236,8 +309,24 @@ export class Viewport {
     this.applyNavScheme();
   }
 
-  getControlState(): { mode: ControlMode; preset: MousePreset; navScheme: NavScheme } {
-    return { mode: this.controlMode, preset: this.mousePreset, navScheme: this.navScheme };
+  /** Apply the persisted Shapr3D navigation preferences. */
+  setNavigationSettings(settings: Partial<NavigationSettings>): NavigationSettings {
+    this.nav = {
+      ...this.nav,
+      ...settings,
+      speed: clampNumber(settings.speed ?? this.nav.speed, 0.2, 3),
+      damping: clampNumber(settings.damping ?? this.nav.damping, 0, 0.95),
+      trackpadScheme: settings.trackpadScheme === "pan" ? "pan" : settings.trackpadScheme === "orbit" ? "orbit" : this.nav.trackpadScheme,
+    };
+    return { ...this.nav };
+  }
+
+  getNavigationSettings(): NavigationSettings {
+    return { ...this.nav };
+  }
+
+  getControlState(): { mode: ControlMode; preset: MousePreset; navScheme: NavScheme; nav: NavigationSettings } {
+    return { mode: this.controlMode, preset: this.mousePreset, navScheme: this.navScheme, nav: { ...this.nav } };
   }
 
   private applyNavScheme(): void {
@@ -270,30 +359,77 @@ export class Viewport {
     this.controls.mouseButtons.MIDDLE = null as unknown as THREE.MOUSE;
   }
 
-  private orbitBy(dx: number, dy: number): void {
+  /** Orbit with the current sensitivity and invert flags. `record` seeds the
+   *  inertia velocity; inertia frames call it with `record = false`. */
+  private orbitBy(dx: number, dy: number, record = true): void {
+    const speed = this.nav.speed;
+    const ox = this.nav.invertOrbitX ? -1 : 1;
+    const oy = this.nav.invertOrbitY ? -1 : 1;
+    const stepX = dx * 0.005 * speed * ox;
+    const stepY = dy * 0.005 * speed * oy;
     const offset = this.camera.position.clone().sub(this.controls.target);
     const spherical = new THREE.Spherical().setFromVector3(offset);
-    spherical.theta -= dx * 0.005;
-    spherical.phi = clampNumber(spherical.phi - dy * 0.005, 0.05, Math.PI - 0.05);
+    spherical.theta -= stepX;
+    spherical.phi = clampNumber(spherical.phi - stepY, 0.05, Math.PI - 0.05);
     offset.setFromSpherical(spherical);
     this.camera.position.copy(this.controls.target).add(offset);
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(this.controls.target);
     this.controls.update();
     this.debugControl.orbits++;
+    if (record && this.nav.damping > 0.01) {
+      this.inertia.orbitX = dx * 0.35;
+      this.inertia.orbitY = dy * 0.35;
+    }
     this.onCameraChange?.();
   }
 
-  private panBy(dx: number, dy: number): void {
+  private panBy(dx: number, dy: number, record = true): void {
+    const speed = this.nav.speed;
+    const inv = this.nav.invertPan ? -1 : 1;
     const scale = this.worldPerPixel();
     const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
     const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
-    const move = right.multiplyScalar(-dx * scale).add(up.multiplyScalar(dy * scale));
+    const move = right
+      .multiplyScalar(-dx * scale * speed * inv)
+      .add(up.multiplyScalar(dy * scale * speed * inv));
     this.controls.target.add(move);
     this.camera.position.add(move);
     this.controls.update();
     this.debugControl.pans++;
+    if (record && this.nav.damping > 0.01) {
+      this.inertia.panX = dx * 0.35;
+      this.inertia.panY = dy * 0.35;
+    }
     this.onCameraChange?.();
+  }
+
+  /** Stop any residual glide (a new gesture or a view change cancels it). */
+  private clearInertia(): void {
+    this.inertia = { orbitX: 0, orbitY: 0, panX: 0, panY: 0 };
+  }
+
+  private applyInertia(dt: number): void {
+    if (this.nav.damping <= 0.01) {
+      this.clearInertia();
+      return;
+    }
+    if (this.down || this.customDrag || this.touchPointers.size > 0 || this.viewAnim) {
+      return;
+    }
+    const { orbitX, orbitY, panX, panY } = this.inertia;
+    if (Math.abs(orbitX) + Math.abs(orbitY) + Math.abs(panX) + Math.abs(panY) < 0.02) {
+      this.clearInertia();
+      return;
+    }
+    const frames = clampNumber(dt / 16.67, 0.4, 2.5);
+    const keep = Math.pow(this.nav.damping, frames);
+    if (Math.abs(orbitX) + Math.abs(orbitY) > 0.02) this.orbitBy(orbitX, orbitY, false);
+    if (Math.abs(panX) + Math.abs(panY) > 0.02) this.panBy(panX, panY, false);
+    this.inertia.orbitX *= keep;
+    this.inertia.orbitY *= keep;
+    this.inertia.panX *= keep;
+    this.inertia.panY *= keep;
   }
 
   /** Cursor-anchored dolly shared by mouse wheel, pinch and keyboard zoom. */
@@ -323,8 +459,12 @@ export class Viewport {
   }
 
   /** Wheel routing follows the Shapr3D control mode:
-   *  mouse = zoom, trackpad = two-finger orbit (Shift pan, Ctrl/pinch zoom),
-   *  pen = wheel zoom for hybrid pens that emit wheel events. */
+   *  mouse = zoom, trackpad = two-finger orbit/pan (Shift pan, Ctrl/pinch zoom),
+   *  pen = wheel zoom for hybrid pens that emit wheel events.
+   *
+   *  A trackpad two-finger scroll orbits in *both* axes: the old
+   *  `|dx| > |dy| * 1.8` shortcut hijacked horizontal gestures into a pan and
+   *  made the camera jump mid-orbit, so it is gone. */
   private handleWheel = (e: WheelEvent): void => {
     e.preventDefault();
     e.stopPropagation();
@@ -332,11 +472,12 @@ export class Viewport {
     const dx = e.deltaX * scale;
     const dy = e.deltaY * scale;
     if (this.controlMode === "trackpad" && !e.ctrlKey) {
-      if (e.shiftKey || Math.abs(dx) > Math.abs(dy) * 1.8) {
-        this.panBy(-dx * 0.9, -dy * 0.9);
-      } else {
-        this.orbitBy(dx * 0.55, dy * 0.55);
-      }
+      // Two fingers follow the chosen scheme; Shift swaps the roles, so
+      // "Pan" + Shift = Orbit and "Orbit" + Shift = Pan.
+      const scheme = this.nav.trackpadScheme === "pan" ? "pan" : "orbit";
+      const pan = e.shiftKey ? scheme === "orbit" : scheme === "pan";
+      if (pan) this.panBy(-dx * 0.9, -dy * 0.9);
+      else this.orbitBy(dx * 0.55, dy * 0.55);
       return;
     }
     const factor = Math.exp(clampNumber(dy * 0.0011, -0.6, 0.6));
@@ -910,6 +1051,262 @@ export class Viewport {
     return this.pickFace();
   }
 
+  // ----------------------------------------------------------- direct modelling
+
+  /** Enable the Shapr3D "drag a floating component" path (assembly mode). */
+  setComponentDragEnabled(enabled: boolean): void {
+    this.componentDragEnabled = enabled;
+    if (!enabled) this.dragComponent = null;
+  }
+
+  /** Push/Pull arrow on a planar face. `null` clears it. */
+  showFaceGizmo(pick: FacePick | null, label = ""): void {
+    if (!pick || pick.face.surface !== "plane") {
+      this.clearGizmo();
+      return;
+    }
+    this.clearGizmo();
+    const origin = new THREE.Vector3(...pick.face.point);
+    const dir = new THREE.Vector3(...pick.face.normal).normalize();
+    const length = Math.max(8, this.modelRadius() * 0.34);
+    const material = new THREE.MeshBasicMaterial({ color: 0xff8c1a, depthTest: false, transparent: true, opacity: 0.96 });
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(length * 0.028, length * 0.028, length * 0.8, 12), material);
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(length * 0.085, length * 0.2, 16), material);
+    tip.position.y = length * 0.5;
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(length * 0.1, 14, 10), material);
+    knob.position.y = length * 0.42;
+    const handle = new THREE.Group();
+    handle.add(shaft, tip, knob);
+    handle.userData.gizmo = "face";
+    handle.position.copy(origin);
+    handle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    handle.renderOrder = 999;
+    this.gizmoGroup.add(handle);
+    this.gizmo = {
+      kind: "face",
+      face: pick,
+      origin,
+      dir,
+      startX: 0,
+      startY: 0,
+      distance: 0,
+      pxPerMm: 1,
+      screenDir: new THREE.Vector2(0, -1),
+      object: handle,
+      label: this.makeGizmoLabel(label || "Push / Pull"),
+    };
+  }
+
+  /** Fillet/chamfer handle on a straight edge. `null` clears it. */
+  showEdgeGizmo(pick: EdgePick | null): void {
+    if (!pick || pick.edge.points.length < 2) {
+      this.clearGizmo();
+      return;
+    }
+    this.clearGizmo();
+    const a = new THREE.Vector3(...pick.edge.points[0]);
+    const b = new THREE.Vector3(...pick.edge.points[pick.edge.points.length - 1]);
+    const origin = a.clone().add(b).multiplyScalar(0.5);
+    const edgeDir = b.clone().sub(a);
+    if (edgeDir.lengthSq() < 1e-9) edgeDir.set(1, 0, 0);
+    edgeDir.normalize();
+    const away = new THREE.Vector3().crossVectors(edgeDir, this.camera.position.clone().sub(origin)).normalize();
+    const material = new THREE.MeshBasicMaterial({ color: 0x1f9dd8, depthTest: false, transparent: true, opacity: 0.95 });
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(Math.max(1.2, this.modelRadius() * 0.055), 16, 12), material);
+    knob.userData.gizmo = "edge";
+    knob.position.copy(origin).addScaledVector(away, Math.max(3, this.modelRadius() * 0.08));
+    knob.renderOrder = 999;
+    this.gizmoGroup.add(knob);
+    this.gizmo = {
+      kind: "edge",
+      edge: pick,
+      origin: knob.position.clone(),
+      dir: away,
+      startX: 0,
+      startY: 0,
+      distance: 0,
+      pxPerMm: 1,
+      screenDir: new THREE.Vector2(0.7, -0.7),
+      object: knob,
+      label: this.makeGizmoLabel("Fillet / Chamfer"),
+    };
+  }
+
+  /** The active direct-modelling handle, for keyboard value entry. */
+  getActiveGizmo(): { kind: "face" | "edge"; face?: FacePick; edge?: EdgePick; distance: number } | null {
+    if (!this.gizmo) return null;
+    return { kind: this.gizmo.kind, face: this.gizmo.face, edge: this.gizmo.edge, distance: this.gizmo.distance };
+  }
+
+  clearGizmo(): void {
+    if (this.gizmoPreview) {
+      this.gizmoPreview.parent?.remove(this.gizmoPreview);
+      this.gizmoPreview.geometry.dispose();
+      (this.gizmoPreview.material as THREE.Material).dispose();
+      this.gizmoPreview = null;
+    }
+    for (const child of [...this.gizmoGroup.children]) {
+      this.gizmoGroup.remove(child);
+      child.traverse((node) => {
+        const mesh = node as THREE.Mesh;
+        if (mesh.geometry) mesh.geometry.dispose();
+      });
+    }
+    this.gizmo?.label.remove();
+    this.gizmo = null;
+    this.gizmoDragging = false;
+  }
+
+  private makeGizmoLabel(text: string): HTMLDivElement {
+    const el = document.createElement("div");
+    el.className = "gizmo-label";
+    el.textContent = text;
+    this.container.appendChild(el);
+    return el;
+  }
+
+  private updateGizmoLabel(text: string): void {
+    if (!this.gizmo) return;
+    this.gizmo.label.textContent = text;
+    const screen = this.projectToScreen([this.gizmo.origin.x, this.gizmo.origin.y, this.gizmo.origin.z]);
+    this.gizmo.label.style.left = `${screen.x}px`;
+    this.gizmo.label.style.top = `${Math.max(12, screen.y - 34)}px`;
+  }
+
+  private startGizmoDrag(e: PointerEvent): boolean {
+    if (!this.gizmo) return false;
+    this.updatePointerAt(e.clientX, e.clientY);
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hits = this.raycaster.intersectObjects(this.gizmoGroup.children, true);
+    if (hits.length === 0) return false;
+    const origin = this.gizmo.origin;
+    const dir = this.gizmo.dir;
+    const s0 = this.projectToScreen([origin.x, origin.y, origin.z]);
+    const s1 = this.projectToScreen([origin.x + dir.x * 10, origin.y + dir.y * 10, origin.z + dir.z * 10]);
+    const dx = s1.x - s0.x;
+    const dy = s1.y - s0.y;
+    const px = Math.hypot(dx, dy) / 10;
+    this.gizmo.pxPerMm = Math.max(0.05, px);
+    this.gizmo.screenDir = new THREE.Vector2(dx, dy).normalize();
+    this.gizmo.startX = e.clientX;
+    this.gizmo.startY = e.clientY;
+    this.gizmo.distance = 0;
+    this.gizmoDragging = true;
+    this.down = null;
+    e.preventDefault();
+    this.updateGizmoLabel(this.gizmo.kind === "face" ? "0.0 mm" : "R 0.0");
+    return true;
+  }
+
+  private updateGizmoDrag(clientX: number, clientY: number): void {
+    if (!this.gizmo) return;
+    const dx = clientX - this.gizmo.startX;
+    const dy = clientY - this.gizmo.startY;
+    let distance: number;
+    if (this.gizmo.kind === "face") {
+      distance = (dx * this.gizmo.screenDir.x + dy * this.gizmo.screenDir.y) / this.gizmo.pxPerMm;
+    } else {
+      // Edge handles read the diagonal (up-right grows, down-left shrinks).
+      distance = (dx - dy) / this.gizmo.pxPerMm;
+    }
+    this.gizmo.distance = distance;
+    if (this.gizmo.kind === "face") {
+      this.updateGizmoLabel(`${distance >= 0 ? "+" : ""}${distance.toFixed(1)} mm`);
+      this.updatePushPullPreview(distance);
+      this.onGizmoDrag?.({ kind: "face", distance, done: false, face: this.gizmo.face });
+    } else {
+      this.updateGizmoLabel(distance >= 0 ? `R ${distance.toFixed(1)}` : `C ${Math.abs(distance).toFixed(1)}`);
+      this.onGizmoDrag?.({ kind: "edge", distance, done: false, edge: this.gizmo.edge });
+    }
+    this.debugControl.gizmoDrags++;
+  }
+
+  private finishGizmoDrag(): void {
+    if (!this.gizmo) return;
+    const event: GizmoDragEvent = {
+      kind: this.gizmo.kind,
+      distance: this.gizmo.distance,
+      done: true,
+      face: this.gizmo.face,
+      edge: this.gizmo.edge,
+    };
+    const moved = Math.abs(this.gizmo.distance) > 0.05;
+    this.gizmoDragging = false;
+    if (!moved) {
+      // A click without movement just dismisses the handle.
+      this.clearGizmo();
+      return;
+    }
+    this.onGizmoDrag?.(event);
+  }
+
+  private updatePushPullPreview(distance: number): void {
+    if (!this.gizmo || this.gizmo.kind !== "face" || !this.gizmo.face) return;
+    const pick = this.gizmo.face;
+    const view = [...this.bodies.values()].find(
+      (v) => v.partId === pick.partId && v.componentId === pick.componentId,
+    );
+    if (!view) return;
+    if (!this.gizmoPreview) {
+      const geometry = faceGeometry(view.data, [pick.face.index]);
+      if (!geometry) return;
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xff9a3c,
+        transparent: true,
+        opacity: 0.35,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      this.gizmoPreview = new THREE.Mesh(geometry, material);
+      this.gizmoPreview.name = "push-pull-preview";
+      view.group.add(this.gizmoPreview);
+      this.gizmoPreview.userData.owner = view.key;
+    }
+    this.gizmoPreview.position.set(
+      this.gizmo.dir.x * distance,
+      this.gizmo.dir.y * distance,
+      this.gizmo.dir.z * distance,
+    );
+  }
+
+  /** Dashed bend lines of a sheet-metal flat pattern. The WebGPU backend has no
+   *  LineDashedMaterial (it throws on the dash uniforms), so the gaps are baked
+   *  into the geometry as short segments — renderer independent and visible. */
+  setBendLines(segments: [Vec3, Vec3][]): void {
+    for (const child of [...this.bendGroup.children]) {
+      this.bendGroup.remove(child);
+      const line = child as THREE.LineSegments;
+      line.geometry?.dispose();
+      (line.material as THREE.Material)?.dispose();
+    }
+    this.bendLines = null;
+    if (segments.length === 0) return;
+    const dash = 1.4;
+    const gap = 0.9;
+    const points: number[] = [];
+    for (const [a, b] of segments) {
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+      if (len < 1e-6) continue;
+      const dir: Vec3 = [(b[0] - a[0]) / len, (b[1] - a[1]) / len, (b[2] - a[2]) / len];
+      for (let t = 0; t < len; t += dash + gap) {
+        const t1 = Math.min(len, t + dash);
+        points.push(a[0] + dir[0] * t, a[1] + dir[1] * t, a[2] + dir[2] * t);
+        points.push(a[0] + dir[0] * t1, a[1] + dir[1] * t1, a[2] + dir[2] * t1);
+      }
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(points, 3));
+    const material = new THREE.LineBasicMaterial({ color: 0xd8452a, linewidth: 1 });
+    const lines = new THREE.LineSegments(geometry, material);
+    lines.name = "sheet-metal-bends";
+    this.bendGroup.add(lines);
+    this.bendLines = lines;
+  }
+
+  hasBendLines(): boolean {
+    return Boolean(this.bendLines);
+  }
+
   /** Edges connected end-to-end to the picked edge (a topological loop).
    *  With `tangentOnly`, the walk also requires the directions to line up, which
    *  is how SolidWorks' Select Tangency behaves. */
@@ -1121,6 +1518,7 @@ export class Viewport {
 
   private handlePointerDown = (e: PointerEvent): void => {
     if (e.pointerType === "touch") {
+      this.clearInertia();
       this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       this.debugControl.touches++;
       try {
@@ -1132,21 +1530,38 @@ export class Viewport {
         const [a, b] = [...this.touchPointers.values()];
         this.lastPinch = Math.hypot(a.x - b.x, a.y - b.y);
       }
+      if (this.touchPointers.size === 3) {
+        const pts = [...this.touchPointers.values()];
+        this.swipe = {
+          ids: [...this.touchPointers.keys()],
+          startX: pts.reduce((sum, p) => sum + p.x, 0) / pts.length,
+          startY: pts.reduce((sum, p) => sum + p.y, 0) / pts.length,
+          fired: false,
+        };
+      }
       e.preventDefault();
       return;
     }
     if (e.pointerType === "pen") {
       this.debugControl.penDown++;
       this.penStart = { x: e.clientX, y: e.clientY };
+      this.penArmed = false;
       this.cancelPenTimer();
-      // A pen barrel/side button and a press-and-hold open the context menu in
-      // exactly the same way as a right-click.
+      // A pen barrel/side button opens the context menu immediately; a
+      // press-and-hold opens the same menu after the pen rests in place.
+      if (e.button === 2) {
+        e.preventDefault();
+        this.openContextMenu(e);
+        return;
+      }
       this.penTimer = window.setTimeout(() => {
         this.penTimer = 0;
         if (this.penStart) this.openContextMenu({ clientX: this.penStart.x, clientY: this.penStart.y } as MouseEvent);
       }, 620);
     }
     this.down = { x: e.clientX, y: e.clientY, button: e.button };
+    // A gizmo handle wins over every navigation and selection route.
+    if (e.button === 0 && this.startGizmoDrag(e)) return;
     // In the CAD mouse scheme OrbitControls no longer drives the middle button:
     // every preset route goes through customDrag, so the orbit/pan feel is
     // identical across SolidWorks, Fusion and Ansys (and it is observable).
@@ -1158,13 +1573,26 @@ export class Viewport {
       ((this.mousePreset === "fusion" && e.shiftKey) || (this.mousePreset !== "fusion" && !e.ctrlKey && !e.metaKey));
     if ((wantsPan || wantsOrbit) && !this.sketchPlane) {
       e.preventDefault();
+      this.clearInertia();
       this.controls.enabled = false;
       this.customDrag = { kind: wantsPan ? "pan" : "orbit", x: e.clientX, y: e.clientY };
       return;
     }
-    if (e.button === 0 && this.pickFilter !== "none" && !this.sketchPlane) {
+    // Assembly drag: a floating component follows the pointer with its mates
+    // re-projected every frame. Left button only, and never in a sketch.
+    if (e.button === 0 && !this.sketchPlane && this.pickFilter === "all" && this.componentDragEnabled) {
+      const pick = this.pickFace();
+      if (pick?.componentId) {
+        this.dragComponent = { id: pick.componentId, lastX: e.clientX, lastY: e.clientY, moved: false };
+        this.onComponentDrag?.({ componentId: pick.componentId, delta: [0, 0, 0], done: false, start: true });
+        e.preventDefault();
+        return;
+      }
+    }
+    if (e.button === 0 && this.pickFilter !== "none" && !this.sketchPlane && e.pointerType !== "pen") {
       // A left drag on the canvas is a window/crossing selection in CAD mode;
-      // orbit stays on the middle mouse button.
+      // orbit stays on the middle mouse button. Pen drags arm lazily after the
+      // 4 px tremor dead-zone (see handlePointerMove).
       this.startBand(e);
     }
   };
@@ -1173,7 +1601,37 @@ export class Viewport {
     if (e.pointerType === "touch") {
       this.touchPointers.delete(e.pointerId);
       this.lastPinch = 0;
-      if (this.touchPointers.size === 0) this.down = null;
+      if (this.touchPointers.size === 0) {
+        this.down = null;
+        this.swipe = null;
+        // One-finger double-tap = Shapr3D "Normal To" on the tapped face.
+        const tap = this.touchTap;
+        const now = performance.now();
+        if (tap && now - tap.time < 340 && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 32) {
+          this.touchTap = null;
+          this.updatePointerAt(e.clientX, e.clientY);
+          this.onTouchDoubleTap?.(this.pickFace());
+        } else {
+          this.touchTap = { time: now, x: e.clientX, y: e.clientY };
+        }
+      } else if (this.touchPointers.size < 3) {
+        this.swipe = null;
+      }
+      return;
+    }
+    if (this.gizmo && this.gizmoDragging) {
+      this.finishGizmoDrag();
+      return;
+    }
+    if (this.dragComponent) {
+      const drag = this.dragComponent;
+      this.dragComponent = null;
+      this.onComponentDrag?.({
+        componentId: drag.id,
+        delta: [0, 0, 0],
+        done: true,
+        start: false,
+      });
       return;
     }
     if (this.penTimer) {
@@ -1233,15 +1691,19 @@ export class Viewport {
   };
 
   private startBand(e: PointerEvent): void {
+    this.startBandAt(e.clientX, e.clientY);
+  }
+
+  private startBandAt(clientX: number, clientY: number): void {
     this.cancelBand();
     const el = document.createElement("div");
     el.className = "select-band";
-    el.style.left = `${e.clientX}px`;
-    el.style.top = `${e.clientY}px`;
+    el.style.left = `${clientX}px`;
+    el.style.top = `${clientY}px`;
     el.style.width = "0px";
     el.style.height = "0px";
     this.container.appendChild(el);
-    this.band = { startX: e.clientX, startY: e.clientY, el, crossing: false };
+    this.band = { startX: clientX, startY: clientY, el, crossing: false };
   }
 
   private updateBand(e: PointerEvent): void {
@@ -1375,21 +1837,47 @@ export class Viewport {
   }
 
   private handlePointerMove = (e: PointerEvent): void => {
-    if (e.pointerType === "pen" && this.penStart && Math.hypot(e.clientX - this.penStart.x, e.clientY - this.penStart.y) > 6) {
-      this.cancelPenTimer();
-      this.penStart = null;
+    if (e.pointerType === "pen") {
+      if (this.penStart) {
+        const travel = Math.hypot(e.clientX - this.penStart.x, e.clientY - this.penStart.y);
+        // 4 px tremor dead-zone: a pen that shakes while touching down must not
+        // start a selection band or a drag.
+        if (!this.penArmed) {
+          if (travel <= 4) return;
+          this.penArmed = true;
+          if (this.pickFilter !== "none" && !this.sketchPlane) this.startBandAt(this.penStart.x, this.penStart.y);
+        }
+        if (travel > 6) {
+          this.cancelPenTimer();
+          this.penStart = null;
+        }
+      }
     }
     if (e.pointerType === "touch") {
       const before = this.touchPointers.get(e.pointerId);
       if (!before) return;
       this.touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.swipe) {
+        // Three-finger horizontal swipe = undo / redo. The camera stays still.
+        const pts = [...this.touchPointers.values()];
+        const cx = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
+        const cy = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
+        const dx = cx - this.swipe.startX;
+        const dy = cy - this.swipe.startY;
+        if (!this.swipe.fired && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+          this.swipe.fired = true;
+          this.onThreeFingerSwipe?.(dx > 0 ? 1 : -1);
+        }
+        return;
+      }
       if (this.touchPointers.size >= 2) {
         const [a, b] = [...this.touchPointers.values()];
         const dist = Math.hypot(a.x - b.x, a.y - b.y);
         const midX = (a.x + b.x) / 2;
         const midY = (a.y + b.y) / 2;
-        // Move the centroid while pinching: two-finger pan + zoom.
-        this.panBy(e.clientX - before.x, e.clientY - before.y);
+        // Move the centroid while pinching: two-finger pan + pinch zoom around
+        // the midpoint between the fingers.
+        this.panBy((e.clientX - before.x) / 2, (e.clientY - before.y) / 2);
         if (this.lastPinch > 4 && dist > 4) {
           this.zoomToward(midX, midY, this.lastPinch / dist);
           this.debugControl.pinches++;
@@ -1399,6 +1887,29 @@ export class Viewport {
         this.orbitBy(e.clientX - before.x, e.clientY - before.y);
       }
       e.preventDefault();
+      return;
+    }
+    if (this.gizmoDragging) {
+      this.updateGizmoDrag(e.clientX, e.clientY);
+      return;
+    }
+    if (this.dragComponent) {
+      const drag = this.dragComponent;
+      const dx = e.clientX - drag.lastX;
+      const dy = e.clientY - drag.lastY;
+      drag.lastX = e.clientX;
+      drag.lastY = e.clientY;
+      if (!drag.moved && Math.hypot(dx, dy) > 2) drag.moved = true;
+      const scale = this.worldPerPixel();
+      const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+      const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+      const delta = right.multiplyScalar(dx * scale).add(up.multiplyScalar(-dy * scale));
+      this.onComponentDrag?.({
+        componentId: drag.id,
+        delta: [delta.x, delta.y, delta.z],
+        done: false,
+        start: false,
+      });
       return;
     }
     if (this.customDrag) {
@@ -1604,6 +2115,9 @@ export class Viewport {
 
   private tick = (): void => {
     if (this.disposed) return;
+    const now = performance.now();
+    const dt = this.lastTick ? now - this.lastTick : 16.67;
+    this.lastTick = now;
     if (this.viewAnim) {
       const a = Math.min(1, (performance.now() - this.viewAnim.start) / this.viewAnim.duration);
       const t = a < 0.5 ? 2 * a * a : 1 - Math.pow(-2 * a + 2, 2) / 2;
@@ -1611,6 +2125,8 @@ export class Viewport {
       this.controls.target.lerpVectors(this.viewAnim.fromTarget, this.viewAnim.toTarget, t);
       this.camera.up.lerpVectors(this.viewAnim.fromUp, this.viewAnim.toUp, t).normalize();
       if (a >= 1) this.viewAnim = null;
+    } else {
+      this.applyInertia(dt);
     }
     this.controls.update();
     this.renderer.render(this.scene, this.camera);

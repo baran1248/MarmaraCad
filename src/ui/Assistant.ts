@@ -80,6 +80,10 @@ Allowed actions and params:
 - modal: {material?,meshSize?,modes?} - modal study with the first natural frequencies.
 - thermal: {material?,meshSize?,temperature?,ambient?} - steady-state thermal study.
 - buckling: {material?,meshSize?,force?} - linear buckling study with a compressive end load.
+- sheet-metal-flange: {thickness?,radius?,kFactor?,angle?,length?,edgeIndex?} - Base Flange first, then a 90°/45° Edge Flange on the picked edge.
+- flatten: {enabled?:boolean} - toggle the K-factor flat pattern and DXF-ready developed blank.
+- configuration: {name, variables?:{L:"160"}, suppress?:string[], copyFrom?:string} - create/switch a named part configuration.
+- push-pull: {faceIndex?,distance} - direct-edit a planar face along its normal (positive = boss, negative = cut).
 - action: {name:"zoom-fit"|"mass-props"|"interference"|"toolbox-bolt"|"new-sketch"} - run an app command.
 Keep models small and printable. If the request is ambiguous, ask a question in "message" and return an empty commands array.
 Current document: "${doc.name}", ${doc.parts.length} part(s), mode ${doc.mode}. Active part features: ${
