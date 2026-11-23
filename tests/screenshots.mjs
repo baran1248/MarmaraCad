@@ -12,6 +12,7 @@ import {
   extrude,
   waitVolume,
   zoomOut,
+  runCmd,
 } from "./e2e-lib.mjs";
 
 const OUT = "C:\\Users\\MBB\\AppData\\Local\\Temp\\opencode\\marmaracad-qa";
@@ -58,7 +59,7 @@ for (const x of [-20, 20]) {
   await sketchClick(page, x + 6, 0);
   await finishSketch(page);
   await page.click('[data-cmd-tab="features"]');
-  await page.click('[data-cmd-action="extrude-cut"]');
+  await runCmd(page, "extrude-cut");
   await page.waitForSelector("#pm-depth");
   await page.fill("#pm-depth", "12");
   await page.click("[data-pm-ok]");

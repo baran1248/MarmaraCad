@@ -6,7 +6,7 @@
  *
  * Each volume is checked against the analytic value of the drawn profile, so a
  * mock or a stale mesh cannot pass. */
-import { launch, openApp, reload, newDocument, startSketch, setTool, sketchClick, finishSketch, sketchState, body, waitVolume, near } from "./e2e-lib.mjs";
+import { launch, openApp, reload, newDocument, startSketch, setTool, sketchClick, finishSketch, sketchState, body, waitVolume, near, runCmd } from "./e2e-lib.mjs";
 
 const browser = await launch();
 const { page, errors } = await openApp(browser);
@@ -104,7 +104,7 @@ record({
 });
 await finishSketch(page);
 await page.click('[data-cmd-tab="features"]');
-await page.click('[data-cmd-action="extrude-cut"]');
+await runCmd(page, "extrude-cut");
 await page.waitForSelector("#pm-depth");
 await page.fill("#pm-depth", "10");
 await page.click("[data-pm-ok]");

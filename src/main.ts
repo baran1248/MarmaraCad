@@ -55,10 +55,12 @@ import { cloneDocument, parseProject, serializeProject } from "./io/project";
 import { addRecent, clearAll, listRecent, loadAutosave, saveAutosave, type RecentEntry } from "./io/storage";
 import { meshMass, parseOBJ, parseSTL, writeOBJ, writeSTL } from "./io/meshio";
 import { transformMeshData } from "./viewport/geometry";
+import { edgeFlangeGhost, edgeGhost, extrudeGhost } from "./viewport/preview";
 import { sectionMesh } from "./viewport/section";
 import { componentMatrix, matrixArray } from "./viewport/math";
 import { faceRefFromPick, solveMates } from "./assembly/mates";
 import { MATERIALS, materialById, partMaterial } from "./analysis/materials";
+import { createMaterialBrowser } from "./ui/MaterialBrowser";
 import { applyVariables, evaluateExpression, makeVariable, standardVariables, variableValues } from "./model/variables";
 import { createFastenerPart, METRIC_SIZES } from "./model/toolbox";
 import {
@@ -81,7 +83,7 @@ import {
 import { buildDrawingSvg, downloadDrawingPdf } from "./drawing/technicalDrawing";
 import { Assistant, type AiCommand } from "./ui/Assistant";
 import { alertDialog, confirmDialog, openModal, promptNumber, toast } from "./ui/Modal";
-import { icon } from "./ui/icons";
+import { hydrateIcons, icon } from "./ui/icons";
 import { materialOptions, type SketchInfo } from "./ui/FeatureTree";
 import {
   arrayBufferToBase64,
@@ -377,7 +379,28 @@ export class App {
           bootMs: this.bootMs,
           fromCache: cadClient().kernelFromCache,
           bytes: cadClient().kernelBytes,
+          memory: cadClient().lastMemory,
         }),
+        // Memory / performance telemetry for the status HUD and the leak tests.
+        kernelMemory: () => {
+          const perf = performance as unknown as {
+            memory?: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number };
+          };
+          let meshBytes = 0;
+          for (const mesh of this.meshes.values()) {
+            meshBytes += mesh.positions.byteLength + mesh.normals.byteLength + mesh.indices.byteLength;
+          }
+          return {
+            occt: cadClient().lastMemory,
+            fea: { ...this.fea.transfer },
+            meshBytes,
+            heap: perf.memory
+              ? { used: perf.memory.usedJSHeapSize, total: perf.memory.totalJSHeapSize, limit: perf.memory.jsHeapSizeLimit }
+              : null,
+            parts: this.doc.parts.length,
+            bodies: this.viewport.bodyCount,
+          };
+        },
       };
     } catch (error) {
       setBoot(`Startup failed: ${messageOf(error)}`, 100);
@@ -400,6 +423,9 @@ export class App {
     this.shell.onModeChange = (mode) => this.setMode(mode);
     this.shell.onView = (name) => this.viewport.setView(name);
     this.shell.onDisplayStyle = (style) => this.setDisplayStyle(style);
+    // The Memory chip is refreshed by the rebuild/solve paths and every few
+    // seconds, so the heap figure also moves while the user is only editing.
+    window.setInterval(() => this.updateMemoryChip(), 4000);
     this.shell.onPlanesToggle = (visible) => this.setPlanes(visible);
     this.shell.onZoomFit = () => this.viewport.zoomFit();
     this.shell.onUndo = () => this.undo();
@@ -946,7 +972,10 @@ export class App {
         toast(messageOf(error), "error", 7000);
       }
     } finally {
-      if (token === this.rebuildToken) this.shell.setBusy(false);
+      if (token === this.rebuildToken) {
+        this.shell.setBusy(false);
+        this.updateMemoryChip();
+      }
     }
   }
 
@@ -964,6 +993,7 @@ export class App {
       for (const component of this.doc.components) {
         const part = this.doc.parts.find((p) => p.id === component.partId);
         if (!part) continue;
+        const material = partMaterial(part);
         const mesh = this.meshForPart(part.id);
         if (!mesh || mesh.positions.length === 0) continue;
         let bodyMesh = mesh;
@@ -1013,6 +1043,8 @@ export class App {
           componentId: component.id,
           mesh: bodyMesh,
           color: component.color ?? part.color,
+          metalness: material.metalness,
+          roughness: material.roughness,
           visible: component.visible && part.visible,
           position,
           rotation,
@@ -1021,11 +1053,14 @@ export class App {
     } else if (activePart) {
       const mesh = this.meshForPart(activePart.id);
       if (mesh && mesh.positions.length > 0) {
+        const material = partMaterial(activePart);
         bodies.push({
           partId: activePart.id,
           componentId: null,
           mesh: cutMesh(mesh),
           color: activePart.color,
+          metalness: material.metalness,
+          roughness: material.roughness,
           visible: activePart.visible && !this.resultIsVisible(),
           position: [0, 0, 0],
           rotation: [0, 0, 0],
@@ -1049,6 +1084,30 @@ export class App {
     if (this.doc.mode !== "analysis" || !this.activeResult) return false;
     const study = this.activeStudy();
     return !!study && this.feaResults.has(study.id);
+  }
+
+  /** Refresh the status-bar memory chip (heap, OCCT lifetime counters, mesh). */
+  private updateMemoryChip(): void {
+    const perf = performance as unknown as {
+      memory?: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number };
+    };
+    const study = this.activeStudy();
+    const occt = cadClient().lastMemory;
+    let meshBytes = 0;
+    for (const mesh of this.meshes.values()) {
+      meshBytes += mesh.positions.byteLength + mesh.normals.byteLength + mesh.indices.byteLength;
+    }
+    this.shell.setMemory({
+      heapUsed: perf.memory?.usedJSHeapSize ?? null,
+      heapLimit: perf.memory?.jsHeapSizeLimit ?? null,
+      meshBytes,
+      nodes: study?.meshStats?.nodes ?? 0,
+      elements: study?.meshStats?.elements ?? 0,
+      occtCreated: occt?.created ?? 0,
+      occtLive: occt?.leaked ?? 0,
+      feaBuffers: this.fea.transfer.totalBuffers,
+      meshBudget: study?.meshBudget?.message,
+    });
   }
 
   private updateMassCard(): void {
@@ -3359,6 +3418,7 @@ export class App {
   private cancelCommand(): void {
     const command = this.command;
     this.command = null;
+    this.viewport.setGhost(null);
     if (command?.cancel) {
       try {
         command.cancel();
@@ -3383,6 +3443,7 @@ export class App {
   private finishCommand(): void {
     this.command = null;
     this.panelRoot = null;
+    this.viewport.setGhost(null);
     this.viewport.setPickFilter("all");
     this.viewport.setSelectedFaces([]);
     this.viewport.setSelectedEdges([]);
@@ -4147,9 +4208,35 @@ export class App {
           hint.innerHTML = summary.closed
             ? `${icon("check-circle-2")} Closed profile · ${fmt(summary.remainingArea, 1)} mm²`
             : `${icon("alert-triangle")} Open profile — extrude will fail. Close the contour first.`;
+          // Hydrate now: a placeholder `<i>` collapses to zero height and the
+          // reflow between mousedown and mouseup would swallow the next click
+          // on OK / Cancel.
+          hydrateIcons();
+        };
+        const ghost = () => {
+          // A change/input event fires while the panel is being removed; never
+          // resurrect the preview from a closed command or a detached tree.
+          if (!this.command || !root.isConnected) return;
+          const id = readText(root, "pm-feature-sketch", sketch.id);
+          const current = part.sketches.find((s) => s.id === id);
+          const value = Math.max(0.01, readNumber(root, "pm-depth", depth));
+          this.viewport.setGhost(
+            current
+              ? extrudeGhost(current, value, {
+                  direction: Number(readText(root, "pm-direction", "1")) === -1 ? -1 : 1,
+                  symmetric: readChecked(root, "pm-symmetric"),
+                  tone: isCut ? "cut" : "add",
+                })
+              : null,
+          );
         };
         update();
-        root.querySelector<HTMLSelectElement>("#pm-feature-sketch")?.addEventListener("change", update);
+        ghost();
+        root.addEventListener("input", ghost);
+        root.addEventListener("change", () => {
+          update();
+          ghost();
+        });
       },
       onOk: () => {
         const sketchId = readText(this.panelRoot ?? document, "pm-feature-sketch", sketch.id);
@@ -4309,6 +4396,7 @@ export class App {
       },
     };
     const renderChips = () => {
+      if (!this.command || !this.panelRoot?.isConnected) return;
       const host = this.panelRoot?.querySelector<HTMLElement>("#pm-edge-chips");
       if (host) {
         host.innerHTML = picked.size
@@ -4319,6 +4407,11 @@ export class App {
           : `<span class="hint">No edges selected yet — click edges in the viewport.</span>`;
       }
       this.viewport.setSelectedEdges([...picked].map((edgeIndex) => ({ componentId: null, edgeIndex })));
+      const root = this.panelRoot;
+      const ghostSize = root
+        ? Math.max(0.01, readNumber(root, isFillet ? "pm-fillet-radius" : "pm-chamfer-distance", size))
+        : size;
+      this.viewport.setGhost(edgeGhost(mesh, [...picked], ghostSize, isFillet ? "fillet" : "chamfer"));
       this.shell.setSelection(picked.size ? `${picked.size} edge(s) selected` : null);
     };
     this.viewport.setPickFilter("edge");
@@ -4343,6 +4436,8 @@ export class App {
           picked.delete(Number(chip.dataset.edgeChip));
           renderChips();
         });
+        root.addEventListener("input", renderChips);
+        root.addEventListener("change", renderChips);
       },
       onOk: () => {
         if (picked.size === 0) {
@@ -4997,6 +5092,28 @@ export class App {
           pmField("K-Factor", numInput("pm-flange-k", sheet.kFactor, "", 0.01, "0.01")) +
           `<div class="hint">The wall is swept along the picked edge with a real bend of radius R. Flatten uses BA = (π/180)·θ·(R + K·t).</div>`,
       ),
+      onMount: (root) => {
+        const base = part.features.find((f) => f.type === "baseFlange");
+        const baseSketch = (base ? part.sketches.find((s) => s.id === base.sketchId) : undefined) ?? part.sketches[0];
+        const normal = baseSketch?.plane.n ?? ([0, 0, 1] as [number, number, number]);
+        const bodyMesh = this.meshForPart(part.id);
+        const center: [number, number, number] = bodyMesh
+          ? [
+              (bodyMesh.bbox.min[0] + bodyMesh.bbox.max[0]) / 2,
+              (bodyMesh.bbox.min[1] + bodyMesh.bbox.max[1]) / 2,
+              (bodyMesh.bbox.min[2] + bodyMesh.bbox.max[2]) / 2,
+            ]
+          : [0, 0, 0];
+        const ghost = () => {
+          if (!root.isConnected) return;
+          const angle = clamp(readNumber(root, "pm-flange-angle", 90), 1, 179);
+          const length = Math.max(0.1, readNumber(root, "pm-flange-length", 20));
+          this.viewport.setGhost(edgeFlangeGhost(edge.edge, length, angle, normal, center));
+        };
+        ghost();
+        root.addEventListener("input", ghost);
+        root.addEventListener("change", ghost);
+      },
       onOk: () => {
         const root = this.panelRoot ?? document;
         const angle = clamp(readNumber(root, "pm-flange-angle", 90), 1, 179);
@@ -6733,7 +6850,17 @@ export class App {
       study.status = "meshed";
       study.error = undefined;
       this.refreshTree();
-      toast(`Mesh ready · ${stats.nodes.toLocaleString()} nodes · ${stats.elements.toLocaleString()} elements`, "success", 6000);
+      if (stats.budget) {
+        // The mesher clamps the element size to the RAM budget: say so instead
+        // of silently returning a coarser mesh than the user asked for.
+        study.meshBudget = stats.budget;
+        toast(stats.budget.message, "warn", 9000);
+        this.shell.setStatus(`Mesh adapted: ${stats.budget.effective.toFixed(2)} mm (RAM budget)`);
+      } else {
+        study.meshBudget = undefined;
+        toast(`Mesh ready · ${stats.nodes.toLocaleString()} nodes · ${stats.elements.toLocaleString()} elements`, "success", 6000);
+      }
+      this.updateMemoryChip();
       this.openStudyPanel();
     } catch (error) {
       study.status = "failed";
@@ -6820,6 +6947,8 @@ export class App {
       study.stale = false;
       study.meshStats = { nodes: outcome.nodes, elements: outcome.elements };
       study.meshMetrics = outcome.result.meshMetrics;
+      study.meshBudget = outcome.budget ?? outcome.result.meshBudget;
+      if (study.meshBudget) toast(study.meshBudget.message, "warn", 9000);
       study.error = undefined;
       study.resultSummary = {
         maxDisplacement: outcome.result.maxDisplacement,
@@ -7625,104 +7754,38 @@ export class App {
   private openMaterialDialog(partId?: string): void {
     const part = this.doc.parts.find((p) => p.id === partId) ?? this.activePart();
     if (!part) return;
-    const current = partMaterial(part);
-    const isCustom = part.materialId === "custom";
-    const body = document.createElement("div");
-    body.innerHTML = `
-      <div class="material-edit-preview">
-        <span class="swatch" id="mat-swatch" style="background:${current.color}"></span>
-        <div style="flex:1"><div style="font-weight:600" id="mat-preview-name">${escapeHtml(current.name)}</div>
-        <div class="hint" id="mat-preview-props">${escapeHtml(part.name)} · effective material</div></div>
-      </div>
-      <div class="field"><label>Library material</label>
-        <select id="mat-select">${MATERIALS.map((m) => `<option value="${m.id}" ${m.id === (part.materialId ?? "") ? "selected" : ""}>${escapeHtml(m.name)}</option>`).join("")}</select>
-      </div>
-      <div class="edit-material-grid">
-        <div class="field"><label>Name</label><input id="mat-name" value="${escapeHtml(current.name)}" /></div>
-        <div class="field"><label>Density ρ (kg/m³)</label><input id="mat-density" type="number" step="10" value="${current.density}" /></div>
-        <div class="field"><label>Young's modulus E (MPa)</label><input id="mat-E" type="number" step="1000" value="${current.E}" /></div>
-        <div class="field"><label>Poisson ν</label><input id="mat-nu" type="number" step="0.01" value="${current.nu}" /></div>
-        <div class="field"><label>Yield strength σy (MPa)</label><input id="mat-yield" type="number" step="1" value="${current.yield}" /></div>
-        <div class="field"><label>&nbsp;</label><button class="btn" id="mat-custom">Custom values</button></div>
-      </div>
-      <div class="hint">Density drives mass properties; E, ν and σy drive the static study. Editing values stores a per-part override.</div>`;
-    let dirty = false;
-    const fields = () => ({
-      name: body.querySelector<HTMLInputElement>("#mat-name")?.value.trim() || "Custom Material",
-      density: Number(body.querySelector<HTMLInputElement>("#mat-density")?.value) || 7850,
-      E: Number(body.querySelector<HTMLInputElement>("#mat-E")?.value) || 200000,
-      nu: Number(body.querySelector<HTMLInputElement>("#mat-nu")?.value) || 0.3,
-      yield: Number(body.querySelector<HTMLInputElement>("#mat-yield")?.value) || 250,
-    });
-    const syncPreview = () => {
-      const f = fields();
-      const sw = body.querySelector<HTMLElement>("#mat-swatch");
-      const name = body.querySelector<HTMLElement>("#mat-preview-name");
-      const props = body.querySelector<HTMLElement>("#mat-preview-props");
-      const lib = MATERIALS.find((m) => m.id === body.querySelector<HTMLSelectElement>("#mat-select")?.value);
-      if (sw && lib) sw.style.background = lib.color;
-      if (name) name.textContent = f.name;
-      if (props) props.textContent = `E ${fmt(f.E, 0)} MPa · ν ${fmt(f.nu, 2)} · σy ${fmt(f.yield, 0)} MPa · ρ ${fmt(f.density, 0)} kg/m³`;
-    };
-    body.querySelector("#mat-select")?.addEventListener("change", () => {
-      const id = body.querySelector<HTMLSelectElement>("#mat-select")?.value ?? "steel";
-      const m = MATERIALS.find((q) => q.id === id);
-      if (!m) return;
-      const set = (sel: string, value: number | string) => {
-        const el = body.querySelector<HTMLInputElement>(sel);
-        if (el) el.value = String(value);
-      };
-      set("#mat-name", m.name);
-      set("#mat-density", m.density);
-      set("#mat-E", m.E);
-      set("#mat-nu", m.nu);
-      set("#mat-yield", m.yield);
-      dirty = false;
-      syncPreview();
-    });
-    body.querySelector("#mat-custom")?.addEventListener("click", () => {
-      const sel = body.querySelector<HTMLSelectElement>("#mat-select");
-      if (sel) sel.value = "custom";
-      const nameInput = body.querySelector<HTMLInputElement>("#mat-name");
-      if (nameInput && nameInput.value === current.name) nameInput.value = "Custom Alloy";
-      dirty = true;
-      syncPreview();
-    });
-    body.querySelectorAll<HTMLInputElement>("input").forEach((input) => input.addEventListener("input", () => {
-      dirty = true;
-      syncPreview();
-    }));
+    const effective = partMaterial(part);
+    const browser = createMaterialBrowser(part.materialId, effective, Boolean(part.materialOverride));
     void openModal({
       title: "Edit Material",
       icon: "layers",
-      body,
-      width: 560,
+      body: browser.body,
+      width: 900,
       actions: [
         { label: "Cancel", value: "cancel", kind: "plain" },
         { label: "Apply", value: "apply", kind: "primary" },
       ],
     }).then((result) => {
       if (result !== "apply") return;
+      const draft = browser.value();
       const before = this.capture();
-      const selected = body.querySelector<HTMLSelectElement>("#mat-select")?.value ?? "custom";
-      if (selected === "custom" || dirty) {
-        const f = fields();
-        part.materialId = "custom";
-        part.materialOverride = f;
-      } else {
-        part.materialId = selected;
-        part.materialOverride = undefined;
-      }
+      part.materialId = draft.materialId;
+      part.materialOverride = draft.override;
       for (const study of this.doc.analyses) {
         if (study.partId !== part.id) continue;
         study.materialId = part.materialId;
         study.stale = study.status === "solved" || study.status === "meshed";
       }
       this.commit(before);
+      this.refreshScene();
       this.updateMassCard();
       this.refreshTree();
-      this.updateMassCard();
-      toast(`Material for ${part.name}: ${partMaterial(part).name}.`, "success");
+      const applied = partMaterial(part);
+      toast(
+        `Material for ${part.name}: ${applied.name} · E ${fmt(applied.E, 0)} MPa · k ${fmt(applied.conductivity, 4)} W/(mm·K)`,
+        "success",
+        6500,
+      );
     });
   }
 
@@ -7867,40 +7930,9 @@ export class App {
   }
 
   private materialLibrary(): void {
-    const part = this.activePart();
-    if (!part) return;
-    const body = document.createElement("div");
-    const render = () => {
-      body.innerHTML = MATERIALS.map(
-        (material) => `<div class="material-row ${material.id === part.materialId ? "active" : ""}" data-material="${material.id}">
-          <span class="material-swatch" style="background:${material.color}"></span>
-          <div style="flex:1;min-width:0"><div class="name">${escapeHtml(material.name)}</div>
-          <div class="props">${material.category} · E ${material.E >= 1000 ? `${fmt(material.E / 1000, 1)} GPa` : `${fmt(material.E, 0)} MPa`} · ν ${material.nu} · σy ${fmt(material.yield, 0)} MPa</div></div>
-          ${material.id === part.materialId ? icon("check") : ""}
-        </div>`,
-      ).join("") + `<div class="hint" style="margin-top:10px">Assigning a material updates the active part and every analysis study that uses it.</div>`;
-    };
-    render();
-    body.addEventListener("click", (event) => {
-      const row = (event.target as HTMLElement).closest<HTMLElement>("[data-material]");
-      if (!row?.dataset.material) return;
-      const id = row.dataset.material;
-      const before = this.capture();
-      part.materialId = id;
-      for (const study of this.doc.analyses) if (study.partId === part.id) study.materialId = id;
-      this.commit(before);
-      this.updateMassCard();
-      this.refreshTree();
-      render();
-      toast(`${materialById(id).name} assigned.`, "success");
-    });
-    void openModal({
-      title: "Material Library",
-      icon: "layers",
-      body,
-      width: 560,
-      actions: [{ label: "Close", value: "close", kind: "primary" }],
-    });
+    // The Engineering Data browser supersedes the old flat list: it searches,
+    // filters by category and edits custom values in the same dialog.
+    this.openMaterialDialog();
   }
 
   private modelInfo(): void {

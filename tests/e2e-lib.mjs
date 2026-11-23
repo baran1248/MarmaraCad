@@ -86,6 +86,25 @@ export async function startSketch(page, plane = "front") {
   await page.waitForTimeout(450);
 }
 
+/** Click a ribbon command, opening its split dropdown when it lives there.
+ *  The ribbon groups related tools under one labelled button (Extrude ▾ …),
+ *  so a test must not assume every action is directly on the ribbon. */
+export async function runCmd(page, action) {
+  const target = page.locator(`[data-cmd-action="${action}"]`).first();
+  if ((await target.count()) && (await target.isVisible())) {
+    await target.click();
+    return;
+  }
+  const owner = await page.evaluate((a) => {
+    const item = document.querySelector(`[data-cmd-action="${a}"]`);
+    return item?.closest("[data-cmd-menu-panel]")?.getAttribute("data-cmd-menu-panel") ?? null;
+  }, action);
+  if (!owner) throw new Error(`Command "${action}" is not available in the ribbon.`);
+  await page.click(`[data-cmd-menu="${owner}"]`);
+  await page.waitForSelector(`[data-cmd-menu-panel="${owner}"]:not([hidden])`, { timeout: 5000 });
+  await page.click(`[data-cmd-menu-panel="${owner}"] [data-cmd-action="${action}"]`);
+}
+
 export async function setTool(page, tool) {
   if (tool === "select") {
     // Escape cancels the pending chain, then clears the selection, then leaves
@@ -97,7 +116,7 @@ export async function setTool(page, tool) {
     return;
   }
   await page.click('[data-cmd-tab="sketch"]');
-  await page.click(`[data-cmd-action="tool-${tool}"]`);
+  await runCmd(page, `tool-${tool}`);
   await page.waitForTimeout(80);
 }
 
@@ -187,7 +206,7 @@ export async function extrude(page, { depth = 10, operation = "new", symmetric =
 export async function revolve(page, { angle = 360, axisMode = "v", operation = "new" } = {}) {
   const before = await featureCount(page);
   await page.click('[data-cmd-tab="features"]');
-  await page.click('[data-cmd-action="revolve"]');
+  await runCmd(page, "revolve");
   await page.waitForSelector("#pm-angle", { timeout: 20000 });
   await page.fill("#pm-angle", String(angle));
   await page.selectOption("#pm-axis-mode", axisMode);

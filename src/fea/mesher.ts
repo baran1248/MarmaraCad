@@ -7,6 +7,23 @@
  *
  *  Interior testing uses parity ray casting along +Z with a 2D bucket index. */
 
+export interface MeshBudget {
+  /** Element size the user asked for. */
+  requested: number;
+  /** Element size the mesher used after clamping to the memory budget. */
+  effective: number;
+  /** "cells" = structured hex grid, "tets" = 24 tets per voxel cell. */
+  limitedBy: "cells" | "tets";
+  /** Hard element/cell ceiling that protects the tab from the browser OOM. */
+  limit: number;
+  /** Cells (or tets) the requested size would have produced. */
+  wanted: number;
+  /** Cells (or tets) actually meshed. */
+  actual: number;
+  /** Human readable message for the status bar / warnings. */
+  message: string;
+}
+
 export interface VoxelMeshData {
   positions: Float32Array;
   /** Eight node indices per element, bottom ring first (0..3) then top ring (4..7). */
@@ -18,6 +35,7 @@ export interface VoxelMeshData {
   elementCount: number;
   bounds: { min: [number, number, number]; max: [number, number, number] };
   warnings: string[];
+  budget?: MeshBudget;
 }
 
 interface FaceRecord {
@@ -58,6 +76,8 @@ export function buildVoxelMesh(sourcePositions: Float32Array, sourceIndices: Uin
   let cellY = Math.ceil((maxY - minY) / h);
   let cellZ = Math.ceil((maxZ - minZ) / h);
   const maxCells = 120000;
+  const requested = h;
+  const wantedCells = (cellX + 2) * (cellY + 2) * (cellZ + 2);
   while ((cellX + 2) * (cellY + 2) * (cellZ + 2) > maxCells) {
     h *= 1.22;
     cellX = Math.ceil((maxX - minX) / h);
@@ -67,7 +87,24 @@ export function buildVoxelMesh(sourcePositions: Float32Array, sourceIndices: Uin
   cellX = Math.max(2, cellX);
   cellY = Math.max(2, cellY);
   cellZ = Math.max(2, cellZ);
-  if (h > meshSize * 1.01) warnings.push(`Mesh size increased to ${h.toFixed(2)} mm to keep the model solvable.`);
+  let budget: MeshBudget | undefined;
+  if (h > requested * 1.01) {
+    // Never resize the mesh silently: the user must know that the browser RAM
+    // budget, not the requested element size, decided the result.
+    const message =
+      `Mesh size adapted to ${h.toFixed(2)} mm (requested ${requested.toFixed(2)} mm) to stay inside the ` +
+      `browser RAM budget: ${wantedCells.toLocaleString()} cells would exceed the ${maxCells.toLocaleString()} cell limit.`;
+    warnings.push(message);
+    budget = {
+      requested,
+      effective: h,
+      limitedBy: "cells",
+      limit: maxCells,
+      wanted: wantedCells,
+      actual: (cellX + 2) * (cellY + 2) * (cellZ + 2),
+      message,
+    };
+  }
 
   const pad = h * 0.02;
   const startX = minX - pad;
@@ -294,6 +331,7 @@ export function buildVoxelMesh(sourcePositions: Float32Array, sourceIndices: Uin
     elementCount,
     bounds: { min: [startX, startY, startZ], max: [startX + dimX * h, startY + dimY * h, startZ + dimZ * h] },
     warnings,
+    budget,
   };
 }
 
@@ -310,6 +348,7 @@ export interface TetMeshData {
   warnings: string[];
   kind: "tet4" | "tet10";
   metrics: { minAspect: number; avgAspect: number; minJacobian: number; avgJacobian: number };
+  budget?: MeshBudget;
 }
 
 /** Local mesh sizing zones from the study UI. The mesher uses the smallest
@@ -370,15 +409,32 @@ export function buildTetMesh(
     }
   }
   const maxTets = 140000;
+  const requested = effective;
   let voxel = buildVoxelMesh(sourcePositions, sourceIndices, effective);
+  const wantedTets = voxel.elementCount * 24;
   let guard = 0;
   while (voxel.elementCount * 24 > maxTets && guard++ < 12) {
     effective = voxel.h * 1.28;
     voxel = buildVoxelMesh(sourcePositions, sourceIndices, effective);
   }
   warnings.push(...voxel.warnings);
-  if (voxel.elementCount * 24 > maxTets) {
-    warnings.push("The model was coarsened to keep the tetrahedral mesh solvable.");
+  let budget: MeshBudget | undefined = voxel.budget;
+  if (wantedTets > maxTets) {
+    const message =
+      `Mesh size adapted to ${voxel.h.toFixed(2)} mm (requested ${requested.toFixed(2)} mm) to stay inside the ` +
+      `browser RAM budget: ${wantedTets.toLocaleString()} tetrahedra would exceed the ${maxTets.toLocaleString()} tet limit.`;
+    // Replace the hex-grid message (if any) with the tetrahedral one.
+    for (let i = warnings.length - 1; i >= 0; i--) if (/browser RAM budget/.test(warnings[i])) warnings.splice(i, 1);
+    warnings.push(message);
+    budget = {
+      requested,
+      effective: voxel.h,
+      limitedBy: "tets",
+      limit: maxTets,
+      wanted: wantedTets,
+      actual: voxel.elementCount * 24,
+      message,
+    };
   }
 
   const h = voxel.h;
@@ -563,6 +619,7 @@ export function buildTetMesh(
     warnings,
     kind,
     metrics,
+    budget,
   };
 }
 

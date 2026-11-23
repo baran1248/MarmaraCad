@@ -48,6 +48,21 @@ visualisation — executes on the user's own CPU/GPU.
 - Construction geometry, Trim, Offset Entities and Convert Entities in the sketch environment.
 - Material row above the feature tree (AISI 1020, 6061-T6, 304 SS, Ti-6Al-4V, ABS, Brass and
   custom), feeding mass properties and every analysis study.
+- Ansys Engineering Data-style material browser (`Ctrl+K` → "malzeme"): 46 real materials in six
+  categories with E, ν, G, σy, σu, ρ, real conductivity (W/(mm·K)), specific heat, CTE and PBR
+  values, Turkish/English search, category chips and per-part custom edits.
+- `Ctrl+K` command palette with Turkish character folding and engineering keywords ("delik",
+  "fillet", "açınım", "modal", "malzeme"); the ribbon groups secondary tools under split dropdowns
+  (Extrude ▾ Cut/Revolve/Sweep/Loft/Helix, Fillet ▾ Chamfer, Pattern ▾ Circular…) with a distinct
+  icon per command.
+- Studio viewport: `RoomEnvironment` + `PMREMGenerator` image-based lighting (WebGL2 and WebGPU),
+  a soft grid floor and contact shadow, per-material metalness/roughness on every body, and
+  translucent live ghosts while Extrude, Cut, Fillet, Chamfer and Edge Flange panels are open.
+- OCCT lifetime discipline (`OcctScope`/`OcctMemory` Proxy over the kernel module): a 20-rebuild
+  stress test reports `leaked 0 / untracked 0`, and the status-bar Memory chip shows the JS heap,
+  mesh buffers, FEA nodes/elements and OCCT object counters. FEA worker replies move their typed
+  arrays as Transferables, and mesh size is clamped to a browser RAM budget with a visible message
+  instead of a silent coarsening.
 - Evaluate tools: Mass Properties (volume, area, mass, centre of mass X/Y/Z), Measure, Section View,
   Interference Detection, technical drawing (3 orthographic + isometric views, hidden lines,
   centerlines/center marks, hatched A-A section, assembly BOM) and PDF export.
@@ -77,7 +92,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 31 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 32 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -102,6 +117,16 @@ and AI cut/revolve/mirror/pattern/mate commands, the drawing dimension placement
 Assembly/mass-card/menu labels.
 
 The phase-4 suites add e2e-phase4.mjs: the horizontal-trackpad orbit regression (dx 120 / dy 10 must orbit, not pan), the Pan scheme with Shift swap, Ctrl/pinch zoom, two-finger pan+pinch, three-finger Undo/Redo, pen dead-zone and tap-to-select, Push/Pull +15 mm (168,000 mm³) with an inward cut and Enter value, the edge-handle R6 fillet, Base/Edge Flange with the BA flat pattern (23,123.82 mm³ analytical) and a valid R12 .dxf, configurations (48,000 ↔ 144,000 mm³ with the Mass card), .mcad.json round-trips, the AI sheet-metal/config/push-pull actions and a live concentric-mate drag with a 0.000 mm radial residual.
+
+The phase-5 suite (`e2e-phase5.mjs`, 23 checks) proves the memory discipline and the new UI: 20
+consecutive rebuilds with `created 2002 / deleted 2002 / leaked 0 / untracked 0` and a stable
+volume, the Memory chip counters, an FEA solve reply that moves 6 ArrayBuffers as Transferables,
+46 materials / 12 fields / 8 category chips with "bakır" and "abs" searches, copper k = 0.385 and
+metalness 0.95 repainted on the body, a custom metalness override, Cut/Fillet/Chamfer ghosts that
+appear and disappear, the split-dropdown inventory and distinct Chamfer/Draft icons, and the Ctrl+K
+palette in Turkish and English (`delik`, `açınım`, `malzeme`, `modal`, `fillet`, `mesh`) including
+Enter-to-run. Unit suites add `tests/materials.test.ts` (library completeness, real conductivity and
+the 1925× copper/ABS flux ratio) and `tests/transfer.test.ts` (deduplicated transferable collection).
 
 The phase-3 suites add the ribbon caption-lane guard (`e2e-ribbon.mjs`, `getBoundingClientRect()` at
 1440 and 1024 px), the control-mode matrix (`e2e-controlmodes.mjs`: presets, trackpad gestures, pen and

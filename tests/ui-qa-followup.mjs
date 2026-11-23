@@ -1,7 +1,7 @@
 /* Read-only checks for the visual-QA follow-ups: legend labels, toast overlap,
  * mass-card numbers, command-ribbon label size, and how much of the viewport
  * the FEA result actually covers. */
-import { launch, openApp, newDocument, startSketch, setTool, sketchClick, finishSketch, extrude, waitVolume, zoomOut } from "./e2e-lib.mjs";
+import { launch, openApp, newDocument, startSketch, setTool, sketchClick, finishSketch, extrude, waitVolume, zoomOut, runCmd } from "./e2e-lib.mjs";
 import { imageStats } from "./pngstats.mjs";
 
 const browser = await launch();
@@ -24,7 +24,7 @@ for (const x of [-8, 8]) {
   await sketchClick(page, x + 4, 0);
   await finishSketch(page);
   await page.click('[data-cmd-tab="features"]');
-  await page.click('[data-cmd-action="extrude-cut"]');
+  await runCmd(page, "extrude-cut");
   await page.waitForSelector("#pm-depth");
   await page.fill("#pm-depth", "12");
   await page.click("[data-pm-ok]");

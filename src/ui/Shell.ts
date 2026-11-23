@@ -3,6 +3,7 @@ import type { DisplayStyle, NavigationSettings, ViewName } from "../viewport/Vie
 import type { TreeContext, TreeHandlers } from "./FeatureTree";
 import { FeatureTree } from "./FeatureTree";
 import { CommandManager, type CommandTab } from "./CommandManager";
+import { CommandPalette } from "./CommandPalette";
 import { ViewCube } from "./ViewCube";
 import { hydrateIcons, icon } from "./icons";
 import { fmtMm } from "./dom";
@@ -12,6 +13,27 @@ export type PanelTab = "tree" | "property" | "display";
 export interface MassRow {
   label: string;
   value: string;
+}
+
+/** Live memory / performance telemetry for the status bar popover. */
+export interface MemoryInfo {
+  heapUsed: number | null;
+  heapLimit?: number | null;
+  meshBytes: number;
+  nodes: number;
+  elements: number;
+  occtCreated: number;
+  occtLive: number;
+  feaBuffers: number;
+  meshBudget?: string;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${Math.round(bytes)} B`;
 }
 
 interface MenuEntry {
@@ -218,6 +240,7 @@ export class Shell {
   private docNameEl: HTMLElement;
   private docSubEl: HTMLElement;
   private modeTabs: HTMLElement;
+  private palette!: CommandPalette;
   private panelTabs: HTMLElement;
   private massCard: HTMLElement;
   private statusMsg: HTMLElement;
@@ -274,6 +297,7 @@ export class Shell {
           </nav>
           <div class="doc-title"><span class="doc-name">Untitled</span><span class="doc-sub">Part</span></div>
           <div class="title-actions">
+            <button class="icon-btn" data-title-action="search" title="Command Search (Ctrl+K)" aria-label="Command search">${icon("search")}</button>
             <button class="ai-launch" data-title-action="ai" title="Gemini AI assistant">${icon("sparkles")} AI</button>
             <button class="lang-btn" data-title-action="language" title="Switch language (TR/EN)">EN</button>
             <span class="title-sep"></span>
@@ -356,6 +380,14 @@ export class Shell {
           <div class="status-msg" id="status-msg">Starting…</div>
           <div class="status-item mono" id="status-cursor" style="display:none"></div>
           <div class="status-item" id="status-selection" style="display:none"></div>
+          <button class="status-item memory-chip" id="status-memory" title="Memory / Performance: JS heap, OCCT C++ objects, mesh size">
+            <i data-lucide="memory-stick" class="ic"></i><span id="status-memory-text">—</span>
+          </button>
+          <div class="memory-panel" id="memory-panel" hidden>
+            <div class="mp-head"><i data-lucide="memory-stick" class="ic"></i><span>Memory / Performance</span></div>
+            <div class="mp-grid" id="memory-grid"></div>
+            <div class="mp-hint">OCCT counts every C++ object a rebuild creates; “live” returns to 0 when the scope closes.</div>
+          </div>
           <div class="control-switcher" id="control-switcher" title="Navigation / input mode">
             <span class="cs-label">Navigate</span>
             <button data-control-mode="mouse" class="active">Mouse</button>
@@ -389,6 +421,7 @@ export class Shell {
       <div class="dropdown-layer" id="dropdown-layer"></div>
       <div class="toast-stack" id="toast-stack"></div>
       <div class="modal-layer" id="modal-layer"></div>
+      <div class="cmd-palette-layer" id="cmd-palette-layer" hidden></div>
     `;
     this.viewHost = this.getId("viewport");
     this.docNameEl = root.querySelector(".doc-name")!;
@@ -425,6 +458,8 @@ export class Shell {
       root.querySelector(".cmd-groups") as HTMLElement,
     );
     this.commandManager.onAction = (action) => this.onCommand(action);
+    this.palette = new CommandPalette(this.getId("cmd-palette-layer"), () => this.commandManager.commands());
+    this.palette.onRun = (action) => this.onCommand(action);
     this.viewCube = new ViewCube(this.getId("viewcube"));
     this.viewCube.onView = (name) => this.onView(name);
     this.viewCube.onHome = () => this.onView("iso");
@@ -482,6 +517,7 @@ export class Shell {
         else if (action === "redo") this.onRedo();
         else if (action === "save") this.onSave();
         else if (action === "ai") this.onAssistantToggle();
+        else if (action === "search") this.palette.toggle();
         else if (action === "language") this.onLanguageToggle();
       });
     });
@@ -521,11 +557,26 @@ export class Shell {
       this.setMousePreset((event.target as HTMLSelectElement).value as "solidworks" | "fusion" | "ansys");
     });
     this.bindNavigationSettings();
+    const memoryChip = this.root.querySelector<HTMLElement>("#status-memory");
+    const memoryPanel = this.root.querySelector<HTMLElement>("#memory-panel");
+    memoryChip?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (memoryPanel) memoryPanel.hidden = !memoryPanel.hidden;
+    });
+    memoryPanel?.addEventListener("click", (event) => event.stopPropagation());
+    document.addEventListener("click", () => {
+      if (memoryPanel) memoryPanel.hidden = true;
+    });
     this.menuLayer.addEventListener("click", (e) => {
       if (e.target === this.menuLayer) this.closeMenu();
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") this.closeMenu();
+      // Ctrl+K / Cmd+K: Shapr3D/SolidWorks-style command search.
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        this.palette.toggle();
+      }
     });
     window.addEventListener("blur", () => this.closeMenu());
   }
@@ -1137,6 +1188,42 @@ export class Shell {
   setBusy(busy: boolean): void {
     this.busy = busy;
     this.setKernel(busy ? "Kernel busy" : "OCCT ready", busy ? "busy" : "ok");
+  }
+
+  /** Memory / performance chip + popover in the status bar. */
+  setMemory(info: MemoryInfo): void {
+    this.memoryInfo = info;
+    const text = this.root.querySelector<HTMLElement>("#status-memory-text");
+    if (text) {
+      const parts: string[] = [];
+      if (info.heapUsed !== null) parts.push(formatBytes(info.heapUsed));
+      if (info.elements) parts.push(`${info.elements.toLocaleString()} el`);
+      text.textContent = parts.length ? parts.join(" · ") : "n/a";
+    }
+    const grid = this.root.querySelector<HTMLElement>("#memory-grid");
+    if (grid) {
+      const rows: [string, string][] = [
+        ["JS heap", info.heapUsed === null ? "not exposed by this browser" : `${formatBytes(info.heapUsed)} / ${formatBytes(info.heapLimit ?? 0)}`],
+        ["Mesh buffers", formatBytes(info.meshBytes)],
+        ["FEA nodes", info.nodes ? info.nodes.toLocaleString() : "—"],
+        ["FEA elements", info.elements ? info.elements.toLocaleString() : "—"],
+        ["OCCT objects tracked", info.occtCreated.toLocaleString()],
+        ["OCCT objects live", info.occtLive.toLocaleString()],
+        ["Buffers moved (zero-copy)", info.feaBuffers.toLocaleString()],
+      ];
+      if (info.meshBudget) rows.push(["Mesh budget", info.meshBudget]);
+      grid.innerHTML = rows
+        .map(([k, v]) => `<span>${k}</span><span>${v.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"))}</span>`)
+        .join("");
+    }
+    const chip = this.root.querySelector<HTMLElement>("#status-memory");
+    chip?.classList.toggle("warn", info.occtLive > 0);
+  }
+
+  private memoryInfo: MemoryInfo | null = null;
+
+  get memory(): MemoryInfo | null {
+    return this.memoryInfo;
   }
 
   get isBusy(): boolean {

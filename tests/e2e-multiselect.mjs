@@ -1,4 +1,4 @@
-import { launch, openApp, newDocument, startSketch, sketchClick, setTool, finishSketch, extrude, waitVolume, near } from "./e2e-lib.mjs";
+import { launch, openApp, newDocument, startSketch, sketchClick, setTool, finishSketch, extrude, waitVolume, near, runCmd } from "./e2e-lib.mjs";
 
 const browser = await launch();
 const { page, errors } = await openApp(browser);
@@ -251,7 +251,7 @@ try {
     await page.waitForTimeout(120);
   }
   await page.click('[data-cmd-tab="features"]');
-  await page.click('[data-cmd-action="chamfer"]');
+  await runCmd(page, "chamfer");
   await page.waitForSelector("#pm-chamfer-distance");
   const chamferPanel = await page.locator(".panel-body").innerText();
   await page.fill("#pm-chamfer-distance", "2");

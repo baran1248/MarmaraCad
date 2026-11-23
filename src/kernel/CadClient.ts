@@ -1,10 +1,12 @@
 import type { MeshData, RebuildPart } from "../model/types";
-import type { ExportResponse, ImportResponse, KernelResponse, RebuildResponse } from "./protocol";
+import type { OcctMemorySnapshot } from "./occtScope";
+import type { ExportResponse, ImportResponse, KernelResponse, MemoryResponse, RebuildResponse } from "./protocol";
 
 export interface RebuildResult {
   parts: Record<string, MeshData>;
   errors: Record<string, Record<string, string>>;
   kernelMs: number;
+  memory?: OcctMemorySnapshot;
 }
 
 type Waiter = {
@@ -24,6 +26,7 @@ export class CadClient {
   private booted = false;
   private bootFromCache = false;
   private bootBytes = 0;
+  private memorySnapshot: OcctMemorySnapshot | null = null;
   private bootListeners = new Set<(phase: string, percent: number) => void>();
 
   constructor() {
@@ -124,8 +127,24 @@ export class CadClient {
     return this.enqueue(async () => {
       await this.readyPromise;
       const res = await this.send<RebuildResponse>({ type: "rebuild", parts, quality }, ["rebuild"]);
-      return { parts: res.parts, errors: res.errors, kernelMs: res.kernelMs };
+      if (res.memory) this.memorySnapshot = res.memory;
+      return { parts: res.parts, errors: res.errors, kernelMs: res.kernelMs, memory: res.memory };
     });
+  }
+
+  /** OCCT C++ lifetime counters; the rebuild response updates them, this asks
+   *  the worker directly (used by the Memory/perf HUD). */
+  memory(): Promise<OcctMemorySnapshot> {
+    return this.enqueue(async () => {
+      await this.readyPromise;
+      const res = await this.send<MemoryResponse>({ type: "memory" }, ["memory"]);
+      this.memorySnapshot = res.occt;
+      return res.occt;
+    });
+  }
+
+  get lastMemory(): OcctMemorySnapshot | null {
+    return this.memorySnapshot;
   }
 
   importFile(partId: string, format: "step" | "iges", data: ArrayBuffer, rev: string): Promise<ImportResponse> {

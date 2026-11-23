@@ -6,11 +6,27 @@ import type { ExportRequest, ImportRequest, KernelResponse, RebuildRequest } fro
 import type { EdgeInfo, FaceInfo, Feature, MeshData, Part, RebuildPart, Sketch, SketchPlane, Vec2, Vec3 } from "../model/types";
 import { buildProfileGroups, planePoint, type ProfileGroup, type ProfileLoop } from "../sketch/geometry";
 import { flatPattern, sheetMetalRecipe } from "../model/sheetMetal";
+import { OcctMemory, type OcctScope, wrapOcctConstructors } from "./occtScope";
 
 let oc: any = null;
 let bootMs = 0;
+/** RAII lifetime tracking for every temporary OCCT C++ object. */
+const memory = new OcctMemory();
 const partShapes = new Map<string, any>();
 const importedShapes = new Map<string, { rev: string; shape: any }>();
+
+/** Release a cached B-Rep wrapper that a rebuild is about to replace.
+ *  Imported bodies are shared with the import cache and must be kept. */
+function dropCachedShape(partId: string, next: any): void {
+  const old = partShapes.get(partId);
+  if (!old || old === next) return;
+  if (importedShapes.get(partId)?.shape === old) return;
+  try {
+    old.delete?.();
+  } catch {
+    /* the wrapper was already released */
+  }
+}
 
 const enumVal = (v: any): number => (typeof v === "number" ? v : v?.value ?? -1);
 const DEG = Math.PI / 180;
@@ -713,12 +729,13 @@ function ribFeature(sketch: Sketch, feature: Feature, shape: any): any {
  *  traversal returns every box edge twice. Deduplicating by the sampled
  *  endpoint/midpoint key keeps picking, highlighting and fillet indices
  *  one-to-one with the edges the user actually sees. */
-function collectEdges(shape: any): any[] {
+function collectEdges(shape: any, scope?: OcctScope | null): any[] {
   const edges: any[] = [];
+  const tracker = scope ?? memory;
   const seen = new Map<string, any[]>();
   const exp = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_EDGE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
   while (exp.More()) {
-    const edge = oc.TopoDS.Edge_1(exp.Current());
+    const edge = tracker.track(oc.TopoDS.Edge_1(exp.Current()));
     let key = "";
     try {
       if (oc.BRep_Tool.Degenerated(edge)) {
@@ -735,6 +752,7 @@ function collectEdges(shape: any): any[] {
       const pa = [round(a.X()), round(a.Y()), round(a.Z())].join(",");
       const pb = [round(b.X()), round(b.Y()), round(b.Z())].join(",");
       key = [pa < pb ? pa : pb, pa < pb ? pb : pa, round(mid.X()), round(mid.Y()), round(mid.Z()), enumVal(curve.GetType())].join("|");
+      for (const point of [a, b, mid]) (point as { delete?: () => void }).delete?.();
     } catch {
       key = "";
     }
@@ -793,36 +811,38 @@ const READ_PATHS = { step: "/i.step", iges: "/i.igs" } as const;
 async function ensureImport(partId: string, format: "step" | "iges", data: ArrayBuffer, rev: string): Promise<any> {
   const cached = importedShapes.get(partId);
   if (cached && cached.rev === rev) return cached.shape;
-  const path = READ_PATHS[format];
-  oc.FS.writeFile(path, new Uint8Array(data));
-  let shape: any = null;
-  try {
-    if (format === "step") {
-      const reader = new oc.STEPControl_Reader_1();
-      const status = reader.ReadFile(path);
-      if (enumVal(status) !== 1) throw new Error("STEP reader could not open the file.");
-      reader.TransferRoots();
-      shape = reader.OneShape();
-    } else {
-      const reader = new oc.IGESControl_Reader_1();
-      const status = reader.ReadFile(path);
-      if (enumVal(status) !== 1) throw new Error("IGES reader could not open the file.");
-      reader.TransferRoots();
-      shape = reader.OneShape();
-    }
-  } finally {
+  return memory.run(`import-file:${format}`, (scope) => {
+    const path = READ_PATHS[format];
+    oc.FS.writeFile(path, new Uint8Array(data));
+    let shape: any = null;
     try {
-      oc.FS.unlink(path);
-    } catch {
-      /* ignore */
+      if (format === "step") {
+        const reader = new oc.STEPControl_Reader_1();
+        const status = reader.ReadFile(path);
+        if (enumVal(status) !== 1) throw new Error("STEP reader could not open the file.");
+        reader.TransferRoots();
+        shape = reader.OneShape();
+      } else {
+        const reader = new oc.IGESControl_Reader_1();
+        const status = reader.ReadFile(path);
+        if (enumVal(status) !== 1) throw new Error("IGES reader could not open the file.");
+        reader.TransferRoots();
+        shape = reader.OneShape();
+      }
+    } finally {
+      try {
+        oc.FS.unlink(path);
+      } catch {
+        /* ignore */
+      }
     }
-  }
-  if (!shape || shape.IsNull()) throw new Error("The file did not contain a transferable solid.");
-  importedShapes.set(partId, { rev, shape });
-  return shape;
+    if (!shape || shape.IsNull()) throw new Error("The file did not contain a transferable solid.");
+    importedShapes.set(partId, { rev, shape: scope.keep(shape) });
+    return shape;
+  });
 }
 
-function tessellate(shape: any, quality: number): MeshData {
+function tessellate(shape: any, quality: number, scope: OcctScope): MeshData {
   const linDeflection = Math.max(0.02, quality || 0.12);
   new oc.BRepMesh_IncrementalMesh_2(shape, linDeflection, false, 0.35, true);
   const positions: number[] = [];
@@ -839,7 +859,7 @@ function tessellate(shape: any, quality: number): MeshData {
   const allTris: { a: Vec3; b: Vec3; c: Vec3; faceId: number }[] = [];
 
   while (expFaces.More()) {
-    const face = oc.TopoDS.Face_1(expFaces.Current());
+    const face = scope.track(oc.TopoDS.Face_1(expFaces.Current()));
     // The triangulation winds along the underlying surface parameterisation. OCCT
     // stores the solid's outward sense in the face orientation, so reversed faces
     // must have their triangle winding (and normals) flipped.
@@ -1018,7 +1038,7 @@ function tessellate(shape: any, quality: number): MeshData {
   // Topological edges as smooth polylines for display and picking.
   const edges: EdgeInfo[] = [];
   try {
-    const topoEdges = collectEdges(shape);
+    const topoEdges = collectEdges(shape, scope);
     for (let edgeIndex = 0; edgeIndex < topoEdges.length; edgeIndex++) {
       const edge = topoEdges[edgeIndex];
       try {
@@ -1034,6 +1054,7 @@ function tessellate(shape: any, quality: number): MeshData {
           const t = first + ((last - first) * i) / (samples - 1);
           const p = curve.Value(t);
           const v: Vec3 = [p.X(), p.Y(), p.Z()];
+          (p as { delete?: () => void }).delete?.();
           if (prev) length += Math.hypot(v[0] - prev[0], v[1] - prev[1], v[2] - prev[2]);
           pts.push(v);
           prev = v;
@@ -1082,7 +1103,7 @@ function tessellate(shape: any, quality: number): MeshData {
   };
 }
 
-function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors: Record<string, string> } {
+function buildPart(part: RebuildPart, quality: number, scope: OcctScope): { mesh: MeshData; errors: Record<string, string> } {
   const errors: Record<string, string> = {};
   let shape: any = null;
   let baseImported: any = null;
@@ -1113,6 +1134,7 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
         }
         if (!baseImported || baseImported.IsNull()) throw new Error("The imported file did not contain a solid.");
         importedShapes.set(part.id, { rev: part.assetRev ?? "", shape: baseImported });
+        scope.keep(baseImported);
       }
     } catch (e) {
       errors["import"] = String(e);
@@ -1130,8 +1152,10 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
       shape = null;
     }
     if (shape && !shape.IsNull()) {
+      dropCachedShape(part.id, shape);
       partShapes.set(part.id, shape);
-      const mesh = tessellate(shape, quality);
+      scope.keep(shape);
+      const mesh = tessellate(shape, quality, scope);
       mesh.warnings = [...mesh.warnings, ...Object.values(errors)];
       return { mesh, errors };
     }
@@ -1216,8 +1240,10 @@ function buildPart(part: RebuildPart, quality: number): { mesh: MeshData; errors
     return { mesh: empty, errors };
   }
 
+  dropCachedShape(part.id, shape);
   partShapes.set(part.id, shape);
-  const mesh = tessellate(shape, quality);
+  scope.keep(shape);
+  const mesh = tessellate(shape, quality, scope);
   mesh.warnings = [...mesh.warnings, ...Object.values(errors)];
   return { mesh, errors };
 }
@@ -1232,13 +1258,14 @@ function matrixToTrsf(matrix: number[]): any {
   return t;
 }
 
-function buildCompound(targets: { partId: string; matrix?: number[] }[]): any {
+function buildCompound(targets: { partId: string; matrix?: number[] }[], scope?: OcctScope | null): any {
+  const tracker = scope ?? memory;
   if (targets.length === 1) {
     const shape = partShapes.get(targets[0].partId);
     if (!shape) throw new Error("Part geometry is not available. Rebuild the model first.");
     if (!targets[0].matrix) return shape;
     const tr = new oc.BRepBuilderAPI_Transform_2(shape, matrixToTrsf(targets[0].matrix), true);
-    return tr.Shape();
+    return tracker.track(tr.Shape());
   }
   const builder = new oc.BRep_Builder();
   const compound = new oc.TopoDS_Compound();
@@ -1247,7 +1274,7 @@ function buildCompound(targets: { partId: string; matrix?: number[] }[]): any {
     const shape = partShapes.get(target.partId);
     if (!shape) continue;
     const transformed = target.matrix
-      ? new oc.BRepBuilderAPI_Transform_2(shape, matrixToTrsf(target.matrix), true).Shape()
+      ? tracker.track(new oc.BRepBuilderAPI_Transform_2(shape, matrixToTrsf(target.matrix), true).Shape())
       : shape;
     builder.Add(compound, transformed);
   }
@@ -1259,19 +1286,31 @@ async function handleRebuild(req: RebuildRequest) {
   const meshes: Record<string, MeshData> = {};
   const errors: Record<string, Record<string, string>> = {};
   for (const part of req.parts) {
-    const result = buildPart(part, req.quality ?? 0.12);
+    // One RAII scope per part: every temporary C++ object created while building
+    // this part is released before the next part starts.
+    const result = memory.run(`rebuild:${part.id}`, (scope) => buildPart(part, req.quality ?? 0.12, scope));
     meshes[part.id] = result.mesh;
     if (Object.keys(result.errors).length) errors[part.id] = result.errors;
   }
-  post({ type: "rebuild", parts: meshes, errors, kernelMs: Math.round(performance.now() - t0) });
+  post({
+    type: "rebuild",
+    parts: meshes,
+    errors,
+    kernelMs: Math.round(performance.now() - t0),
+    memory: memory.snapshot(),
+  });
 }
 
 async function handleImport(req: ImportRequest) {
   try {
     const shape = await ensureImport(req.partId, req.format, req.data, req.rev);
-    partShapes.set(req.partId, shape);
-    const mesh = tessellate(shape, 0.15);
-    post({ type: "import", partId: req.partId, mesh });
+    memory.run("import", (scope) => {
+      dropCachedShape(req.partId, shape);
+      partShapes.set(req.partId, shape);
+      scope.keep(shape);
+      const mesh = tessellate(shape, 0.15, scope);
+      post({ type: "import", partId: req.partId, mesh });
+    });
   } catch (e) {
     post({ type: "import", partId: req.partId, mesh: null, error: e instanceof Error ? e.message : String(e) });
   }
@@ -1286,28 +1325,31 @@ const EXPORT_PATHS = { step: "/o.step", iges: "/o.igs" } as const;
 async function handleExport(req: ExportRequest) {
   const path = EXPORT_PATHS[req.format];
   try {
-    const shape = buildCompound(req.targets);
-    if (req.format === "step") {
-      const writer = new oc.STEPControl_Writer_1();
-      const transfer = writer.Transfer(shape, oc.STEPControl_StepModelType.STEPControl_AsIs, true);
-      if (enumVal(transfer) !== 1) throw new Error(`STEP transfer failed: status ${enumVal(transfer)}.`);
-      const status = writer.Write(path);
-      if (enumVal(status) !== 1) throw new Error(`STEP writer failed: status ${enumVal(status)}.`);
-    } else {
-      const writer = new oc.IGESControl_Writer_2("MM", 1);
-      writer.AddShape(shape);
-      writer.ComputeModel();
-      // The stream overload (Write_1) is not bound in opencascade.js; the file
-      // overload takes (filename, bureautic-mode) and must be called with both.
-      if (!writer.Write_2(path, false)) throw new Error("IGES writer failed.");
-    }
-    let bytes: Uint8Array;
-    try {
-      bytes = new Uint8Array(oc.FS.readFile(path));
-    } catch (e) {
-      throw new Error(`The exported CAD file could not be read back (${String(e)}).`);
-    }
-    if (bytes.length === 0) throw new Error("The CAD exporter produced an empty file.");
+    const bytes = memory.run(`export:${req.format}`, (scope) => {
+      const shape = buildCompound(req.targets, scope);
+      if (req.format === "step") {
+        const writer = new oc.STEPControl_Writer_1();
+        const transfer = writer.Transfer(shape, oc.STEPControl_StepModelType.STEPControl_AsIs, true);
+        if (enumVal(transfer) !== 1) throw new Error(`STEP transfer failed: status ${enumVal(transfer)}.`);
+        const status = writer.Write(path);
+        if (enumVal(status) !== 1) throw new Error(`STEP writer failed: status ${enumVal(status)}.`);
+      } else {
+        const writer = new oc.IGESControl_Writer_2("MM", 1);
+        writer.AddShape(shape);
+        writer.ComputeModel();
+        // The stream overload (Write_1) is not bound in opencascade.js; the file
+        // overload takes (filename, bureautic-mode) and must be called with both.
+        if (!writer.Write_2(path, false)) throw new Error("IGES writer failed.");
+      }
+      let data: Uint8Array;
+      try {
+        data = new Uint8Array(oc.FS.readFile(path));
+      } catch (e) {
+        throw new Error(`The exported CAD file could not be read back (${String(e)}).`);
+      }
+      if (data.length === 0) throw new Error("The CAD exporter produced an empty file.");
+      return data;
+    });
     post({ type: "export", bytes, filename: req.filename }, [bytes.buffer]);
   } catch (e) {
     post({ type: "export", bytes: null, filename: req.filename, error: e instanceof Error ? e.message : String(e) });
@@ -1322,9 +1364,12 @@ async function handleExport(req: ExportRequest) {
 
 async function boot() {
   const t0 = performance.now();
-  oc = await getOcct((progress) => {
+  // The raw module is kept for `oc.FS` (file I/O) and the wrapped module is used
+  // for every geometry call so constructors are tracked by `memory`.
+  const rawOc = await getOcct((progress) => {
     post({ type: "boot-progress", phase: progress.phase, percent: progress.percent });
   });
+  oc = wrapOcctConstructors(rawOc, memory);
   bootMs = Math.round(performance.now() - t0);
   const info = occtCacheInfo();
   post({ type: "ready", bootMs, fromCache: info.fromCache, wasmBytes: info.bytes });
@@ -1337,6 +1382,7 @@ self.onmessage = async (e: MessageEvent) => {
     else if (req.type === "rebuild") await handleRebuild(req);
     else if (req.type === "import") await handleImport(req);
     else if (req.type === "export") await handleExport(req);
+    else if (req.type === "memory") post({ type: "memory", occt: memory.snapshot() });
   } catch (err) {
     post({ type: "error", message: err instanceof Error ? err.message : String(err), stack: (err as Error)?.stack });
   }

@@ -231,8 +231,16 @@ export interface Part {
     name?: string;
     E?: number;
     nu?: number;
+    G?: number;
     yield?: number;
+    uts?: number;
     density?: number;
+    conductivity?: number;
+    specificHeat?: number;
+    cte?: number;
+    color?: string;
+    metalness?: number;
+    roughness?: number;
   };
   /** Features at or below this index rebuild; the rest are rolled back. */
   rollbackIndex?: number;
@@ -385,6 +393,16 @@ export interface AnalysisStudy {
   modeCount?: number;
   thermal?: { ambient: number; convection: number };
   meshMetrics?: FeaMeshMetrics;
+  /** Set when the browser RAM budget forced a coarser mesh than requested. */
+  meshBudget?: {
+    requested: number;
+    effective: number;
+    limitedBy: "cells" | "tets";
+    limit: number;
+    wanted: number;
+    actual: number;
+    message: string;
+  };
   /** Last result summary persisted with the document (mode frequencies etc.). */
   resultSummary?: Record<string, number>;
 }
@@ -475,11 +493,23 @@ export interface FeaMaterial {
   category: string;
   E: number; // MPa
   nu: number;
+  /** Shear modulus (MPa). Derived from E and nu when not supplied. */
+  G: number;
   yield: number; // MPa
+  /** Ultimate tensile strength (MPa). */
+  uts: number;
   density: number; // kg/m3
   /** Thermal conductivity in W/(mm·K); defaults to steel-like 0.05. */
-  conductivity?: number;
+  conductivity: number;
+  /** Specific heat capacity in J/(kg·K). */
+  specificHeat: number;
+  /** Coefficient of thermal expansion in 1/K. */
+  cte: number;
   color: string;
+  /** Studio PBR: 0 = dielectric, 1 = metal. */
+  metalness: number;
+  /** Studio PBR: 0 = mirror, 1 = fully diffuse. */
+  roughness: number;
 }
 
 export interface FeaNodeResult {
@@ -516,6 +546,16 @@ export interface FeaNodeResult {
   bucklingMode?: Float32Array;
   meshKind?: FeaMeshKind;
   meshMetrics?: FeaMeshMetrics;
+  /** Set when the browser RAM budget resized the requested mesh. */
+  meshBudget?: {
+    requested: number;
+    effective: number;
+    limitedBy: "cells" | "tets";
+    limit: number;
+    wanted: number;
+    actual: number;
+    message: string;
+  };
 }
 
 export interface ProjectFile {

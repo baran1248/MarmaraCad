@@ -119,29 +119,55 @@ try {
   record("Right-click Hide / Show toggles visibility and Ctrl+Z restores it", hidden && restored, { hidden, restored });
 
   // --- Right-click Sketch on Face opens a sketch on that face.
-  // Scan a few pixels around the face centre until the ray lands on a planar face,
-  // so the test does not depend on the centre hitting a hole rim.
-  const planar = await page.evaluate((p) => {
-    const vp = window.__marmaracad.app.viewport;
-    const rect = vp.renderer.domElement.getBoundingClientRect();
-    const s = vp.projectToScreen(p);
-    const base = { x: rect.left + s.x, y: rect.top + s.y };
-    for (const r of [0, 12, 24, 40, 60, 90]) {
-      for (const [dx, dy] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
-        const x = base.x + dx;
-        const y = base.y + dy;
+  // Project the centroids of the face's own triangles and pick the first pixel
+  // where the ray lands on that face and on no edge/vertex. `face.point` is a
+  // V-Rep point that can sit exactly on a bore rim, so a fixed pixel radius was
+  // zoom dependent and flaky.
+  const findPlanar = () =>
+    page.evaluate(() => {
+      const api = window.__marmaracad;
+      const vp = api.app.viewport;
+      const doc = api.doc();
+      const mesh = api.meshes().get(doc.parts[0].id);
+      if (!mesh) return null;
+      const rect = vp.renderer.domElement.getBoundingClientRect();
+      const faceIndex = mesh.faces.findIndex((f) => f.surface === "plane" && f.normal[2] > 0.9);
+      const face = mesh.faces[faceIndex];
+      if (!face) return null;
+      const stride = Math.max(1, Math.floor(face.triCount / 600));
+      for (let t = 0; t < face.triCount; t += stride) {
+        const tri = (face.triStart + t) * 3;
+        const a = mesh.indices[tri] * 3;
+        const b = mesh.indices[tri + 1] * 3;
+        const c = mesh.indices[tri + 2] * 3;
+        const centroid = [
+          (mesh.positions[a] + mesh.positions[b] + mesh.positions[c]) / 3,
+          (mesh.positions[a + 1] + mesh.positions[b + 1] + mesh.positions[c + 1]) / 3,
+          (mesh.positions[a + 2] + mesh.positions[b + 2] + mesh.positions[c + 2]) / 3,
+        ];
+        const s = vp.projectToScreen(centroid);
+        if (!s.visible) continue;
+        const x = rect.left + s.x;
+        const y = rect.top + s.y;
+        if (x < rect.left + 3 || x > rect.right - 3 || y < rect.top + 3 || y > rect.bottom - 3) continue;
         if (vp.pickVertex(x, y)) continue;
-        vp.raycastFaceAt(x, y);
-        if (vp.pickEdge()) continue;
         const pick = vp.raycastFaceAt(x, y);
-        if (pick && pick.face.surface === "plane" && Math.abs(pick.face.normal[2]) > 0.9) {
-          return { x, y, index: pick.faceIndex, normal: pick.face.normal, dx, dy };
+        if (vp.pickEdge()) continue;
+        if (pick && pick.faceIndex === faceIndex && pick.face.surface === "plane" && Math.abs(pick.face.normal[2]) > 0.9) {
+          return { x, y, index: pick.faceIndex, normal: pick.face.normal, tri: t };
         }
       }
-    }
-    return null;
-  }, top.point);
+      return null;
+    });
+  let planar = await findPlanar();
+  if (!planar) {
+    // A tight zoom can push every sampled centroid off-screen; fit first.
+    await page.evaluate(() => window.__marmaracad.app.viewport.zoomFit(false));
+    await page.waitForTimeout(250);
+    planar = await findPlanar();
+  }
   record("A planar top face is pickable near its centre", !!planar, planar ?? {});
+  if (!planar) throw new Error("No pickable planar top-face pixel was found.");
   await page.mouse.click(planar.x, planar.y, { button: "right" });
   await page.waitForSelector("#viewport-context.visible", { timeout: 5000 });
   const menuItems = await page.locator("#viewport-context .ctx-item").allInnerTexts();

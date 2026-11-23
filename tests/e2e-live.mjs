@@ -138,6 +138,48 @@ const fea = await page.evaluate(() => {
 });
 console.log("FEA", JSON.stringify(fea));
 
+// Phase 5 surfaces on the deployed build: RAII counters, the material browser
+// and the Ctrl+K palette must all exist in the published bundle.
+const phase5 = await page.evaluate(async () => {
+  const application = window.__marmaracad.app;
+  const part = window.__marmaracad.doc().parts[0];
+  const feature = part.features.find((f) => f.type === "extrude" || f.type === "cut");
+  for (let i = 0; i < 6; i++) {
+    if (feature) feature.params.depth = 10 + (i % 2) * 4;
+    await application.rebuild();
+  }
+  const memory = window.__marmaracad.kernelMemory();
+  application.openMaterialDialog();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const rows = document.querySelectorAll(".mat-browser [data-material]").length;
+  const fields = ["mat-E", "mat-G", "mat-conductivity", "mat-specificHeat", "mat-cte", "mat-metalness"]
+    .filter((id) => document.getElementById(id)).length;
+  document.querySelector(".modal-head .close")?.click();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const palette = !document.getElementById("cmd-palette-layer").hidden;
+  const input = document.getElementById("cp-input");
+  if (input) {
+    input.value = "açınım";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  const trHit = [...document.querySelectorAll(".cp-row")].some((r) => r.dataset.cpAction === "flatten");
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  return {
+    occt: memory.occt,
+    env: Boolean(application.viewport.scene.environment),
+    ground: application.viewport.groundGroup.children.length,
+    materialRows: rows,
+    materialFields: fields,
+    palette,
+    trHit,
+    transfer: application.fea.transfer,
+  };
+});
+console.log("PHASE5", JSON.stringify(phase5));
+
 console.log("ERRORS", errors.length ? JSON.stringify(errors, null, 2) : "none");
 const ok =
   sample.volume === 98507 &&
@@ -149,6 +191,16 @@ const ok =
   Number(fea.maxDeformation) > 0 &&
   Number(fea.maxStress) > 0 &&
   fea.colorbarVisible === true &&
+  phase5.occt?.leaked === 0 &&
+  phase5.occt?.untracked === 0 &&
+  phase5.occt?.created > 0 &&
+  phase5.env === true &&
+  phase5.ground >= 2 &&
+  phase5.materialRows >= 45 &&
+  phase5.materialFields === 6 &&
+  phase5.palette === true &&
+  phase5.trHit === true &&
+  Number(phase5.transfer?.totalBuffers) > 0 &&
   errors.length === 0;
 console.log("RESULT", ok ? "PASS" : "FAIL");
 await browser.close();

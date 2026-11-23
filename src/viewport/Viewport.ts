@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import type { EdgeInfo, FaceInfo, MeshData, SketchPlane, Vec3 } from "../model/types";
 import { bodyGeometry, edgeLineGeometry, edgePolylineGeometry, faceGeometry } from "./geometry";
 import type { RendererBackend, RendererLike } from "./renderer";
@@ -72,6 +73,9 @@ export interface SceneBody {
   componentId: string | null;
   mesh: MeshData;
   color: string;
+  /** Studio PBR taken from the part material (0 = dielectric, 1 = metal). */
+  metalness?: number;
+  roughness?: number;
   visible?: boolean;
   position?: Vec3;
   rotation?: Vec3;
@@ -122,15 +126,26 @@ const FACE_SELECT = 0xffb100;
 const FACE_HOVER = 0x55a8f0;
 const EDGE_HIGHLIGHT = 0xffa000;
 
-function makeBodyMaterial(color: string): THREE.MeshStandardMaterial {
+function makeBodyMaterial(color: string, metalness = 0.18, roughness = 0.52): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
     color: new THREE.Color(color),
-    metalness: 0.18,
-    roughness: 0.52,
+    metalness,
+    roughness,
     side: THREE.FrontSide,
     polygonOffset: true,
     polygonOffsetFactor: 1,
     polygonOffsetUnits: 1,
+  });
+}
+
+/** Release every geometry/material below a preview group. */
+function disposeObject3D(root: THREE.Object3D): void {
+  root.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    mesh.geometry?.dispose?.();
+    const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+    if (Array.isArray(material)) material.forEach((m) => m.dispose());
+    else material?.dispose?.();
   });
 }
 
@@ -230,6 +245,11 @@ export class Viewport {
   private resizeObserver: ResizeObserver;
   private disposed = false;
   private debugWire: THREE.Mesh | null = null;
+  /** Studio backdrop: soft grid + faked contact shadow under the model. */
+  private groundGroup = new THREE.Group();
+  private shadowPlane: THREE.Mesh | null = null;
+  /** Translucent live preview from a PropertyManager (Extrude, Cut, Fillet…). */
+  private ghostGroup: THREE.Group | null = null;
 
   constructor(container: HTMLElement, renderer: RendererLike, backend: RendererBackend = "webgl2") {
     this.container = container;
@@ -269,7 +289,9 @@ export class Viewport {
     this.controls.addEventListener("change", () => this.onCameraChange?.());
 
     this.setupLights();
+    this.setupStudioEnvironment();
     this.buildOriginPlanes();
+    this.buildStudioGround();
 
     this.renderer.domElement.addEventListener("pointerdown", this.handlePointerDown);
     this.renderer.domElement.addEventListener("pointerup", this.handlePointerUp);
@@ -499,7 +521,8 @@ export class Viewport {
     return { ...this.section };
   }
 
-  private setupLights(): void {    const hemi = new THREE.HemisphereLight(0xffffff, 0x5b6b7c, 1.35);
+  private setupLights(): void {
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x5b6b7c, 1.35);
     this.scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 2.1);
     key.position.set(180, 260, 220);
@@ -510,6 +533,165 @@ export class Viewport {
     const rim = new THREE.DirectionalLight(0xffffff, 0.65);
     rim.position.set(100, -160, 90);
     this.scene.add(rim);
+  }
+
+  /** Studio image-based lighting: RoomEnvironment through a PMREM prefilter.
+   *
+   *  The WebGL2 path uses Three's WebGL PMREM. The WebGPU renderer needs the
+   *  PMREM implementation that ships with `three/webgpu`; it is imported lazily
+   *  so WebGL2 clients never download the second bundle. If either path fails
+   *  (older driver, headless GPU), a procedural equirect canvas keeps the
+   *  viewport shaded instead of leaving materials flat. */
+  private async setupStudioEnvironment(): Promise<void> {
+    const room = new RoomEnvironment();
+    try {
+      if (this.backend === "webgpu") {
+        const mod = (await import("three/webgpu")) as unknown as {
+          PMREMGenerator?: new (renderer: RendererLike) => {
+            fromScene(scene: THREE.Scene, sigma?: number): { texture: THREE.Texture };
+            dispose(): void;
+          };
+        };
+        if (!mod.PMREMGenerator) throw new Error("WebGPU PMREMGenerator is unavailable");
+        const pmrem = new mod.PMREMGenerator(this.renderer);
+        const target = pmrem.fromScene(room, 0.04);
+        this.scene.environment = target.texture;
+        this.scene.environmentIntensity = 0.9;
+        pmrem.dispose();
+      } else {
+        const pmrem = new THREE.PMREMGenerator(this.renderer as unknown as THREE.WebGLRenderer);
+        const target = pmrem.fromScene(room, 0.04);
+        this.scene.environment = target.texture;
+        this.scene.environmentIntensity = 0.9;
+        pmrem.dispose();
+      }
+    } catch (error) {
+      console.warn("Studio environment fell back to the procedural sky:", error);
+      this.scene.environment = this.proceduralStudioEnvironment();
+      this.scene.environmentIntensity = 0.75;
+    } finally {
+      room.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry?.dispose?.();
+        const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+        if (Array.isArray(material)) material.forEach((m) => m.dispose());
+        else material?.dispose?.();
+      });
+    }
+  }
+
+  /** Equirectangular studio gradient used when PMREM is not available. */
+  private proceduralStudioEnvironment(): THREE.Texture {
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 256;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      const sky = ctx.createLinearGradient(0, 0, 0, 256);
+      sky.addColorStop(0, "#f7fbff");
+      sky.addColorStop(0.42, "#dfeaf3");
+      sky.addColorStop(0.52, "#9fb2c3");
+      sky.addColorStop(1, "#39434d");
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, 512, 256);
+      // Overhead softbox + two side panels: the highlights that read as metal.
+      ctx.fillStyle = "rgba(255,255,255,0.92)";
+      ctx.fillRect(96, 18, 200, 26);
+      ctx.fillRect(330, 42, 90, 40);
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      ctx.fillRect(20, 60, 54, 48);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.mapping = THREE.EquirectangularReflectionMapping;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.needsUpdate = true;
+    return texture;
+  }
+
+  /** Soft grid and a faked contact shadow — cheaper and more stable than a
+   *  shadow-map pass, and identical on WebGL2 and WebGPU. */
+  private buildStudioGround(): void {
+    const grid = new THREE.GridHelper(800, 80, 0xa9bccd, 0xd4dfe9);
+    const gridMat = grid.material as THREE.LineBasicMaterial;
+    gridMat.transparent = true;
+    gridMat.opacity = 0.34;
+    gridMat.depthWrite = false;
+    grid.raycast = () => undefined;
+    this.groundGroup.add(grid);
+
+    const shadowCanvas = document.createElement("canvas");
+    shadowCanvas.width = 256;
+    shadowCanvas.height = 256;
+    const ctx = shadowCanvas.getContext("2d");
+    if (ctx) {
+      const gradient = ctx.createRadialGradient(128, 128, 8, 128, 128, 124);
+      gradient.addColorStop(0, "rgba(18,32,46,0.42)");
+      gradient.addColorStop(0.55, "rgba(18,32,46,0.18)");
+      gradient.addColorStop(1, "rgba(18,32,46,0)");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, 256, 256);
+    }
+    const shadowTexture = new THREE.CanvasTexture(shadowCanvas);
+    shadowTexture.colorSpace = THREE.SRGBColorSpace;
+    const shadowGeometry = new THREE.PlaneGeometry(1, 1);
+    shadowGeometry.rotateX(-Math.PI / 2);
+    const shadowMaterial = new THREE.MeshBasicMaterial({
+      map: shadowTexture,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const shadow = new THREE.Mesh(shadowGeometry, shadowMaterial);
+    shadow.raycast = () => undefined;
+    shadow.renderOrder = 0;
+    this.shadowPlane = shadow;
+    this.groundGroup.add(shadow);
+    this.scene.add(this.groundGroup);
+  }
+
+  private updateGround(list: SceneBody[]): void {
+    if (!this.shadowPlane) return;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const spec of list) {
+      const offset = spec.position ?? [0, 0, 0];
+      minX = Math.min(minX, spec.mesh.bbox.min[0] + offset[0]);
+      maxX = Math.max(maxX, spec.mesh.bbox.max[0] + offset[0]);
+      minY = Math.min(minY, spec.mesh.bbox.min[1] + offset[1]);
+      minZ = Math.min(minZ, spec.mesh.bbox.min[2] + offset[2]);
+      maxZ = Math.max(maxZ, spec.mesh.bbox.max[2] + offset[2]);
+    }
+    if (!Number.isFinite(minX)) {
+      this.groundGroup.visible = false;
+      return;
+    }
+    this.groundGroup.visible = true;
+    const grid = this.groundGroup.children[0] as THREE.GridHelper;
+    const cx = (minX + maxX) / 2;
+    const cz = (minZ + maxZ) / 2;
+    const span = Math.max(20, Math.hypot(maxX - minX, maxZ - minZ));
+    const floor = minY - Math.max(0.25, span * 0.004);
+    grid.position.set(cx, floor, cz);
+    const size = span * 2.6;
+    this.shadowPlane.position.set(cx, floor - 0.02, cz);
+    this.shadowPlane.scale.set(size, 1, size);
+  }
+
+  /** Show or clear a translucent live-preview group (world coordinates). */
+  setGhost(group: THREE.Group | null): void {
+    if (this.ghostGroup) {
+      this.scene.remove(this.ghostGroup);
+      disposeObject3D(this.ghostGroup);
+    }
+    this.ghostGroup = group;
+    if (group) {
+      group.renderOrder = 4;
+      this.scene.add(group);
+    }
   }
 
   private buildOriginPlanes(): void {
@@ -636,6 +818,11 @@ export class Viewport {
       let view = this.bodies.get(key);
       const meshChanged = !view || view.data !== spec.mesh;
       if (view && !meshChanged) {
+        view.material.color.set(spec.color);
+        view.baseColor.set(spec.color);
+        view.material.metalness = spec.metalness ?? 0.18;
+        view.material.roughness = spec.roughness ?? 0.52;
+        view.material.needsUpdate = true;
         view.group.visible = spec.visible !== false;
         view.group.position.set(...(spec.position ?? [0, 0, 0]));
         const r = spec.rotation ?? [0, 0, 0];
@@ -658,6 +845,7 @@ export class Viewport {
     this.applyDisplayStyle();
     this.applySelections();
     this.applyActiveComponent();
+    this.updateGround(list);
     if (!this.fitted && this.bodies.size > 0) {
       this.fitted = true;
       this.zoomFit(false);
@@ -678,7 +866,7 @@ export class Viewport {
         "XYZ",
       );
     }
-    const material = makeBodyMaterial(spec.color);
+    const material = makeBodyMaterial(spec.color, spec.metalness, spec.roughness);
     this.applyClipToMaterial(material);
     const mesh = new THREE.Mesh(bodyGeometry(spec.mesh), material);
     mesh.userData.pickBody = true;

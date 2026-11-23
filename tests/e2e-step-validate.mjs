@@ -7,7 +7,7 @@
  * compares volume, face count and the hole radius. */
 import { readFile, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { launch, openApp, newDocument, startSketch, setTool, sketchClick, finishSketch, extrude, waitVolume, body, near } from "./e2e-lib.mjs";
+import { launch, openApp, newDocument, startSketch, setTool, sketchClick, finishSketch, extrude, waitVolume, body, near, runCmd } from "./e2e-lib.mjs";
 
 const TMP = "C:\\Users\\MBB\\AppData\\Local\\Temp\\opencode\\marmaracad-e2e";
 const stepPath = join(TMP, "plate-with-hole.step");
@@ -37,7 +37,7 @@ await sketchClick(page, 0, 0);
 await sketchClick(page, 5, 0);
 await finishSketch(page);
 await page.click('[data-cmd-tab="features"]');
-await page.click('[data-cmd-action="extrude-cut"]');
+await runCmd(page, "extrude-cut");
 await page.waitForSelector("#pm-depth");
 await page.fill("#pm-depth", "10");
 await page.click("[data-pm-ok]");

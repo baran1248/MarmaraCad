@@ -1,4 +1,5 @@
 import type { MeshData, RebuildPart } from "../model/types";
+import type { OcctMemorySnapshot } from "./occtScope";
 
 export interface RebuildRequest {
   type: "rebuild";
@@ -11,6 +12,8 @@ export interface RebuildResponse {
   parts: Record<string, MeshData>;
   errors: Record<string, Record<string, string>>;
   kernelMs: number;
+  /** OCCT C++ object lifetime counters for the rebuild. */
+  memory?: OcctMemorySnapshot;
 }
 
 export interface ImportRequest {
@@ -47,6 +50,15 @@ export interface ExportResponse {
   error?: string;
 }
 
+export interface MemoryRequest {
+  type: "memory";
+}
+
+export interface MemoryResponse {
+  type: "memory";
+  occt: OcctMemorySnapshot;
+}
+
 export interface ReadyResponse {
   type: "ready";
   bootMs: number;
@@ -70,6 +82,7 @@ export type KernelResponse =
   | RebuildResponse
   | ImportResponse
   | ExportResponse
+  | MemoryResponse
   | ReadyResponse
   | BootProgressResponse
   | ErrorResponse;

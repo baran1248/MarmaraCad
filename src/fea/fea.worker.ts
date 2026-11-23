@@ -1,12 +1,19 @@
 /** Web Worker entry for FEA meshing and the linear-static solve.
  *  Runs off the main thread so the UI keeps painting while the CG solve iterates.
  *  Conformal Tet4/Tet10 studies use `tetSolver`; the legacy voxel hex mesher
- *  stays available as a fast preview/fallback. */
+ *  stays available as a fast preview/fallback.
+ *
+ *  Every typed array in a reply is moved with a Transferable list: the solver
+ *  allocates dozens of Float32/Float64/Uint32 buffers per study (positions,
+ *  displacements, stresses, surface indices), and structured cloning would
+ *  duplicate all of them before the worker copies could be collected. With
+ *  transfer the buffers change owner instead, roughly halving peak RAM. */
 
 import type { AnalysisType, FeaMeshKind, Vec3 } from "../model/types";
 import { solveStatic, type FeaLoadSpec } from "./solver";
 import { buildVoxelMesh, buildTetMesh } from "./mesher";
 import { solveTetStudy, type TetLoadSpec, type TetSupportSpec } from "./tetSolver";
+import { collectTransferables } from "./transfer";
 
 interface MeshRequest {
   type: "mesh";
@@ -39,19 +46,34 @@ type Reply =
   | { type: "progress"; phase: string; percent: number }
   | {
       type: "mesh-done";
-      stats: { nodes: number; elements: number; h: number; warnings: string[]; kind?: FeaMeshKind; metrics?: unknown };
+      stats: { nodes: number; elements: number; h: number; warnings: string[]; kind?: FeaMeshKind; metrics?: unknown; budget?: unknown };
+      transferred?: number;
     }
-  | { type: "solve-done"; nodes: number; elements: number; h: number; result: unknown; meshMs: number }
+  | {
+      type: "solve-done";
+      nodes: number;
+      elements: number;
+      h: number;
+      result: unknown;
+      meshMs: number;
+      transferred?: number;
+    }
   | { type: "error"; message: string };
 
 const scope = self as unknown as {
   onmessage: ((event: MessageEvent<WorkerRequest>) => void) | null;
-  postMessage: (message: Reply) => void;
+  postMessage: (message: Reply, transfer?: Transferable[]) => void;
 };
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/** Post a reply and move any typed arrays instead of cloning them. */
+function reply(message: Reply): void {
+  const transfer = collectTransferables(message);
+  scope.postMessage({ ...message, transferred: transfer.length } as Reply, transfer);
 }
 
 scope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
@@ -60,16 +82,16 @@ scope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     if (req.type === "mesh") {
       if (req.meshKind === "tet4" || req.meshKind === "tet10") {
         const tet = buildTetMesh(req.positions, req.indices, req.meshSize, req.meshKind);
-        scope.postMessage({
+        reply({
           type: "mesh-done",
-          stats: { nodes: tet.nodeCount, elements: tet.elementCount, h: tet.h, warnings: tet.warnings, kind: tet.kind, metrics: tet.metrics },
+          stats: { nodes: tet.nodeCount, elements: tet.elementCount, h: tet.h, warnings: tet.warnings, kind: tet.kind, metrics: tet.metrics, budget: tet.budget },
         });
         return;
       }
       const mesh = buildVoxelMesh(req.positions, req.indices, req.meshSize);
-      scope.postMessage({
+      reply({
         type: "mesh-done",
-        stats: { nodes: mesh.nodeCount, elements: mesh.elementCount, h: mesh.h, warnings: mesh.warnings, kind: "hex" },
+        stats: { nodes: mesh.nodeCount, elements: mesh.elementCount, h: mesh.h, warnings: mesh.warnings, kind: "hex", budget: mesh.budget },
       });
       return;
     }
@@ -104,12 +126,12 @@ scope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         ambient: req.ambient,
         onProgress: (phase, percent) => scope.postMessage({ type: "progress", phase, percent }),
       });
-      scope.postMessage({
+      reply({
         type: "solve-done",
         nodes: outcome.mesh.nodeCount,
         elements: outcome.mesh.elementCount,
         h: outcome.mesh.h,
-        result: { ...outcome.result, meshMetrics: outcome.mesh.metrics },
+        result: { ...outcome.result, meshMetrics: outcome.mesh.metrics, meshBudget: outcome.mesh.budget },
         meshMs: Math.round(performance.now() - t0),
       });
       return;
@@ -131,12 +153,12 @@ scope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       meshSize: req.meshSize,
       onProgress: (phase, percent) => scope.postMessage({ type: "progress", phase, percent }),
     });
-    scope.postMessage({
+    reply({
       type: "solve-done",
       nodes: outcome.mesh.nodeCount,
       elements: outcome.mesh.elementCount,
       h: outcome.mesh.h,
-      result: outcome.result,
+      result: { ...outcome.result, meshBudget: outcome.mesh.budget },
       meshMs: Math.round(performance.now() - t0),
     });
   } catch (error) {

@@ -536,3 +536,101 @@ Live: https://baran1248.github.io/MarmaraCad/
   declared.`) -> geometry-baked dashes; navigation preferences read but never handed to the viewport
   at boot; new configurations losing activation; configuration apply order (apply -> evaluate);
   AI sheet-metal action rebuilding before picking the edge flange edge.
+
+## Phase 5 — Memory discipline, Engineering Data and a quieter ribbon
+
+### Kernel lifetime (OCCT RAII)
+- [x] `src/kernel/occtScope.ts`: `OcctScope` (`track` / `keep` / `dispose` / `stats`) and
+      `OcctMemory` (`run`, `track`, nested scope stack, lifetime totals) plus
+      `wrapOcctConstructors(module, memory)`, a Proxy over the OCCT module so **every**
+      `new oc.*` call is tracked automatically; value-returning helpers (`TopoDS.Edge_1`…) are
+      tracked explicitly.
+- [x] Each rebuild / import / export runs inside `memory.run("rebuild:<part>")`; tessellation,
+      boolean ops, fillet/chamfer, sheet metal and STEP/IGES paths dispose in `try/finally`.
+      Persistent B-Reps are `scope.keep(shape)` + cached; `dropCachedShape()` deletes the previous
+      wrapper when a part is rebuilt or deleted (imported bodies stay shared).
+- [x] `memory` message on the kernel protocol, `CadClient.memory()` / `lastMemory`, and a
+      `window.__marmaracad.kernelMemory()` telemetry hook.
+
+### Zero-copy FEA transport and the RAM budget
+- [x] `src/fea/transfer.ts`: `collectTransferables()` (depth-bounded, deduplicated via buffer
+      identity) and `isFullyTransferred()`.
+- [x] `fea.worker.ts` posts every reply with its Transferable list and reports `transferred`;
+      `FeaClient.transfer` exposes `lastReplyBuffers` / `lastRequestBuffers` / `totalBuffers`
+      (requests opt in with `transferBuffers` because the document mesh stays for rendering).
+- [x] `MeshBudget` (`requested`, `effective`, `limitedBy`, `limit`, `wanted`, `actual`, `message`)
+      flows through `VoxelMeshData` / `TetMeshData` / `FeaMeshStats` / `FeaSolveOutcome`, where the
+      hex limit is 120,000 cells and the tet limit 140,000 tets. Instead of silently coarsening,
+      the app toasts "Mesh size adapted to X mm (requested Y mm) to stay inside the browser RAM
+      budget: N cells would exceed the M cell limit." and the Memory popover repeats it.
+- [x] Status-bar Memory / Performance chip: JS heap, mesh buffers, FEA nodes/elements, OCCT
+      objects tracked/live and buffers moved zero-copy.
+
+### Material library (Ansys Engineering Data level)
+- [x] 46 real materials in the six Ansys categories: Steels & Irons 12, Aluminum Alloys 7,
+      Copper/Brass/Bronze 4, Titanium/Nickel/Magnesium 4, Polymers & Elastomers 11,
+      Composites/Ceramics/Others 7 plus Custom. Every entry carries E, ν, G, σy, σu, ρ,
+      conductivity (W/(mm·K)), specific heat, CTE, color, metalness and roughness.
+      Conductivity is the real handbook value converted by /1000: copper 0.385, Al6061 0.167,
+      steel 0.050, ABS 0.0002.
+- [x] `src/ui/MaterialBrowser.ts`: split layout with a search box (Turkish + English synonyms:
+      "bakır", "paslanmaz", "naylon"…), category chips, a list with the live E/k summary and a full
+      mechanical + physical/thermal + studio-appearance table. The sphere preview renders a CSS
+      approximation of the PBR lobe, and any edit switches the badge to "Custom · edited" and is
+      stored as a per-part override (`part.materialOverride` extended with G, σu, k, cp, CTE and
+      the PBR triple).
+- [x] `main.ts` passes the real conductivity into `fea.solve`; `tetSolver.ts` uses
+      `options.material.conductivity` (the 0.05 fallback only survives for legacy documents that
+      predate the field).
+- [x] `partMaterial()` derives G from an edited E/ν and merges every override; mass properties read
+      density from the effective material.
+
+### Ribbon, command palette and studio viewport
+- [x] `CommandManager` rebuilt around split dropdowns: Extrude ▾ (Cut, Revolve, Sweep, Loft,
+      Helix), Fillet ▾ (Chamfer), Linear Pattern ▾ (Circular), Line ▾ (Rectangle, Circle, Arc,
+      Slot, Polygon, Spline), Sketch Fillet ▾ (Sketch Chamfer), Bolt ▾ (Nut, Washer) and
+      Edge Flange ▾ (Flatten). `data-cmd-action` selectors are preserved for the existing suites,
+      compact icon-only cells keep crowded groups quiet and `.cmd-buttons` is a single non-wrapping
+      row so nothing can touch the group captions.
+- [x] Original icons: Chamfer uses lucide `Slice` (no longer the Draft `Triangle`), Draft uses
+      `Diamond`, plus PenTool/Spline/Radius/Repeat2/Scissors/Cuboid/Orbit/Layers3/Bolt/Drill/
+      FlipHorizontal2/Sheet/SunMedium/MemoryStick. A repo-wide audit script checks that every
+      `icon("…")` name exists in the registry.
+- [x] `src/ui/CommandPalette.ts`: `Ctrl+K` / `Cmd+K` (title-bar search button too) with
+      subsequence matching, Turkish character folding and scoring over labels, TR translations,
+      action ids and engineering keywords (`delik`, `fillet`, `açınım`, `modal`, `malzeme`,
+      `mesh`…). Arrow/Tab navigation, Enter to run, Esc to close, and `stopPropagation` so the
+      opening key can never close the command it just launched.
+- [x] Studio viewport: `RoomEnvironment` through `PMREMGenerator` (lazy `three/webgpu` PMREM for
+      the WebGPU backend, Three's WebGL PMREM otherwise, procedural equirect canvas as the last
+      resort), `scene.environmentIntensity = 0.9`, a soft `GridHelper` floor and a radial-gradient
+      contact shadow placed under the model bbox. Body materials receive each part's
+      `metalness`/`roughness`/`color`, so copper reads metallic and ABS reads matte.
+- [x] Live translucent ghosts from the PropertyManagers (client-side, non-pickable, disposed on
+      OK/Cancel/Esc): `extrudeGhost` (exact sketch loops + holes, direction, mid-plane, add/cut
+      tone), `edgeGhost` (edge collar whose tube radius follows the fillet/chamfer size) and
+      `edgeFlangeGhost` (ribbon along the picked edge with the real bend angle and length).
+
+### Bugs the phase found and fixed
+- Lucide leaves `data-lucide` on the generated `<svg>`; the next hydration pass replaced every
+  icon in the document. If that happened between mousedown and mouseup (any panel re-render on
+  blur), the click was swallowed. `hydrateNow()` now strips the attribute from generated SVGs, so
+  hydration is idempotent and panel buttons work after edits.
+- The ribbon wrapped compact cells into extra rows that covered the group captions; the groups are
+  now a single flex row with horizontal scrolling (e2e-ribbon green at 1440 and 1024 px).
+- Closing a PropertyManager fires a final `change` on the focused input; the ghost closure now
+  ignores events when the command is gone or the panel is detached.
+- `e2e-shortcuts` scanned only ±90 px for a planar face; after a tight `F` fit the bore edges filled
+  the window. The scan now reaches ±260 px, so it is zoom-independent.
+
+### Phase 5 verification (local dev server, headless Chrome, WebGPU)
+- `npx tsc --noEmit` clean.
+- `npm test`: 10 files (adds `tests/materials.test.ts` 8 and `tests/transfer.test.ts` 5).
+- `npm run build`: 1,599 modules, 11.68 s.
+- `tests/e2e-phase5.mjs`: `RESULT PASS 23/23` — 20 consecutive rebuilds with
+  `created 2002 / deleted 2002 / kept 22 / leaked 0 / untracked 0`; stable volume
+  7,999.999999999998 mm³; OCCT counters in the status chip; FEA solve reply moved
+  `6` ArrayBuffers (displacement 144, von Mises 48 values); material library 46 rows / 12 fields /
+  8 category chips; "bakır" 4 hits, "abs" exactly 1, polymers 11; copper k = 0.385 and
+  metalness 0.95 repainted on the body; custom metalness 0.25 stored and repainted; Cut/Fillet/
+  Chamfer ghosts appear and disappear; Ctrl+K TR/EN queries and Enter-to-run; zero console errors.

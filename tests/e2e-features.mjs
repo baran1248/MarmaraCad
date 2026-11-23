@@ -1,7 +1,7 @@
 /* Revolve, Fillet and Chamfer through the real UI, plus parametric edits from
  * the FeatureManager: changing a value must rebuild the OCCT solid, not just the
  * panel. Every volume is compared with the analytic formula. */
-import { launch, openApp, newDocument, startSketch, setTool, sketchClick, finishSketch, body, featureCount, waitVolume, extrude, revolve, pickEdges, near } from "./e2e-lib.mjs";
+import { launch, openApp, newDocument, startSketch, setTool, sketchClick, finishSketch, body, featureCount, waitVolume, extrude, revolve, pickEdges, near, runCmd } from "./e2e-lib.mjs";
 
 const browser = await launch();
 const { page, errors } = await openApp(browser);
@@ -128,7 +128,7 @@ await extrude(page, { depth: 10, operation: "new" });
 await waitVolume(page, "v > 7000");
 
 await page.click('[data-cmd-tab="features"]');
-await page.click('[data-cmd-action="chamfer"]');
+await runCmd(page, "chamfer");
 await page.waitForSelector("#pm-chamfer-distance", { timeout: 15000 });
 const vertical2 = await pickEdges(
   page,

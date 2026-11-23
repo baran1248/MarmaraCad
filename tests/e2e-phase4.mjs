@@ -19,6 +19,7 @@ import {
   waitFeatureCount,
   waitVolume,
   near,
+  runCmd,
 } from "./e2e-lib.mjs";
 
 const browser = await launch();
@@ -597,7 +598,7 @@ try {
   const BA = (Math.PI / 180) * 90 * (2 + 0.44 * 2);
   const expectedFlat = (120 * 80 + (20 + BA) * 80) * 2;
   await page.click('[data-cmd-tab="sheetmetal"]');
-  await page.click('[data-cmd-action="flatten"]');
+  await runCmd(page, "flatten");
   await page.waitForFunction(() => window.__marmaracad.doc().parts[0].sheetMetal.flattened === true, null, { timeout: 30000 });
   await waitVolume(page, `Math.abs(v - ${expectedFlat}) < 60`);
   const flat = await page.evaluate(() => {

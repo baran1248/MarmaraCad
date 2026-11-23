@@ -49,8 +49,8 @@ try {
 
   // --- Material assignment drives the mass card and the drawing title block.
   await page.locator(".material-button").first().click();
-  await page.waitForSelector("#mat-select");
-  await page.selectOption("#mat-select", "al6061");
+  await page.waitForSelector('.mat-browser [data-material="al6061"]', { timeout: 15000 });
+  await page.click('.mat-browser [data-material="al6061"]');
   await page.click(".modal .btn.primary");
   await page.waitForTimeout(250);
   const material = await sample();
