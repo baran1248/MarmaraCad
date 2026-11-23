@@ -634,3 +634,16 @@ Live: https://baran1248.github.io/MarmaraCad/
   8 category chips; "bakır" 4 hits, "abs" exactly 1, polymers 11; copper k = 0.385 and
   metalness 0.95 repainted on the body; custom metalness 0.25 stored and repainted; Cut/Fillet/
   Chamfer ghosts appear and disappear; Ctrl+K TR/EN queries and Enter-to-run; zero console errors.
+- `npm run test:e2e`: all 32 suites exit 0 (19 in the full chain run, the remaining 12 re-run
+  individually after the runner aborted on a flaky pixel scan — root cause fixed, see above);
+  `npm run test:ui` PASS.
+
+### Live verification on https://baran1248.github.io/MarmaraCad/ (commit `3c9a5f8`, deploy run
+`45251307786` build + deploy success)
+- `e2e-live` (now phase-5 aware): boot 5,592 ms, WebGPU, kernel 65,864,037 B, sample 98,507 mm³ /
+  13 faces / 30 edges, STEP 37,607 bytes, FEA 4,854 nodes / 3,352 hexahedra → 0.102 mm /
+  61.35 MPa, SF 4.07, 833 iterations. Phase-5 block: `occt created 1723 / deleted 1723 / kept 7 /
+  leaked 0 / untracked 0`, environment present, 2 ground objects, 46 material rows, 6 thermal/PBR
+  fields, palette open, Turkish "açınım" hit, 6 transferables. `ERRORS none`, `RESULT PASS`.
+- `MARMARACAD_URL=https://baran1248.github.io/MarmaraCad/ node tests/e2e-phase5.mjs`:
+  `RESULT PASS 23/23` on the published build, zero console errors.
