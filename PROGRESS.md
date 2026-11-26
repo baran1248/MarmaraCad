@@ -755,3 +755,16 @@ Live: https://baran1248.github.io/MarmaraCad/
 - Two test-harness fixes the phase needed: `e2e-faz2` expands the owning feature before clicking the
       nested `Sketch1`; `e2e-lib` ignores `blob:` `ERR_ABORTED` requests (Vite HMR modules aborted at
       teardown) while still failing on real console/page errors.
+
+### Live verification on https://baran1248.github.io/MarmaraCad/ (commit `bcc873f`, deploy run
+`45804999033` build + deploy success)
+- Title-bar badge reads `1.7`; the assistant header exposes `Clear Chat`; zero console errors.
+- `e2e-live`: boot 8,385 ms (kernel 4,584 ms, cache hit), WebGPU, kernel 65,864,037 B, sample
+      98,507 mm³ / 13 faces / 30 edges, `ERRORS none`, `RESULT PASS`.
+- `e2e-featuretree`: `RESULT PASS` 7/7 — consumed sketches absent from the top level,
+      `Boss-Extrude1 ▸ Sketch1` at depth 2, four inline actions, one-click Edit Sketch, suppress greys
+      the row, Turkish labels (`Malzemeyi Düzenle`, `Yapılandırmalar`, `3 özellik · 3 eskiz`).
+- `e2e-ai`: `RESULT PASS` 27/27 — thinkingConfig 400 retried without the config, 503 shows Google's
+      "overloaded" message after 2 POSTs, roles alternate with no failed turn, `Clear Chat` leaves one
+      user turn.
+- `e2e-phase5`: `RESULT PASS 23/23` — OCCT leaked 0, 46 materials, 6 transferables.
