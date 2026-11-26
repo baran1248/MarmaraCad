@@ -697,3 +697,13 @@ Live: https://baran1248.github.io/MarmaraCad/
 - `tests/e2e-ai.mjs`: `RESULT PASS`, 23 checks — inlineData 104,190 B, topology 13 faces / 30 edges /
   `holeAxes ["y"]` / corners `[0,1,4,7]`, off-toggle sends 0 images, `gemini-4-hydrogen` with
   `thinkingLevel: "medium"`, 1,545.13 mm³ targeted fillet loss, zero console errors.
+- Full `npm run test:e2e` chain: 32/32 suites exit 0 (27 `RESULT PASS` blocks, no `FAIL`/`SUITE ERROR`).
+
+### Live verification on https://baran1248.github.io/MarmaraCad/ (commit `050c813`, deploy run
+`45787558616` build + deploy success)
+- Title-bar badge reads `1.6`; About dialog reads `MarmaraCad 1.6`; zero console errors.
+- `e2e-live`: boot 35,540 ms (cold WASM), WebGPU, kernel 65,864,037 B, `ERRORS none`, `RESULT PASS`.
+- `e2e-phase5`: `RESULT PASS 23/23` — OCCT leaked 0, 46 materials, 6 transferables.
+- `e2e-ai`: `RESULT PASS` — JPEG 104,190 B + topology 13 faces / 30 edges / `holeAxes ["y"]` /
+  corners `[0,1,4,7]`, `gemini-4-hydrogen` with `thinkingLevel: "medium"`, targeted fillet
+  168,219.56 → 166,674.42 mm³ (1,545.13 mm³), 23/23 checks, zero console errors.
