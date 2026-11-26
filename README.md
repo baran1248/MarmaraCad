@@ -13,6 +13,11 @@ visualisation — executes on the user's own CPU/GPU.
 ## Highlights
 
 - SolidWorks-inspired CommandManager, FeatureManager design tree and ViewCube.
+- SolidWorks-style FeatureManager nesting: the sketches a feature consumes (`Boss-Extrude`, `Cut-Extrude`,
+  `Revolve`, `Sweep`, `Loft`, `Base Flange`, `Rib`…) appear as children under that feature
+  (`Boss-Extrude1 ▸ Sketch1`) instead of a separate top-level list; unbound sketches stay at the top
+  level, and hovering or selecting a row reveals inline **Edit Feature**, **Edit Sketch**,
+  **Suppress/Unsuppress** and **Hide/Show** actions.
 - Parametric sketches with dimensions and geometric relations, solved with a
   Levenberg–Marquardt constraint solver.
 - Extrude Boss/Base, Extruded Cut, Revolve, Fillet, Chamfer, Shell, Mirror, Linear Pattern, Sweep,
@@ -74,7 +79,9 @@ visualisation — executes on the user's own CPU/GPU.
   history. Fillet/chamfer edges can be named semantically (`"all"`, `"selected"`, explicit indices, or
   a selector with `preset` / `axis` / `outerOnly` / `straightOnly` / length bounds), and the assistant
   also covers reference planes, sweeps, lofts, circular patterns, holes, exploded views, modal, thermal
-  and buckling studies.
+  and buckling studies. Failed calls keep the chat history clean, show Google's real `error.message`,
+  retry once on HTTP 503 (1.5 s back-off) and drop `thinkingConfig` once on a thinking-related HTTP 400;
+  **Clear Chat** resets the conversation.
 - Multi-part assemblies with Coincident, Concentric, Distance and Angle mates plus an exploded view
   with an explode/collapse slider.
 - STEP (AP214), IGES, STL and OBJ import/export; `.mcad.json` projects; IndexedDB autosave.
@@ -95,7 +102,7 @@ npm install
 npm run dev      # http://localhost:5173/MarmaraCad/
 npm run build    # typecheck + production build
 npm test         # unit tests
-npm run test:e2e # 32 Playwright suites (start `npm run dev` first; uses local Chrome)
+npm run test:e2e # 33 Playwright suites (start `npm run dev` first; uses local Chrome)
 npm run test:ui  # non-visual UI audit: icon hydration, overflow, legend, sketch raster proof
 npm run test:live # smoke test against the published GitHub Pages build
 ```
@@ -122,6 +129,8 @@ Assembly/mass-card/menu labels.
 The phase-4 suites add e2e-phase4.mjs: the horizontal-trackpad orbit regression (dx 120 / dy 10 must orbit, not pan), the Pan scheme with Shift swap, Ctrl/pinch zoom, two-finger pan+pinch, three-finger Undo/Redo, pen dead-zone and tap-to-select, Push/Pull +15 mm (168,000 mm³) with an inward cut and Enter value, the edge-handle R6 fillet, Base/Edge Flange with the BA flat pattern (23,123.82 mm³ analytical) and a valid R12 .dxf, configurations (48,000 ↔ 144,000 mm³ with the Mass card), .mcad.json round-trips, the AI sheet-metal/config/push-pull actions and a live concentric-mate drag with a 0.000 mm radial residual.
 
 The phase-6 assistant suite verifies the multimodal request (viewport JPEG `inlineData` + topology JSON with the hole axis and four outer corners), the `Send viewport view` toggle, hydrogen resolution to `gemini-4-hydrogen` with Gemini-4 models in the Recommended group, per-generation thinking config (`thinkingLevel` vs `thinkingBudget`), and a targeted fillet that selects only the four outer corners with the analytic 1,545.13 mm³ volume loss.
+
+The phase-7 suites add `e2e-featuretree.mjs` (consumed sketches nest under `Boss-Extrude1 ▸ Sketch1`, the four inline quick actions, one-click Edit Sketch, suppress/unsuppress and the Turkish FeatureManager labels) and extend `e2e-ai.mjs` with a thinkingConfig HTTP 400 retry, a 503 back-off retry that keeps the history clean, and `Clear Chat`.
 
 The phase-5 suite (`e2e-phase5.mjs`, 23 checks) proves the memory discipline and the new UI: 20
 consecutive rebuilds with `created 2002 / deleted 2002 / leaked 0 / untracked 0` and a stable

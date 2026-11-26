@@ -707,3 +707,51 @@ Live: https://baran1248.github.io/MarmaraCad/
 - `e2e-ai`: `RESULT PASS` — JPEG 104,190 B + topology 13 faces / 30 edges / `holeAxes ["y"]` /
   corners `[0,1,4,7]`, `gemini-4-hydrogen` with `thinkingLevel: "medium"`, targeted fillet
   168,219.56 → 166,674.42 mm³ (1,545.13 mm³), 23/23 checks, zero console errors.
+
+## Phase 7 - SolidWorks FeatureManager, assistant resilience and release 1.7.0
+
+### FeatureManager nesting and inline actions
+- [x] `src/ui/FeatureTree.ts` now nests the sketches a feature consumes (profile `sketchId`, loft
+      `profileSketchIds`, sweep `pathSketchId`) directly under that feature: `Boss-Extrude1 ▸ Sketch1`,
+      `Cut-Extrude1 ▸ Sketch3`, … Free sketches (not referenced by any feature) stay at the top level.
+      The feature row gets a twisty only when it owns sketches; a single click on the row also expands
+      it, and each child keeps its own dimensions/relations subtree and eye toggle.
+- [x] Hovering or selecting a feature row reveals inline **Edit Feature**, **Edit Sketch** (only when a
+      sketch is linked), **Suppress/Unsuppress** and **Hide/Show** (body visibility) buttons; child
+      sketch rows expose **Edit Sketch**, **Edit Feature** (parent) and **Hide/Show**. The quick
+      actions are plain `data-tree-action` buttons handled by `runTreeAction`, so they participate in
+      the normal undo/redo transaction and kernel rebuild.
+- [x] Fixed a latent twisty bug: `FeatureTree` sends the expansion key as the handler's second
+      argument, so `runTreeAction("twist", …)` previously toggled `""`; every chevron in the tree
+      (origin, folders, features, studies) now really expands/collapses.
+- [x] TR labels owned by FeatureTree: `Malzemeyi Düzenle`, `Yapılandırmalar`,
+      `Henüz yapılandırma yok. Oluşturmak için +'ya tıklayın.`, `N özellik · M eskiz`, plus Turkish
+      quick-action tooltips. `TreeContext.lang` is fed by `Shell.setTreeContext` and refreshed by
+      `applyLanguage`.
+
+### Assistant failure handling
+- [x] `send()` rolls the optimistic user turn back with `trimDanglingUser()` on every failure path and
+      before each new request, so the history can never become `[user, user]` (HTTP 400).
+- [x] `!res.ok` now parses Google's `error.message` and shows the real reason; non-JSON bodies fall
+      back to `HTTP <status> <statusText>`.
+- [x] HTTP 503: 1.5 s back-off and one automatic retry. HTTP 400 mentioning thinking: drop
+      `generationConfig.thinkingConfig` and retry once. Model changes also drop any dangling user turn.
+- [x] `Clear Chat` button in the assistant header resets `history` and the message list (ignored while
+      a request is in flight).
+
+### Phase 7 verification (local dev server, headless Chrome, WebGPU)
+- `npx tsc --noEmit` clean.
+- `npm test`: 12 files / 62 tests pass.
+- `npm run build`: 1,601 modules, 13.0 s.
+- `tests/e2e-featuretree.mjs` (new, wired into `npm run test:e2e`): `RESULT PASS` 7/7 — consumed
+      sketches absent from the top level, `Boss-Extrude1 ▸ Sketch1` at depth 2, four inline actions,
+      one-click Edit Sketch (`editor.sketch.name === "Sketch1"`), suppress greys the row, TR labels,
+      zero console errors.
+- `tests/e2e-ai.mjs`: `RESULT PASS` 27/27 — thinkingConfig 400 retried without the config (2 POSTs,
+      `temperature 0.15`), 503 shows Google's "overloaded" message after exactly 2 POSTs, the next
+      request sends alternating roles with no failed turn, `Clear Chat` leaves a single user turn.
+- `npm run test:e2e`: 33/33 suites exit 0 (adds `e2e-featuretree.mjs`).
+- `npm run test:ui`: PASS, zero unhydrated icons / console errors.
+- Two test-harness fixes the phase needed: `e2e-faz2` expands the owning feature before clicking the
+      nested `Sketch1`; `e2e-lib` ignores `blob:` `ERR_ABORTED` requests (Vite HMR modules aborted at
+      teardown) while still failing on real console/page errors.

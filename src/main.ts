@@ -1295,6 +1295,13 @@ export class App {
       this.shell.setStatus(`${this.doc.components.find((c) => c.id === id)?.name ?? "Component"} selected`);
       return;
     }
+    // A feature that owns sketches expands on a single click, like SolidWorks.
+    if (kind === "feature") {
+      const owner = this.doc.parts.find((p) => p.features.some((f) => f.id === id));
+      const feature = owner?.features.find((f) => f.id === id);
+      const linked = feature?.sketchId ?? feature?.params.profileSketchIds?.[0] ?? feature?.params.pathSketchId;
+      if (linked) this.expanded.add(`feature:${id}`);
+    }
     this.setSelection(kind, id);
     if (kind === "study" || kind === "study-material" || kind === "study-mesh") {
       const study = this.doc.analyses.find((s) => s.id === id);
@@ -1449,7 +1456,8 @@ export class App {
 
   private async runTreeAction(action: string, kind?: string, id?: string): Promise<void> {
     if (action === "twist") {
-      const key = id ?? "";
+      // FeatureTree sends the row key in the second argument (kind).
+      const key = id ?? kind ?? "";
       const normalized =
         key.startsWith("study-loads:")
           ? `loads:${key.slice("study-loads:".length)}`
@@ -1505,6 +1513,58 @@ export class App {
     }
     if (action === "edit-material") {
       this.openMaterialDialog(id);
+      return;
+    }
+    // Inline FeatureManager actions (hover/selection quick buttons).
+    if (action === "feature-edit" || action === "feature-edit-sketch" || action === "feature-suppress" || action === "feature-hide") {
+      const owner = this.doc.parts.find((p) => p.features.some((f) => f.id === id));
+      const feature = owner?.features.find((f) => f.id === id);
+      if (!owner || !feature) return;
+      if (action === "feature-edit") {
+        this.editFeature(feature);
+        return;
+      }
+      if (action === "feature-edit-sketch") {
+        const sketchId = feature.sketchId ?? feature.params.profileSketchIds?.[0] ?? feature.params.pathSketchId;
+        const sketch = owner.sketches.find((s) => s.id === sketchId);
+        if (!sketch) {
+          toast("This feature has no sketch to edit.", "info");
+          return;
+        }
+        this.doc.activePartId = owner.id;
+        this.shell.setDocument(this.doc);
+        this.beginExistingSketch(sketch);
+        return;
+      }
+      const before = this.capture();
+      if (action === "feature-suppress") {
+        feature.suppressed = !feature.suppressed;
+        this.commit(before);
+        this.refreshTree();
+        void this.rebuild();
+        toast(`${feature.name} ${feature.suppressed ? "suppressed" : "unsuppressed"}.`, "info");
+      } else {
+        owner.visible = !owner.visible;
+        this.commit(before);
+        this.refreshScene();
+        this.refreshTree();
+        toast(owner.visible ? "Body shown." : "Body hidden.", "info");
+      }
+      return;
+    }
+    if (action === "sketch-edit" || action === "sketch-hide") {
+      const owner = this.doc.parts.find((p) => p.sketches.some((s) => s.id === id));
+      const sketch = owner?.sketches.find((s) => s.id === id);
+      if (!owner || !sketch) return;
+      if (action === "sketch-edit") {
+        this.doc.activePartId = owner.id;
+        this.shell.setDocument(this.doc);
+        this.beginExistingSketch(sketch);
+      } else {
+        sketch.visible = !sketch.visible;
+        this.refreshTree();
+        this.touchDocument();
+      }
       return;
     }
     if (action === "rollback") {

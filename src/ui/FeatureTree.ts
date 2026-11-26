@@ -1,4 +1,4 @@
-import type { AnalysisStudy, Part, ProjectDocument, WorkspaceMode } from "../model/types";
+import type { AnalysisStudy, Feature, Part, ProjectDocument, Sketch, WorkspaceMode } from "../model/types";
 import { MATERIALS, materialById, partMaterial } from "../analysis/materials";
 import { escapeHtml } from "../utils/misc";
 import { icon } from "./icons";
@@ -17,6 +17,8 @@ export interface TreeContext {
   planesVisible: boolean;
   sketchInfo: Record<string, SketchInfo>;
   activeResult: string | null;
+  /** UI language, used for the labels FeatureTree owns. */
+  lang?: "en" | "tr";
 }
 
 export interface TreeHandlers {
@@ -25,6 +27,12 @@ export interface TreeHandlers {
   open: (kind: string, id: string) => void;
   contextMenu: (kind: string, id: string, x: number, y: number) => void;
   action: (action: string, kind?: string, id?: string) => void;
+}
+
+interface QuickAction {
+  action: string;
+  icon: string;
+  title: string;
 }
 
 interface RowOptions {
@@ -46,12 +54,20 @@ interface RowOptions {
   eye?: "on" | "off" | null;
   title?: string;
   extra?: string;
+  /** SolidWorks-style inline actions, revealed on hover/selection. */
+  quick?: QuickAction[];
 }
 
 export class FeatureTree {
   private root: HTMLElement;
   private handlers: TreeHandlers;
   handlersSet = false;
+  private lang: "en" | "tr" = "en";
+
+  /** Localise a label that FeatureTree owns (feature names are user data). */
+  private t(en: string, tr: string): string {
+    return this.lang === "tr" ? tr : en;
+  }
 
   constructor(root: HTMLElement, handlers: TreeHandlers) {
     this.root = root;
@@ -148,12 +164,20 @@ export class FeatureTree {
     if (opts.error) classes.push("error");
     if (opts.suppressed) classes.push("suppressed");
     const twisty = opts.twisty
-      ? `<button class="twisty" data-twist="${escapeHtml(key)}" title="Expand / collapse">${icon(opts.expanded ? "chevron-down" : "chevron-right")}</button>`
+      ? `<button class="twisty" data-twist="${escapeHtml(key)}" title="${this.t("Expand / collapse", "Genişlet / daralt")}">${icon(opts.expanded ? "chevron-down" : "chevron-right")}</button>`
       : `<span class="twisty"></span>`;
     const eye =
       opts.eye === null
         ? ""
-        : `<button class="row-btn ${opts.eye === "on" ? "pinned" : ""}" data-eye data-kind="${escapeHtml(opts.kind)}" data-id="${escapeHtml(opts.id)}" title="${opts.eye === "on" ? "Hide" : "Show"}">${icon(opts.eye === "on" ? "eye" : "eye-off")}</button>`;
+        : `<button class="row-btn ${opts.eye === "on" ? "pinned" : ""}" data-eye data-kind="${escapeHtml(opts.kind)}" data-id="${escapeHtml(opts.id)}" title="${opts.eye === "on" ? this.t("Hide", "Gizle") : this.t("Show", "Göster")}">${icon(opts.eye === "on" ? "eye" : "eye-off")}</button>`;
+    const quick = opts.quick?.length
+      ? `<span class="row-quick">${opts.quick
+          .map(
+            (q) =>
+              `<button class="row-btn quick-btn" data-tree-action="${escapeHtml(q.action)}" data-kind="${escapeHtml(opts.kind)}" data-id="${escapeHtml(opts.id)}" title="${escapeHtml(q.title)}">${icon(q.icon)}</button>`,
+          )
+          .join("")}</span>`
+      : "";
     return `<div class="${classes.join(" ")}" data-key="${escapeHtml(key)}" data-kind="${escapeHtml(opts.kind)}" data-id="${escapeHtml(opts.id)}" style="--depth:${opts.depth}" title="${escapeHtml(opts.title ?? opts.label)}">
       ${twisty}
       ${icon(opts.iconName, `node-icon ${opts.iconClass ?? ""}`)}
@@ -161,6 +185,7 @@ export class FeatureTree {
       ${opts.badge ? `<span class="badge">${escapeHtml(opts.badge)}</span>` : ""}
       ${opts.sub ? `<span class="sub">${escapeHtml(opts.sub)}</span>` : ""}
       ${opts.extra ?? ""}
+      ${quick}
       ${eye}
     </div>`;
   }
@@ -207,6 +232,7 @@ export class FeatureTree {
   }
 
   render(ctx: TreeContext): void {
+    this.lang = ctx.lang ?? "en";
     const expand = (key: string, fallback = false) => ctx.expanded.has(key) || fallback;
     const { doc, mode } = ctx;
     const activePart = doc.parts.find((p) => p.id === doc.activePartId) ?? doc.parts[0];
@@ -298,14 +324,14 @@ export class FeatureTree {
     // Material line, like SolidWorks' "Material <not specified>" row.
     const material = part.materialId ? materialById(part.materialId) : undefined;
     html += `<div class="tree-material">
-      <button class="material-button" data-tree-action="edit-material" data-kind="part" data-id="${escapeHtml(part.id)}" title="Assign or edit the part material">
+      <button class="material-button" data-tree-action="edit-material" data-kind="part" data-id="${escapeHtml(part.id)}" title="${this.t("Assign or edit the part material", "Parça malzemesini ata veya düzenle")}">
         <span class="swatch" style="background:${material?.color ?? "#c9d3dc"}"></span>
         ${
           material
             ? `<span>${escapeHtml(material.name)}</span>`
-            : `<span class="unset">Material &lt;not specified&gt;</span>`
+            : `<span class="unset">${this.t("Material &lt;not specified&gt;", "Malzeme &lt;belirtilmemiş&gt;")}</span>`
         }
-        <span class="edit">${material ? "Edit Material" : "Assign"}</span>
+        <span class="edit">${material ? this.t("Edit Material", "Malzemeyi Düzenle") : this.t("Assign", "Ata")}</span>
       </button>
     </div>`;
 
@@ -346,36 +372,14 @@ export class FeatureTree {
       </div>`;
     }
 
+    // Sketches consumed by a feature nest under that feature (SolidWorks style);
+    // only sketches no feature uses stay at the top level.
+    const consumed = new Set<string>();
+    for (const f of part.features) for (const s of this.featureSketches(part, f)) consumed.add(s.id);
+
     for (const sketch of part.sketches) {
-      const info = ctx.sketchInfo[sketch.id];
-      const key = `sketch:${sketch.id}`;
-      const open = expand(key);
-      const warnings = info?.warnings?.length ?? 0;
-      html += this.row(key, {
-        kind: "sketch",
-        id: sketch.id,
-        depth: 1,
-        label: sketch.name,
-        iconName: "drafting-compass",
-        iconClass: "sketch",
-        selected: ctx.selection === key,
-        hidden: !sketch.visible,
-        twisty: true,
-        expanded: open,
-        eye: sketch.visible ? "on" : "off",
-        badge: warnings && !info?.closed ? "OPEN" : undefined,
-        error: !!warnings && !info?.closed,
-        sub: info?.closed ? `${info.area.toFixed(0)} mm²` : undefined,
-        title: `${sketch.name} — ${info?.closed ? "closed profile" : "open profile"}`,
-      });
-      if (open) {
-        const constraints = sketch.constraints.slice(0, 40);
-        if (constraints.length === 0) {
-          html += `<div class="tree-note" style="padding-left:32px">No dimensions or relations.</div>`;
-        } else {
-          for (const c of constraints) html += this.constraintRow(sketch.id, c, 2);
-        }
-      }
+      if (consumed.has(sketch.id)) continue;
+      html += this.sketchRows(ctx, sketch, 1);
     }
 
     for (const f of part.features) {
@@ -444,6 +448,8 @@ export class FeatureTree {
                                     ? `Ø${f.params.helixDiameter ?? 20} · P${f.params.helixPitch ?? 5} · ${f.params.helixTurns ?? 4} turns`
                                     : "";
       const rolledBack = part.rollbackIndex !== undefined && part.features.indexOf(f) >= part.rollbackIndex;
+      const children = this.featureSketches(part, f);
+      const open = children.length > 0 && expand(key);
       html += this.row(key, {
         kind: "feature",
         id: f.id,
@@ -456,10 +462,26 @@ export class FeatureTree {
         error: !!f.error,
         badge: f.error ? "!" : undefined,
         sub: params,
-        title: f.error ? `${f.name}: ${f.error}` : `${f.name} — double-click to edit`,
+        twisty: children.length > 0,
+        expanded: open,
+        eye: null,
+        title: f.error ? `${f.name}: ${f.error}` : `${f.name} — ${this.t("double-click to edit", "düzenlemek için çift tıkla")}`,
+        quick: [
+          { action: "feature-edit", icon: "pencil", title: this.t("Edit Feature", "Özelliği Düzenle") },
+          ...(children.length ? [{ action: "feature-edit-sketch", icon: "drafting-compass", title: this.t("Edit Sketch", "Eskizi Düzenle") }] : []),
+          {
+            action: "feature-suppress",
+            icon: f.suppressed ? "circle" : "circle-off",
+            title: f.suppressed ? this.t("Unsuppress", "Bastırmayı Kaldır") : this.t("Suppress", "Bastır"),
+          },
+          { action: "feature-hide", icon: part.visible ? "eye" : "eye-off", title: part.visible ? this.t("Hide body", "Gövdeyi gizle") : this.t("Show body", "Gövdeyi göster") },
+        ],
       });
       if (f.error && ctx.expanded.has(`error:${f.id}`)) {
         html += `<div class="tree-note" style="color:#c0392b;padding-left:32px">${escapeHtml(f.error)}</div>`;
+      }
+      if (open) {
+        for (const child of children) html += this.sketchRows(ctx, child, 2, f);
       }
       if (part.rollbackIndex !== undefined && part.features.indexOf(f) === part.rollbackIndex - 1) {
         html += `<div class="rollback-bar active" draggable="true" data-rollback data-part="${escapeHtml(part.id)}" title="Drag the rollback bar to rebuild up to a feature">
@@ -489,10 +511,71 @@ export class FeatureTree {
       });
     }
 
-    html += `<div class="tree-note">${icon("info")} &nbsp;${part.features.filter((f) => !f.suppressed && f.type !== "imported").length} feature(s) · ${part.sketches.length} sketch(es)</div>`;
+    const activeFeatures = part.features.filter((f) => !f.suppressed && f.type !== "imported").length;
+    html += `<div class="tree-note">${icon("info")} &nbsp;${
+      this.lang === "tr"
+        ? `${activeFeatures} özellik · ${part.sketches.length} eskiz`
+        : `${activeFeatures} feature(s) · ${part.sketches.length} sketch(es)`
+    }</div>`;
     html += this.configurationsBlock(ctx, part, expand);
     if (part.asset && part.asset.format !== "step" && part.asset.format !== "iges") {
       html += `<div class="tree-note">Mesh-only imported body — boolean features are unavailable.</div>`;
+    }
+    return html;
+  }
+
+  /** Sketches a feature consumes: its profile, loft sections and sweep path. */
+  private featureSketches(part: Part, feature: Feature): Sketch[] {
+    const ids: string[] = [];
+    if (feature.sketchId) ids.push(feature.sketchId);
+    for (const id of feature.params?.profileSketchIds ?? []) ids.push(id);
+    if (feature.params?.pathSketchId) ids.push(feature.params.pathSketchId);
+    const seen = new Set<string>();
+    const sketches: Sketch[] = [];
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const sketch = part.sketches.find((s) => s.id === id);
+      if (sketch) sketches.push(sketch);
+    }
+    return sketches;
+  }
+
+  /** A sketch row (and its dimensions/relations), optionally nested in a feature. */
+  private sketchRows(ctx: TreeContext, sketch: Sketch, depth: number, parent?: Feature): string {
+    const info = ctx.sketchInfo[sketch.id];
+    const key = `sketch:${sketch.id}`;
+    const open = ctx.expanded.has(key);
+    const warnings = info?.warnings?.length ?? 0;
+    let html = this.row(key, {
+      kind: "sketch",
+      id: sketch.id,
+      depth,
+      label: sketch.name,
+      iconName: "drafting-compass",
+      iconClass: "sketch",
+      selected: ctx.selection === key,
+      hidden: !sketch.visible,
+      twisty: true,
+      expanded: open,
+      eye: sketch.visible ? "on" : "off",
+      badge: warnings && !info?.closed ? "OPEN" : undefined,
+      error: !!warnings && !info?.closed,
+      sub: info?.closed ? `${info.area.toFixed(0)} mm²` : undefined,
+      title: `${sketch.name} — ${info?.closed ? this.t("closed profile", "kapalı profil") : this.t("open profile", "açık profil")}`,
+      quick: [
+        { action: "sketch-edit", icon: "pencil", title: this.t("Edit Sketch", "Eskizi Düzenle") },
+        ...(parent ? [{ action: "feature-edit", icon: "square", title: this.t("Edit Feature", "Özelliği Düzenle") }] : []),
+        { action: "sketch-hide", icon: sketch.visible ? "eye" : "eye-off", title: sketch.visible ? this.t("Hide", "Gizle") : this.t("Show", "Göster") },
+      ],
+    });
+    if (open) {
+      const constraints = sketch.constraints.slice(0, 40);
+      if (constraints.length === 0) {
+        html += `<div class="tree-note" style="padding-left:${28 + depth * 15}px">${this.t("No dimensions or relations.", "Ölçü veya ilişki yok.")}</div>`;
+      } else {
+        for (const c of constraints) html += this.constraintRow(sketch.id, c, depth + 1);
+      }
     }
     return html;
   }
@@ -502,12 +585,12 @@ export class FeatureTree {
     const open = expand("configurations", true);
     const configs = part.configurations ?? [];
     let html = `<div class="tree-section-head" data-tree-action="configurations">
-      ${icon("layers-3")}<span>Configurations</span>
-      <button class="tree-section-add" data-tree-action="configuration-add" title="Add configuration">${icon("plus")}</button>
+      ${icon("layers-3")}<span>${this.t("Configurations", "Yapılandırmalar")}</span>
+      <button class="tree-section-add" data-tree-action="configuration-add" title="${this.t("Add configuration", "Yapılandırma ekle")}">${icon("plus")}</button>
     </div>`;
     if (!open) return html;
     if (configs.length === 0) {
-      html += `<div class="tree-note">No configurations yet. Click + to create one.</div>`;
+      html += `<div class="tree-note">${this.t("No configurations yet. Click + to create one.", "Henüz yapılandırma yok. Oluşturmak için +'ya tıklayın.")}</div>`;
       return html;
     }
     for (const config of configs) {

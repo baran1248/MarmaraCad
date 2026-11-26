@@ -27,6 +27,9 @@ export async function openApp(browser, { width = 1440, height = 900, query = "" 
   page.on("requestfailed", (r) => {
     const url = r.url();
     if (url.includes("favicon") || url.includes("three_webgpu.js")) return;
+    // Vite serves HMR/worker modules from blob: URLs; a teardown or hot reload
+    // aborts them with ERR_ABORTED, which is not an application failure.
+    if (url.startsWith("blob:") && /ERR_ABORTED/.test(r.failure()?.errorText ?? "")) return;
     errors.push(`requestfailed: ${url.slice(-100)} ${r.failure()?.errorText}`);
   });
   await page.goto(BASE + query, { waitUntil: "domcontentloaded", timeout: 120000 });

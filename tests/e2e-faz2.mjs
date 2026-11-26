@@ -255,6 +255,15 @@ try {
 
   // --- Confirmation Corner (while the sample part is still the active part).
   const sketchId = await page.evaluate(() => window.__marmaracad.doc().parts[0].sketches[0]?.id);
+  // Consumed sketches live under their feature now, so expand the owner first.
+  await page.evaluate((id) => {
+    if (document.querySelector(`[data-key="sketch:${id}"]`)) return;
+    const part = window.__marmaracad.doc().parts[0];
+    const owner = part.features.find((f) => f.sketchId === id);
+    const row = [...document.querySelectorAll('.tree-row[data-kind="feature"]')].find((r) => r.dataset.id === owner?.id);
+    row?.querySelector(".twisty")?.click();
+  }, sketchId);
+  await page.waitForSelector(`[data-key="sketch:${sketchId}"]`, { timeout: 15000 });
   await page.click(`[data-key="sketch:${sketchId}"]`);
   const featuresBefore = await page.evaluate(() => window.__marmaracad.doc().parts[0].features.length);
   await page.click('[data-cmd-tab="features"]');

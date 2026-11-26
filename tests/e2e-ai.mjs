@@ -589,6 +589,134 @@ try {
     mate,
   );
 
+  // --- Failure handling: real Google messages, thinkingConfig fallback, 503
+  // retry and a history that never keeps a dangling user turn.
+  await page.evaluate(() => {
+    window.__aiFail = null;
+    const current = window.fetch;
+    window.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input.url;
+      const method = init?.method ?? "GET";
+      const fail = window.__aiFail;
+      if (fail && fail.remaining !== 0 && url.includes("generativelanguage.googleapis.com") && method === "POST") {
+        if (fail.remaining > 0) fail.remaining -= 1;
+        window.__aiCalls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : null });
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: fail.status,
+              message: fail.message,
+              status: fail.status === 503 ? "UNAVAILABLE" : "INVALID_ARGUMENT",
+            },
+          }),
+          { status: fail.status, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return current(input, init);
+    };
+  });
+  await page.evaluate(() => {
+    window.__aiReply = { message: "Iso view.", commands: [{ action: "view", params: { name: "iso" } }] };
+  });
+
+  // HTTP 400 caused by thinkingConfig: drop it once and retry.
+  const postsBefore400 = await page.evaluate(() => window.__aiCalls.filter((c) => c.method === "POST").length);
+  await page.evaluate(() => {
+    window.__aiFail = { status: 400, message: "Thinking config is not supported for this model.", remaining: 1 };
+  });
+  const appliesBefore400 = await page.locator(".ai-apply").count();
+  await page.fill("#ai-prompt", "THINKING-400-PROMPT");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-apply").length > n, appliesBefore400, { timeout: 30000 });
+  await page.waitForTimeout(200);
+  const retried400 = await page.evaluate(() => {
+    const posts = window.__aiCalls.filter((c) => c.method === "POST");
+    const last = posts.at(-1);
+    return {
+      posts: posts.length,
+      thinking: last?.body?.generationConfig?.thinkingConfig ?? null,
+      temperature: last?.body?.generationConfig?.temperature,
+      lastText: last?.body?.contents?.at(-1)?.parts?.[0]?.text ?? "",
+    };
+  });
+  record(
+    "A thinkingConfig 400 is retried once without the thinking config",
+    retried400.posts === postsBefore400 + 2 && retried400.thinking === null && retried400.temperature === 0.15 && /THINKING-400-PROMPT/.test(retried400.lastText),
+    retried400,
+  );
+
+  // HTTP 503: one automatic retry, Google's own message in the chat, and the
+  // failed user turn is rolled back so the next request cannot send [user, user].
+  const postsBefore503 = await page.evaluate(() => window.__aiCalls.filter((c) => c.method === "POST").length);
+  await page.evaluate(() => {
+    window.__aiFail = { status: 503, message: "The model is overloaded. Please try again later.", remaining: 2 };
+  });
+  const errorsBefore503 = await page.locator(".ai-msg.error").count();
+  await page.fill("#ai-prompt", "FAIL-503-PROMPT");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-msg.error").length > n, errorsBefore503, { timeout: 30000 });
+  await page.waitForTimeout(300);
+  const failed503 = await page.evaluate(() => ({
+    errors: [...document.querySelectorAll(".ai-msg.error")].map((el) => el.textContent ?? ""),
+    posts: window.__aiCalls.filter((c) => c.method === "POST").length,
+  }));
+  record(
+    "A 503 shows Google's error message after one automatic retry",
+    /overloaded/.test(failed503.errors.at(-1) ?? "") && failed503.posts === postsBefore503 + 2,
+    { message: failed503.errors.at(-1), posts: failed503.posts - postsBefore503 },
+  );
+
+  await page.evaluate(() => {
+    window.__aiFail = null;
+  });
+  const appliesAfter503 = await page.locator(".ai-apply").count();
+  await page.fill("#ai-prompt", "AFTER-503-PROMPT");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-apply").length > n, appliesAfter503, { timeout: 30000 });
+  await page.waitForTimeout(200);
+  const recovered = await page.evaluate(() => {
+    const posts = window.__aiCalls.filter((c) => c.method === "POST");
+    const last = posts.at(-1);
+    const texts = (last?.body?.contents ?? []).map((c) => c.parts?.[0]?.text ?? "");
+    const roles = (last?.body?.contents ?? []).map((c) => c.role);
+    return { roles, texts, hasFailedTurn: texts.some((t) => t.includes("FAIL-503-PROMPT")), hasTwoUsers: /user,user/.test(roles.join(",")) };
+  });
+  record(
+    "After a 503 the history has no dangling user turn and the next request succeeds",
+    recovered.roles.at(-1) === "user" && !recovered.hasTwoUsers && !recovered.hasFailedTurn && /AFTER-503-PROMPT/.test(recovered.texts.at(-1) ?? ""),
+    { roles: recovered.roles, hasFailedTurn: recovered.hasFailedTurn },
+  );
+
+  // Clear Chat empties the conversation and the next request starts from one turn.
+  await page.click("#ai-clear-chat");
+  await page.waitForTimeout(200);
+  const clearedChat = await page.evaluate(() => ({
+    userMessages: document.querySelectorAll(".ai-msg.user").length,
+    applyButtons: document.querySelectorAll(".ai-apply").length,
+    text: document.getElementById("ai-scroll")?.innerText ?? "",
+  }));
+  const appliesAfterClear = await page.locator(".ai-apply").count();
+  await page.fill("#ai-prompt", "AFTER-CLEAR-PROMPT");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-apply").length > n, appliesAfterClear, { timeout: 30000 });
+  await page.waitForTimeout(200);
+  const afterClear = await page.evaluate(() => {
+    const posts = window.__aiCalls.filter((c) => c.method === "POST");
+    const last = posts.at(-1);
+    const contents = last?.body?.contents ?? [];
+    return { roles: contents.map((c) => c.role), texts: contents.map((c) => c.parts?.[0]?.text ?? "") };
+  });
+  record(
+    "Clear Chat resets the conversation to a single user turn",
+    clearedChat.userMessages === 0 &&
+      clearedChat.applyButtons === 0 &&
+      /Chat cleared/.test(clearedChat.text) &&
+      afterClear.roles.length === 1 &&
+      afterClear.roles[0] === "user" &&
+      /AFTER-CLEAR-PROMPT/.test(afterClear.texts[0] ?? ""),
+    { clearedChat, roles: afterClear.roles },
+  );
+
   // Clearing the key removes it from localStorage and the cookie.
   await page.click("#ai-key-clear");
   await page.waitForTimeout(200);

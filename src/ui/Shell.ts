@@ -799,10 +799,10 @@ export class Shell {
   }
 
   setTreeContext(ctx: TreeContext): void {
-    this.treeContext = ctx;
+    this.treeContext = { ...ctx, lang: this.language };
     if (this.activePanel === "tree") {
       const scroll = this.panelBody.scrollTop;
-      this.tree.render(ctx);
+      this.tree.render(this.treeContext);
       hydrateIcons();
       this.panelBody.scrollTop = scroll;
     }
@@ -1151,6 +1151,9 @@ export class Shell {
     });
     this.badgeEl.textContent = `${this.mode === "part" ? (map.Part ?? "Part") : this.mode === "assembly" ? (map.Assembly ?? "Assembly") : map["Static Structural"] ?? "Static Structural"} · mm`;
     this.renderMassCard();
+    // Re-render the FeatureManager so its own labels follow the language.
+    if (this.treeContext) this.treeContext = { ...this.treeContext, lang };
+    this.refreshTree();
     hydrateIcons();
   }
 

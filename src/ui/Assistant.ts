@@ -217,6 +217,7 @@ export class Assistant {
       <div class="ai-head">
         <span class="ai-logo">${icon("sparkles")}</span>
         <div class="ai-title">Gemini CAD assistant<small id="ai-head-state">Local key · no server relay</small></div>
+        <button class="ai-clear" id="ai-clear-chat" title="Clear the conversation history">Clear Chat</button>
         <button class="ai-close" title="Close">${icon("x")}</button>
       </div>
       <div class="ai-key">
@@ -271,6 +272,7 @@ export class Assistant {
     if (this.modelSelect) this.modelSelect.value = this.model;
     this.updateKeyState();
     this.root.querySelector(".ai-close")?.addEventListener("click", () => this.toggle(false));
+    this.root.querySelector("#ai-clear-chat")?.addEventListener("click", () => this.clearChat());
     this.root.querySelector("#ai-key-save")?.addEventListener("click", () => {
       const value = (this.keyInput?.value ?? "").trim();
       if (!value) {
@@ -293,6 +295,8 @@ export class Assistant {
     this.modelSelect?.addEventListener("change", () => {
       this.model = this.modelSelect?.value ?? DEFAULT_MODEL;
       this.modelId = this.model === DEFAULT_MODEL ? this.defaultModelId() : this.model;
+      // A failed request must never leak a dangling user turn into the next model.
+      this.trimDanglingUser();
       try {
         localStorage.setItem(MODEL_STORAGE, this.model);
       } catch {
@@ -450,6 +454,42 @@ export class Assistant {
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
 
+  /** Drop a dangling user turn left behind by a failed request, so the next
+   *  call never sends two `user` turns in a row (Google replies HTTP 400). */
+  private trimDanglingUser(): void {
+    while (this.history.length && this.history[this.history.length - 1].role === "user") this.history.pop();
+  }
+
+  private clearChat(): void {
+    if (this.busy) return;
+    this.history = [];
+    if (this.messagesEl) {
+      this.messagesEl.innerHTML = "";
+      this.pushMessage("Chat cleared. The next request starts a fresh conversation.", "bot");
+    }
+    this.setStatus("Chat cleared");
+  }
+
+  /** Google's error envelope carries the actionable reason in `error.message`. */
+  private async readApiError(res: Response): Promise<{ status: number; message: string; raw: string }> {
+    let raw = "";
+    try {
+      raw = await res.text();
+      const data = JSON.parse(raw) as { error?: { message?: string } };
+      if (data.error?.message) return { status: res.status, message: data.error.message, raw };
+    } catch {
+      /* non-JSON body keeps the HTTP status text */
+    }
+    return { status: res.status, message: `HTTP ${res.status} ${res.statusText}`, raw };
+  }
+
+  private postGenerate(body: unknown): Promise<Response> {
+    return fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.modelId)}:generateContent?key=${encodeURIComponent(this.key)}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    );
+  }
+
   async send(): Promise<void> {
     if (this.busy) return;
     const prompt = (this.promptEl?.value ?? "").trim();
@@ -459,6 +499,7 @@ export class Assistant {
       this.keyInput?.focus();
       return;
     }
+    this.trimDanglingUser();
     if (this.promptEl) this.promptEl.value = "";
     this.pushMessage(prompt, "user");
     this.history.push({ role: "user", text: prompt });
@@ -495,11 +536,24 @@ export class Assistant {
         contents,
         generationConfig,
       };
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.modelId)}:generateContent?key=${encodeURIComponent(this.key)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      let res = await this.postGenerate(body);
+      if (!res.ok) {
+        let apiError = await this.readApiError(res);
+        if (apiError.status === 503) {
+          // Server overload: one short back-off, then the same request again.
+          this.setStatus("Gemini is busy (503) · retrying in 1.5 s…");
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          res = await this.postGenerate(body);
+          if (!res.ok) apiError = await this.readApiError(res);
+        } else if (apiError.status === 400 && generationConfig.thinkingConfig && /thinking/i.test(`${apiError.message} ${apiError.raw}`)) {
+          // Some models reject thinkingConfig; drop it and retry once.
+          this.setStatus("Model rejected thinkingConfig · retrying without it…");
+          delete generationConfig.thinkingConfig;
+          res = await this.postGenerate(body);
+          if (!res.ok) apiError = await this.readApiError(res);
+        }
+        if (!res.ok) throw new Error(apiError.message);
+      }
       const data = (await res.json()) as {
         candidates?: { content?: { parts?: { text?: string }[] } }[];
       };
@@ -513,6 +567,8 @@ export class Assistant {
       }
       this.setStatus("Gemini replied");
     } catch (error) {
+      // Roll the optimistic user turn back so the history stays [user, model]*.
+      this.trimDanglingUser();
       this.pushMessage(`Gemini request failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       this.setStatus("Gemini request failed");
     } finally {

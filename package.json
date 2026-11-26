@@ -1,7 +1,7 @@
 {
   "name": "marmaracad",
   "private": true,
-  "version": "1.6.0",
+  "version": "1.7.0",
   "type": "module",
   "description": "MarmaraCad - Browser-based parametric CAD, assembly and FEA engineering suite",
   "scripts": {
@@ -10,7 +10,7 @@
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "node tests/e2e-boot.mjs && node tests/e2e-run.mjs && node tests/e2e-sample.mjs && node tests/e2e-modify.mjs && node tests/e2e-import.mjs && node tests/e2e-sketch-tools.mjs && node tests/e2e-sketch-utils.mjs && node tests/e2e-features.mjs && node tests/e2e-body-features.mjs && node tests/e2e-templates.mjs && node tests/e2e-step-validate.mjs && node tests/e2e-assembly.mjs && node tests/e2e-mates.mjs && node tests/e2e-fea.mjs && node tests/e2e-fea-beam.mjs && node tests/e2e-fea-tet.mjs && node tests/e2e-fea-multiphysics.mjs && node tests/e2e-fea-multiselect.mjs && node tests/e2e-analysis-strip.mjs && node tests/e2e-multiselect.mjs && node tests/e2e-shortcuts.mjs && node tests/e2e-variables.mjs && node tests/e2e-dynamic-input.mjs && node tests/e2e-snap.mjs && node tests/e2e-template-boxlid.mjs && node tests/e2e-faz2.mjs && node tests/e2e-hud.mjs && node tests/e2e-ai.mjs && node tests/e2e-ribbon.mjs && node tests/e2e-controlmodes.mjs && node tests/e2e-phase4.mjs && node tests/e2e-phase5.mjs",
+    "test:e2e": "node tests/e2e-boot.mjs && node tests/e2e-run.mjs && node tests/e2e-sample.mjs && node tests/e2e-modify.mjs && node tests/e2e-import.mjs && node tests/e2e-sketch-tools.mjs && node tests/e2e-sketch-utils.mjs && node tests/e2e-features.mjs && node tests/e2e-body-features.mjs && node tests/e2e-templates.mjs && node tests/e2e-step-validate.mjs && node tests/e2e-assembly.mjs && node tests/e2e-mates.mjs && node tests/e2e-fea.mjs && node tests/e2e-fea-beam.mjs && node tests/e2e-fea-tet.mjs && node tests/e2e-fea-multiphysics.mjs && node tests/e2e-fea-multiselect.mjs && node tests/e2e-analysis-strip.mjs && node tests/e2e-multiselect.mjs && node tests/e2e-shortcuts.mjs && node tests/e2e-variables.mjs && node tests/e2e-dynamic-input.mjs && node tests/e2e-snap.mjs && node tests/e2e-template-boxlid.mjs && node tests/e2e-faz2.mjs && node tests/e2e-hud.mjs && node tests/e2e-featuretree.mjs && node tests/e2e-ai.mjs && node tests/e2e-ribbon.mjs && node tests/e2e-controlmodes.mjs && node tests/e2e-phase4.mjs && node tests/e2e-phase5.mjs",
     "test:ui": "node tests/ui-audit.mjs && node tests/ui-sketch-proof.mjs && node tests/ui-qa-followup.mjs",
     "test:live": "node tests/e2e-live.mjs",
     "test:phase4": "node tests/e2e-phase4.mjs",
