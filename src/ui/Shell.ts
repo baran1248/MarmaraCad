@@ -7,6 +7,7 @@ import { CommandPalette } from "./CommandPalette";
 import { ViewCube } from "./ViewCube";
 import { hydrateIcons, icon } from "./icons";
 import { fmtMm } from "./dom";
+import { APP_VERSION_SHORT } from "../model/defaults";
 
 export type PanelTab = "tree" | "property" | "display";
 
@@ -286,7 +287,7 @@ export class Shell {
     root.innerHTML = `
       <div class="app-shell">
         <header class="titlebar">
-          <div class="brand"><span class="brand-mark">M</span><span>MarmaraCad</span><span class="ver">1.0</span></div>
+          <div class="brand"><span class="brand-mark">M</span><span>MarmaraCad</span><span class="ver">${APP_VERSION_SHORT}</span></div>
           <nav class="menubar">
             <button data-menu="file">File</button>
             <button data-menu="edit">Edit</button>
@@ -1134,6 +1135,20 @@ export class Shell {
     if (assemblyTab) assemblyTab.innerHTML = `${icon("boxes")} ${map.Assembly ?? "Assembly"}`;
     const analysisTab = this.root.querySelector<HTMLElement>('[data-mode="analysis"]');
     if (analysisTab) analysisTab.innerHTML = `${icon("activity")} ${map.Analysis ?? "Analysis"}`;
+    // Selection filter bar: Select All Faces Edges Vertices → SEÇ · Tümü / Yüzler / Kenarlar / Köşeler.
+    const pickLabels: Record<string, string> =
+      lang === "tr" ? { all: "Tümü", face: "Yüzler", edge: "Kenarlar", vertex: "Köşeler" } : { all: "All", face: "Faces", edge: "Edges", vertex: "Vertices" };
+    const pickTitles: Record<string, string> =
+      lang === "tr"
+        ? { all: "Yüz, kenar ve köşeleri seç", face: "Yalnız yüzler", edge: "Yalnız kenarlar", vertex: "Yalnız köşeler" }
+        : { all: "Select faces, edges and vertices", face: "Faces only", edge: "Edges only", vertex: "Vertices only" };
+    const sfLabel = this.root.querySelector<HTMLElement>(".selection-filters .sf-label");
+    if (sfLabel) sfLabel.textContent = lang === "tr" ? "SEÇ ·" : "Select";
+    this.root.querySelectorAll<HTMLElement>("[data-pick-filter]").forEach((button) => {
+      const key = button.dataset.pickFilter ?? "";
+      if (pickLabels[key]) button.textContent = pickLabels[key];
+      if (pickTitles[key]) button.title = pickTitles[key];
+    });
     this.badgeEl.textContent = `${this.mode === "part" ? (map.Part ?? "Part") : this.mode === "assembly" ? (map.Assembly ?? "Assembly") : map["Static Structural"] ?? "Static Structural"} · mm`;
     this.renderMassCard();
     hydrateIcons();
@@ -1148,9 +1163,18 @@ export class Shell {
    *  language changes, so the card title follows immediately). */
   private renderMassCard(): void {
     if (!this.massRows) return;
+    const tr: Record<string, string> = {
+      Volume: "Hacim",
+      Mass: "Kütle",
+      Area: "Alan",
+      "CoM X": "Ağırlık Merkezi X",
+      "CoM Y": "Ağırlık Merkezi Y",
+      "CoM Z": "Ağırlık Merkezi Z",
+      Components: "Bileşenler",
+    };
     const title = this.language === "tr" ? "Kütle Özellikleri" : "Mass Properties";
     this.massCard.innerHTML = `<div class="title"><span>${title}</span><span>${icon("gauge")}</span></div><div class="mass-grid">${this.massRows
-      .map((r) => `<span>${r.label}</span><span>${r.value}</span>`)
+      .map((r) => `<span>${this.language === "tr" ? (tr[r.label] ?? r.label) : r.label}</span><span>${r.value}</span>`)
       .join("")}</div>`;
     hydrateIcons();
   }

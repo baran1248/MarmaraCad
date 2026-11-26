@@ -1,7 +1,7 @@
 {
   "name": "marmaracad",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.6.0",
   "type": "module",
   "description": "MarmaraCad - Browser-based parametric CAD, assembly and FEA engineering suite",
   "scripts": {

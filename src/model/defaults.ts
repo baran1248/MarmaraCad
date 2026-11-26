@@ -1,7 +1,9 @@
 import type { Part, ProjectDocument, Sketch, SketchPlane, Vec3 } from "./types";
 
 export const APP_NAME = "MarmaraCad";
-export const APP_VERSION = "1.0.0";
+export const APP_VERSION = "1.6.0";
+/** Compact UI label: 1.6.0 -> 1.6. */
+export const APP_VERSION_SHORT = APP_VERSION.split(".").slice(0, 2).join(".");
 export const PROJECT_FORMAT = "marmaracad";
 export const UNIT = "mm";
 

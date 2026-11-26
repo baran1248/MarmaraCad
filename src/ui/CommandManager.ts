@@ -343,6 +343,7 @@ export const TABS: TabDef[] = [
 const TR_LABELS: Record<string, string> = {
   Sketch: "Eskiz",
   Features: "Özellikler",
+  "Sheet Metal": "Sac Metal",
   Assembly: "Montaj",
   Evaluate: "Değerlendir",
   Analysis: "Analiz",
@@ -357,6 +358,7 @@ const TR_LABELS: Record<string, string> = {
   Import: "İçe Aktar",
   Output: "Çıktı",
   Display: "Görünüm",
+  View: "Görünüm",
   Views: "Bakışlar",
   Export: "Dışa Aktar",
   Setup: "Kurulum",

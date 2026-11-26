@@ -647,3 +647,53 @@ Live: https://baran1248.github.io/MarmaraCad/
   fields, palette open, Turkish "açınım" hit, 6 transferables. `ERRORS none`, `RESULT PASS`.
 - `MARMARACAD_URL=https://baran1248.github.io/MarmaraCad/ node tests/e2e-phase5.mjs`:
   `RESULT PASS 23/23` on the published build, zero console errors.
+
+## Phase 6 - Multimodal Gemini, B-Rep topology and targeted edges
+
+### Viewport + topology context
+- [x] `Viewport.captureJpeg(quality = 0.78, maxWidth = 1024)` copies the presented frame to a 2D
+      canvas, downscales it to 1024 px, retries with a forced render when the content ratio is below
+      0.01, and reports `content`, `fallback` and `bytes`. `lastCapture` keeps the latest frame for the
+      debug API.
+- [x] `src/ai/topology.ts` summarises the active body: bbox/volume/area, selected faces/edges,
+      `holeAxes`, faces (`planar|cylindrical|other`, normal/axis, centre, radius, `isHole`) and edges
+      (`line|circle|arc|curved`, start/end, centre/radius, length, axis, `planes`, `isOuterBoundary`,
+      `isOuterCorner`, `onHole`), capped at 120 faces / 160 edges.
+- [x] `Assistant` sends the same JSON in `systemInstruction` on every request and the viewport JPEG as
+      `inlineData` on the newest user turn. The `Send viewport view` checkbox is on by default,
+      persisted in localStorage, and only suppresses the image (the topology always stays).
+- [x] `main.ts` wires `aiContext()` to the live mesh/selection/capture and exposes
+      `window.__marmaracad.topology()` / `lastCapture()` for tests.
+
+### Targeted fillet / chamfer
+- [x] `src/ai/edgeSelection.ts` resolves `"all"`, `"selected"`, explicit arrays and selector objects
+      (`preset`, `axis`, `outerOnly`, `straightOnly`, `minLength`, `maxLength`). `parallel-to-holes`
+      uses `holeAxes[0]`; the Y-up `outer-top` / `outer-bottom` presets use `y-max` / `y-min`.
+- [x] `fillet` / `chamfer` call the resolver on the same `TopologySummary` the model saw, reject empty
+      selections with a reason toast, and store the resolved indices in the feature.
+- [x] Verified on a 120 × 80 × 18 plate with four Ø9 holes:
+      `{axis:"parallel-to-holes",outerOnly:true,straightOnly:true}` selects exactly edges `[0,1,4,7]`;
+      R10 removes 1,545.13 mm³ (168,219.56 → 166,674.42) with no kernel warnings.
+
+### Models and thinking
+- [x] The model picker has a `Recommended` group (the hydrogen alias plus every `gemini-4*` /
+      `/hydrogen/i` model) and an `All models` group. Hydrogen resolves exact → newest hydrogen alias
+      → newest flash → first model.
+- [x] `thinkingConfigFor` sends `thinkingLevel` for `gemini-3/4*` and every hydrogen alias,
+      `thinkingBudget` (mid 8192) for 2.5, and no config for 1.5.
+- [x] Model listing is guarded by a `listing` lock and a `lastListSignature`, so saving the same key
+      twice does not duplicate the chat notice; key save no longer posts a "Fetching models…" message.
+
+### Turkish UI
+- [x] `Sac Metal` tab, `GÖRÜNÜM` ribbon group, `SEÇ · Tümü / Yüzler / Kenarlar / Köşeler` selection
+      bar and `Hacim / Kütle / Alan / Ağırlık Merkezi X/Y/Z` mass card.
+- [x] Application version bumped to **1.6.0**: `APP_VERSION` / `APP_VERSION_SHORT`, the title-bar
+      badge, Model Info and About dialogs, `package.json` and `package-lock.json` all read 1.6.
+
+### Phase 6 verification (local dev server, headless Chrome, WebGPU)
+- `npx tsc --noEmit` clean.
+- `npm test`: 12 files / 62 tests pass (adds `tests/topology.test.ts` 3 and
+  `tests/edgeSelection.test.ts` 4).
+- `tests/e2e-ai.mjs`: `RESULT PASS`, 23 checks — inlineData 104,190 B, topology 13 faces / 30 edges /
+  `holeAxes ["y"]` / corners `[0,1,4,7]`, off-toggle sends 0 images, `gemini-4-hydrogen` with
+  `thinkingLevel: "medium"`, 1,545.13 mm³ targeted fillet loss, zero console errors.

@@ -2977,6 +2977,9 @@ body.has-legend .toast-stack {
 .ai-key-row .ai-state { font-size: 9.5px; color: #5c7488; flex: 1; }
 .ai-models { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 6px; }
 .ai-models select { width: 100%; }
+.ai-vision { display: flex; align-items: center; gap: 6px; margin-top: 7px; font-size: 10.5px; color: #3c607c; cursor: pointer; user-select: none; }
+.ai-vision input { width: 12px; height: 12px; accent-color: #1f6fb2; }
+.ai-vision b { margin-left: auto; font-family: var(--mono); font-size: 9px; font-weight: 600; letter-spacing: .4px; color: #6b8aa3; border: 1px solid #c9d9e6; border-radius: 3px; padding: 1px 4px; background: #f7fbfe; }
 .ai-foot { padding: 7px 10px; border-top: 1px solid #d3e0ea; display: flex; gap: 5px; align-items: flex-end; background: #f3f8fc; }
 .ai-foot textarea { flex: 1; resize: none; height: 46px; border: 1px solid #b9ccdb; border-radius: 5px; padding: 5px 7px; font-family: inherit; font-size: 11.5px; }
 .ai-send { width: 34px; height: 34px; border-radius: 6px; border: 0; background: #1f6fb2; color: #fff; display: grid; place-items: center; }

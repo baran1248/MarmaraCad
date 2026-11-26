@@ -7,6 +7,7 @@
  * the application applies inside the normal undo/redo transaction. */
 import type { ProjectDocument } from "../model/types";
 import { createDocument } from "../model/defaults";
+import { MATERIALS } from "../analysis/materials";
 import { escapeHtml } from "../utils/misc";
 import { icon } from "./icons";
 
@@ -20,14 +21,25 @@ export interface AiReply {
   commands: AiCommand[];
 }
 
+/** Everything the assistant knows about the current viewport/body. */
+export interface AiContext {
+  /** Compact topology JSON from `src/ai/topology.ts`. */
+  topology?: unknown;
+  /** Current viewport frame as base64 JPEG (no data: prefix). */
+  image?: { mimeType: "image/jpeg"; base64: string };
+}
+
 export interface AssistantOptions {
   onCommands: (commands: AiCommand[], message: string) => void;
   onStatus?: (text: string) => void;
+  /** Called once per request, right before the network call. */
+  context?: () => AiContext | Promise<AiContext>;
 }
 
 const KEY_STORAGE = "marmaracad.gemini.apiKey";
 const MODEL_STORAGE = "marmaracad.gemini.model";
 const THINK_STORAGE = "marmaracad.gemini.thinking";
+const VIEW_STORAGE = "marmaracad.gemini.sendView";
 const COOKIE = "marmaracad_gemini_key";
 
 /** Public-facing names used by the panel; `hydrogen` is the default. */
@@ -37,12 +49,19 @@ const THINK_LEVELS: Record<string, string> = { low: "low", mid: "medium", high: 
 const THINK_BUDGETS: Record<string, number> = { low: 1024, mid: 8192, high: 24576 };
 
 /** Google split thinking controls between model generations:
- *  Gemini 3 uses `thinkingLevel`, 2.5 uses a token `thinkingBudget`, and older
- *  models reject the whole `thinkingConfig` object. */
+ *  Gemini 3/4 and every hydrogen alias use `thinkingLevel`, 2.5 uses a token
+ *  `thinkingBudget`, and older models reject the whole `thinkingConfig` object. */
 export function thinkingConfigFor(modelId: string, thinking: string): Record<string, unknown> | undefined {
-  if (/gemini-3/i.test(modelId)) return { thinkingLevel: THINK_LEVELS[thinking] ?? "medium" };
+  if (/gemini-[34]/i.test(modelId) || /hydrogen/i.test(modelId)) {
+    return { thinkingLevel: THINK_LEVELS[thinking] ?? "medium" };
+  }
   if (/gemini-2\.5/i.test(modelId)) return { thinkingBudget: THINK_BUDGETS[thinking] ?? 8192 };
   return undefined;
+}
+
+/** The 45+ entry Engineering Data library, compressed to id + name for the prompt. */
+function materialPromptList(): string {
+  return MATERIALS.map((material) => `${material.id} (${material.name})`).join(", ");
 }
 
 export function systemPrompt(doc: ProjectDocument): string {
@@ -52,19 +71,37 @@ You translate Turkish or English natural-language modelling requests into a JSON
 Reply with ONE JSON object and nothing else:
 {"message":"short explanation in the user's language","commands":[{"action":"...","params":{...}}]}
 
+TOPOLOGY CONTEXT
+Every request includes a "CURRENT TOPOLOGY" JSON block for the active part:
+- part: bbox min/max, volume, area, featureCount
+- selection: faces / edges indices the user picked
+- holeAxes: world axes of cylindrical holes, e.g. ["z"]
+- faces[]: index, type ("planar"|"cylindrical"|"other"), normal (planar) or axis (cylindrical), center, radius, isHole
+- edges[]: index, kind ("line"|"circle"|"arc"|"curved"), start/end (lines and arcs), center/radius (circles and arcs), length, axis ("x"|"y"|"z"|"curved"), isOuterBoundary, isOuterCorner, onHole, planes (e.g. ["y-max"])
+The app is Y-up: the top view looks along -Y, so the top bbox plane is "y-max".
+A viewport JPEG of the current camera is attached to the newest user message unless the user turns it off.
+
+EDGE TARGETING for fillet / chamfer "edges"
+- "all" (default), "selected", an explicit index array [0,3,7,11], or a selector object:
+  {"preset":"outer-vertical"|"outer-top"|"outer-bottom"|"holes", "axis":"x"|"y"|"z"|"parallel-to-holes", "outerOnly":true, "straightOnly":true, "minLength":0, "maxLength":0}
+- Use a selector when the user describes geometry: "outer four corners parallel to the holes" -> {"axis":"parallel-to-holes","outerOnly":true,"straightOnly":true}; "top perimeter" -> {"preset":"outer-top"}; "every hole rim" -> {"preset":"holes"}.
+- "outer-vertical" means the upright corner edges (isOuterCorner). "parallel-to-holes" uses holeAxes[0]. "outer-top"/"outer-bottom" use the Y-up bbox planes y-max/y-min.
+- Use "selected" only when selection.edges is non-empty. Use explicit indices only when they appear in the topology JSON.
+- Example: "sadece deliklerle aynı yöndeki dış dört köşeye 10 mm radyus" -> {"action":"fillet","params":{"radius":10,"edges":{"axis":"parallel-to-holes","outerOnly":true,"straightOnly":true}}}
+
 Allowed actions and params:
 - box: {length,width,height,centered?} - create a rectangular part (new document part).
 - cylinder: {diameter,height,centered?}
 - extrude: {sketch?:"Sketch1",depth,direction?} - extrude an existing sketch.
 - cut: {sketch?:"Sketch2",depth,direction?} - extruded cut that removes material from the body.
 - revolve: {sketch?:"Sketch1",angle?,axis?:"u"|"v",operation?:"join"|"cut"|"new"} - revolve a sketch.
-- fillet: {radius,edges?:"all"} - round the body edges.
-- chamfer: {distance,edges?:"all"}
+- fillet: {radius,edges?:"all"|"selected"|number[]|selector} - round the body edges (see EDGE TARGETING).
+- chamfer: {distance,edges?:"all"|"selected"|number[]|selector}
 - shell: {thickness}
 - mirror: {plane?:"right"|"front"|"top"} - mirror and fuse the body about a base plane.
 - pattern: {axis?:"x"|"y"|"z",count,spacing} - linear pattern of the body.
 - mate: {type?:"coincident"|"concentric"|"distance",componentA?,componentB?,distance?} - mate two inserted components.
-- material: {id:"aisi1020"|"steel"|"al6061"|"ss304"|"ti6al4v"|"abs"|"brass"}
+- material: {id} - one of: ${materialPromptList()}
 - variable: {name,expression} - global equation, e.g. {"name":"L","expression":"100"}.
 - measure: {} - open the measure tool.
 - view: {name:"front"|"top"|"right"|"iso"}
@@ -91,6 +128,17 @@ Current document: "${doc.name}", ${doc.parts.length} part(s), mode ${doc.mode}. 
   }.`;
 }
 
+/** Numeric version of a Gemini model id, used to prefer the newest alias. */
+function modelVersion(id: string): number {
+  const match = /gemini-(\d+)(?:\.(\d+))?/i.exec(id);
+  if (!match) return -1;
+  return Number(match[1]) + Number(match[2] ?? 0) / 100;
+}
+
+function newestModel(models: { id: string; label: string }[]): { id: string; label: string } | undefined {
+  return [...models].sort((a, b) => modelVersion(b.id) - modelVersion(a.id) || a.id.localeCompare(b.id))[0];
+}
+
 function readCookie(name: string): string | null {
   const match = document.cookie.split(";").map((p) => p.trim()).find((p) => p.startsWith(name + "="));
   return match ? decodeURIComponent(match.slice(name.length + 1)) : null;
@@ -108,10 +156,14 @@ export class Assistant {
   private keyInput: HTMLInputElement | null = null;
   private modelSelect: HTMLSelectElement | null = null;
   private thinkSelect: HTMLSelectElement | null = null;
+  private viewInput: HTMLInputElement | null = null;
   private promptEl: HTMLTextAreaElement | null = null;
   private sendBtn: HTMLButtonElement | null = null;
   private stateEl: HTMLElement | null = null;
   private busy = false;
+  private sendView = true;
+  private listing = false;
+  private lastListSignature = "";
   private history: { role: "user" | "model"; text: string }[] = [];
 
   constructor(root: HTMLElement, options: AssistantOptions) {
@@ -120,6 +172,7 @@ export class Assistant {
     this.key = this.loadKey();
     this.model = localStorage.getItem(MODEL_STORAGE) || DEFAULT_MODEL;
     this.thinking = localStorage.getItem(THINK_STORAGE) || "mid";
+    this.sendView = localStorage.getItem(VIEW_STORAGE) !== "0";
     this.render();
     if (this.key) void this.refreshModels();
   }
@@ -183,6 +236,11 @@ export class Assistant {
             <option value="high">high</option>
           </select>
         </div>
+        <label class="ai-vision" title="Attach the current 3D viewport JPEG and the B-Rep topology JSON">
+          <input type="checkbox" id="ai-send-view" checked />
+          <span>Send viewport view</span>
+          <b>JPEG</b>
+        </label>
       </div>
       <div class="ai-scroll" id="ai-scroll">
         <div class="ai-msg bot">Ask in Turkish or English. I can build parts, apply features, assign materials and set up studies. The API key is stored only in this browser; no MarmaraCad server sees it.</div>
@@ -203,11 +261,13 @@ export class Assistant {
     this.keyInput = this.root.querySelector("#ai-key-input");
     this.modelSelect = this.root.querySelector("#ai-model");
     this.thinkSelect = this.root.querySelector("#ai-thinking");
+    this.viewInput = this.root.querySelector("#ai-send-view");
     this.promptEl = this.root.querySelector("#ai-prompt");
     this.sendBtn = this.root.querySelector("#ai-send");
     this.stateEl = this.root.querySelector("#ai-key-state");
     if (this.keyInput) this.keyInput.value = this.key;
     if (this.thinkSelect) this.thinkSelect.value = this.thinking;
+    if (this.viewInput) this.viewInput.checked = this.sendView;
     if (this.modelSelect) this.modelSelect.value = this.model;
     this.updateKeyState();
     this.root.querySelector(".ai-close")?.addEventListener("click", () => this.toggle(false));
@@ -219,7 +279,7 @@ export class Assistant {
       }
       this.saveKey(value);
       this.updateKeyState();
-      this.pushMessage("API key saved locally. Fetching models…", "bot");
+      this.setStatus("API key saved · listing models…");
       void this.refreshModels();
     });
     this.root.querySelector("#ai-key-clear")?.addEventListener("click", () => {
@@ -249,6 +309,15 @@ export class Assistant {
       }
       this.updateKeyState();
     });
+    this.viewInput?.addEventListener("change", () => {
+      this.sendView = this.viewInput?.checked ?? true;
+      try {
+        localStorage.setItem(VIEW_STORAGE, this.sendView ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      this.updateKeyState();
+    });
     this.sendBtn?.addEventListener("click", () => void this.send());
     this.promptEl?.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
@@ -268,52 +337,60 @@ export class Assistant {
 
   private updateKeyState(): void {
     if (this.stateEl) {
-      this.stateEl.textContent = this.key ? `Key saved · ${this.model} · ${this.thinking}` : "No key";
+      this.stateEl.textContent = this.key
+        ? `Key saved · ${this.model} · ${this.thinking} · ${this.sendView ? "viewport" : "text only"}`
+        : "No key";
       this.stateEl.style.color = this.key ? "#2e7d5b" : "#96690c";
     }
     const head = this.root.querySelector("#ai-head-state");
-    if (head) head.textContent = `${this.key ? "Local key" : "No key"} · ${this.model} · ${this.thinking}`;
+    if (head) head.textContent = `${this.key ? "Local key" : "No key"} · ${this.model} · ${this.thinking} · ${this.sendView ? "vision" : "text"}`;
   }
 
-  /** `hydrogen` is the visible default. When Google lists a model with that
-   *  exact id use it unchanged, otherwise alias it to the first flash model. */
+  /** `hydrogen` is the visible default. Prefer an exact `hydrogen` id, then the
+   *  newest `/hydrogen/i` alias (e.g. `gemini-4-hydrogen`), and only fall back
+   *  to a flash model when the API lists no hydrogen variant at all. */
   private defaultModelId(): string {
     if (this.models.some((m) => m.id === DEFAULT_MODEL)) return DEFAULT_MODEL;
-    return (this.models.find((m) => /flash/i.test(m.id)) ?? this.models[0])?.id ?? DEFAULT_MODEL_ID;
+    const newestHydrogen = newestModel(this.models.filter((m) => /hydrogen/i.test(m.id)));
+    if (newestHydrogen) return newestHydrogen.id;
+    const newestFlash = newestModel(this.models.filter((m) => /flash/i.test(m.id)));
+    return newestFlash?.id ?? this.models[0]?.id ?? DEFAULT_MODEL_ID;
   }
 
   private renderModelOptions(): void {
     if (!this.modelSelect) return;
-    const hydrogen = this.models.find((m) => m.id === DEFAULT_MODEL);
-    const fallback = hydrogen ?? this.models.find((m) => /flash/i.test(m.id)) ?? this.models[0];
-    const list = this.models.length
-      ? [
-          { id: DEFAULT_MODEL, label: hydrogen ? "hydrogen (default)" : `hydrogen (default · ${fallback.label})` },
-          ...this.models.filter((m) => m.id !== DEFAULT_MODEL).map((m) => ({ id: m.id, label: m.label })),
-        ]
-      : [{ id: DEFAULT_MODEL, label: "hydrogen (default)" }];
-    this.modelSelect.innerHTML = list
-      .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`)
-      .join("");
-    let selected = list.find((m) => m.id === this.model);
-    if (!selected) {
-      this.model = DEFAULT_MODEL;
-      selected = list[0];
-    }
-    if (selected) {
-      this.modelSelect.value = selected.id;
-      if (selected.id === DEFAULT_MODEL) {
-        this.model = DEFAULT_MODEL;
-        this.modelId = this.defaultModelId();
-      } else {
-        this.model = selected.id;
-        this.modelId = selected.id;
+    const resolved = this.defaultModelId();
+    const recommended: { id: string; label: string }[] = [
+      { id: DEFAULT_MODEL, label: resolved === DEFAULT_MODEL ? "hydrogen (default)" : `hydrogen (default · ${resolved})` },
+    ];
+    const recommendedIds = new Set([DEFAULT_MODEL]);
+    // Gemini 4 and every hydrogen alias are the recommended picks.
+    for (const model of this.models) {
+      if (model.id === DEFAULT_MODEL) continue;
+      if (/hydrogen/i.test(model.id) || /gemini-4/i.test(model.id)) {
+        recommended.push(model);
+        recommendedIds.add(model.id);
       }
     }
+    const rest = this.models.filter((model) => !recommendedIds.has(model.id));
+    const option = (model: { id: string; label: string }) =>
+      `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label)}</option>`;
+    const groups = [`<optgroup label="Recommended">${recommended.map(option).join("")}</optgroup>`];
+    if (rest.length) groups.push(`<optgroup label="All models">${rest.map(option).join("")}</optgroup>`);
+    this.modelSelect.innerHTML = groups.join("");
+    let selected = [...recommended, ...rest].find((model) => model.id === this.model) ?? recommended[0];
+    if (!selected) {
+      this.model = DEFAULT_MODEL;
+      selected = recommended[0];
+    }
+    this.modelSelect.value = selected.id;
+    this.model = selected.id;
+    this.modelId = selected.id === DEFAULT_MODEL ? resolved : selected.id;
   }
 
   async refreshModels(): Promise<void> {
-    if (!this.key) return;
+    if (!this.key || this.listing) return;
+    this.listing = true;
     this.setStatus("Listing Gemini models…");
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(this.key)}`);
@@ -326,18 +403,24 @@ export class Assistant {
           return { id, label: m.displayName ?? id };
         });
       this.models = models;
-      // `hydrogen` stays the visible default; it is used directly when the API
-      // lists that id, otherwise aliased to the first flash model.
       this.renderModelOptions();
       this.updateKeyState();
-      this.setStatus(`${this.models.length} model(s) available`);
-      this.pushMessage(
-        `${this.models.length} Gemini model(s) listed. Default is hydrogen (${this.modelId}), thinking mid.`,
-        "bot",
-      );
+      const signature = models.map((m) => m.id).sort().join("|");
+      const gemini4 = models.filter((m) => /gemini-4/i.test(m.id)).length;
+      this.setStatus(`${models.length} model(s) · default ${this.modelId} · thinking ${this.thinking}`);
+      // Listing the same models twice (key save + panel init) must not spam the chat.
+      if (signature !== this.lastListSignature) {
+        this.lastListSignature = signature;
+        this.pushMessage(
+          `${models.length} Gemini model(s) listed. Recommended: hydrogen (${this.modelId})${gemini4 ? ` + ${gemini4} Gemini 4 model(s)` : ""}. Thinking mid.`,
+          "bot",
+        );
+      }
     } catch (error) {
       this.pushMessage(`Could not list models: ${error instanceof Error ? error.message : String(error)}`, "error");
       this.setStatus("Model listing failed");
+    } finally {
+      this.listing = false;
     }
   }
 
@@ -384,17 +467,32 @@ export class Assistant {
     this.setStatus("Gemini is thinking…");
     try {
       const debugDoc = (window as unknown as { __marmaracad?: { doc?: () => ProjectDocument } }).__marmaracad?.doc?.();
+      let context: AiContext | undefined;
+      try {
+        context = this.options.context ? await this.options.context() : undefined;
+      } catch {
+        context = undefined;
+      }
+      const topologyText = context?.topology ? `\n\nCURRENT TOPOLOGY (JSON):\n${JSON.stringify(context.topology)}` : "";
+      const image = this.sendView ? context?.image : undefined;
       const generationConfig: Record<string, unknown> = {
         temperature: 0.15,
         responseMimeType: "application/json",
       };
       const thinkingConfig = thinkingConfigFor(this.modelId, this.thinking);
       if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
+      const contents = this.history.map((entry, index) => {
+        const parts: Record<string, unknown>[] = [{ text: entry.text }];
+        // Only the newest user turn carries the frame; older turns stay text so
+        // the conversation does not accumulate images.
+        if (image && entry.role === "user" && index === this.history.length - 1) {
+          parts.push({ inlineData: { mimeType: image.mimeType, data: image.base64 } });
+        }
+        return { role: entry.role, parts };
+      });
       const body = {
-        systemInstruction: { parts: [{ text: systemPrompt(debugDoc ?? createDocument()) }] },
-        contents: [
-          ...this.history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
-        ],
+        systemInstruction: { parts: [{ text: systemPrompt(debugDoc ?? createDocument()) + topologyText }] },
+        contents,
         generationConfig,
       };
       const res = await fetch(

@@ -25,6 +25,7 @@ import type {
 } from "./model/types";
 import {
   basePlane,
+  APP_VERSION_SHORT,
   createDocument,
   createPart,
   nextFeatureName,
@@ -81,7 +82,9 @@ import {
   removeConfiguration,
 } from "./model/configurations";
 import { buildDrawingSvg, downloadDrawingPdf } from "./drawing/technicalDrawing";
-import { Assistant, type AiCommand } from "./ui/Assistant";
+import { Assistant, type AiCommand, type AiContext } from "./ui/Assistant";
+import { summarizeTopology } from "./ai/topology";
+import { resolveEdgeSelection } from "./ai/edgeSelection";
 import { alertDialog, confirmDialog, openModal, promptNumber, toast } from "./ui/Modal";
 import { hydrateIcons, icon } from "./ui/icons";
 import { materialOptions, type SketchInfo } from "./ui/FeatureTree";
@@ -290,6 +293,7 @@ export class App {
     this.assistant = new Assistant(this.shell.aiPanelEl, {
       onCommands: (commands, message) => void this.applyAiCommands(commands, message),
       onStatus: (text) => this.shell.setStatus(text),
+      context: () => this.aiContext(),
     });
 
     this.bindShell();
@@ -373,6 +377,17 @@ export class App {
         app: this,
         assistant: this.assistant,
         selections: () => ({ faces: this.selFaces, edges: this.selEdges, vertices: this.selVertices }),
+        topology: () => {
+          const part = this.activePart();
+          const mesh = part ? this.meshForPart(part.id) : undefined;
+          return mesh && part
+            ? summarizeTopology(mesh, part, {
+                faces: this.selFaces.map((pick) => pick.faceIndex),
+                edges: this.selEdges.map((pick) => pick.edgeIndex),
+              })
+            : null;
+        },
+        lastCapture: () => this.viewport.lastCapture,
         renderer: () => this.graphics.backend,
         control: () => ({ ...this.viewport.getControlState(), ...this.viewport.debugControl }),
         kernel: () => ({
@@ -891,6 +906,23 @@ export class App {
     const part = this.doc.parts.find((p) => p.id === partId);
     if (part?.meshOnly) return this.loadLocalMesh(part);
     return undefined;
+  }
+
+  /** Multimodal request context: live viewport frame + compact B-Rep summary. */
+  private aiContext(): AiContext {
+    const part = this.activePart();
+    const mesh = part ? this.meshForPart(part.id) : undefined;
+    const topology = mesh && part
+      ? summarizeTopology(mesh, part, {
+          faces: this.selFaces.map((pick) => pick.faceIndex),
+          edges: this.selEdges.map((pick) => pick.edgeIndex),
+        })
+      : undefined;
+    const capture = this.viewport.captureJpeg();
+    return {
+      topology,
+      image: capture ? { mimeType: "image/jpeg", base64: capture.base64 } : undefined,
+    };
   }
 
   private loadLocalMesh(part: Part): MeshData | undefined {
@@ -2787,13 +2819,29 @@ export class App {
         if (!this.meshForPart(active.id) && active.features.length) await this.rebuild();
         const mesh = this.meshForPart(active.id);
         if (!mesh) return false;
-        const indices = text("edges") === "all" || !params.edges ? mesh.edges.map((e) => e.index) : (params.edges as number[]);
+        const topology = summarizeTopology(mesh, active, {
+          faces: this.selFaces.map((pick) => pick.faceIndex),
+          edges: this.selEdges.map((pick) => pick.edgeIndex),
+        });
+        const resolved = resolveEdgeSelection(
+          topology,
+          params.edges ?? "all",
+          this.selEdges.filter((pick) => pick.partId === active.id).map((pick) => pick.edgeIndex),
+        );
+        if (!resolved.indices.length) {
+          toast(`AI ${command.action}: ${resolved.reason}`, "warn", 6000);
+          return false;
+        }
         active.features.push({
           id: uid("feat"),
           type: command.action,
           name: nextFeatureName(command.action, active.features),
-          params: command.action === "fillet" ? { radius: Math.max(0.01, num("radius", 2)), edgeIndices: indices } : { distance: Math.max(0.01, num("distance", 1)), edgeIndices: indices },
+          params:
+            command.action === "fillet"
+              ? { radius: Math.max(0.01, num("radius", 2)), edgeIndices: resolved.indices }
+              : { distance: Math.max(0.01, num("distance", 1)), edgeIndices: resolved.indices },
         });
+        this.shell.setStatus(`${command.action === "fillet" ? "Fillet" : "Chamfer"} · ${resolved.reason}`);
         return true;
       }
       case "shell":
@@ -7942,7 +7990,7 @@ export class App {
     const sketches = this.doc.parts.reduce((sum, p) => sum + p.sketches.length, 0);
     const triangles = mesh ? Math.round(mesh.indices.length / 3) : 0;
     const body = `<div class="study-stats">
-      <span>Application</span><span>MarmaraCad 1.0</span>
+      <span>Application</span><span>MarmaraCad ${APP_VERSION_SHORT}</span>
       <span>Document</span><span>${escapeHtml(this.doc.name)}</span>
       <span>Workspace</span><span>${this.doc.mode}</span>
       <span>Units</span><span>mm / N / MPa</span>
@@ -8001,7 +8049,7 @@ export class App {
   private about(): void {
     const body = `<div style="text-align:center;padding:4px 0 8px">
       <div class="boot-mark" style="margin:0 auto 10px;width:52px;height:52px;border-radius:14px;font-size:26px;">M</div>
-      <div style="font-size:20px;font-weight:700">MarmaraCad <span style="color:#1668b3">1.0</span></div>
+      <div style="font-size:20px;font-weight:700">MarmaraCad <span style="color:#1668b3">${APP_VERSION_SHORT}</span></div>
       <p style="color:#5a6c7e;margin:4px 0 12px">Browser-native parametric CAD, assembly and linear-static FEA.</p>
       <div class="study-stats" style="text-align:left">
         <span>Geometry kernel</span><span>Open CASCADE (OCCT) compiled to WebAssembly</span>

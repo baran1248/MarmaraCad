@@ -68,10 +68,13 @@ visualisation — executes on the user's own CPU/GPU.
   centerlines/center marks, hatched A-A section, assembly BOM) and PDF export.
 - Toolbox fasteners (M4–M12 hex bolts, nuts, washers), equations/variables, rollback bar,
   TR/EN interface, document templates (`Cantilever Beam`, `L-Bracket`, `Box + Lid Assembly`).
-- Gemini CAD assistant: the API key is stored only in this browser; Turkish or English requests are
-  translated to a validated command list and applied inside the normal undo/redo history, including
-  reference planes, sweeps, lofts, circular patterns, holes, exploded views, modal, thermal and
-  buckling studies.
+- Gemini CAD assistant: the API key is stored only in this browser; each request can attach the current
+  viewport JPEG plus a compact B-Rep topology JSON (bbox, faces, edges, hole axes, outer corners), so
+  Turkish or English requests become a validated command list applied inside the normal undo/redo
+  history. Fillet/chamfer edges can be named semantically (`"all"`, `"selected"`, explicit indices, or
+  a selector with `preset` / `axis` / `outerOnly` / `straightOnly` / length bounds), and the assistant
+  also covers reference planes, sweeps, lofts, circular patterns, holes, exploded views, modal, thermal
+  and buckling studies.
 - Multi-part assemblies with Coincident, Concentric, Distance and Angle mates plus an exploded view
   with an explode/collapse slider.
 - STEP (AP214), IGES, STL and OBJ import/export; `.mcad.json` projects; IndexedDB autosave.
@@ -117,6 +120,8 @@ and AI cut/revolve/mirror/pattern/mate commands, the drawing dimension placement
 Assembly/mass-card/menu labels.
 
 The phase-4 suites add e2e-phase4.mjs: the horizontal-trackpad orbit regression (dx 120 / dy 10 must orbit, not pan), the Pan scheme with Shift swap, Ctrl/pinch zoom, two-finger pan+pinch, three-finger Undo/Redo, pen dead-zone and tap-to-select, Push/Pull +15 mm (168,000 mm³) with an inward cut and Enter value, the edge-handle R6 fillet, Base/Edge Flange with the BA flat pattern (23,123.82 mm³ analytical) and a valid R12 .dxf, configurations (48,000 ↔ 144,000 mm³ with the Mass card), .mcad.json round-trips, the AI sheet-metal/config/push-pull actions and a live concentric-mate drag with a 0.000 mm radial residual.
+
+The phase-6 assistant suite verifies the multimodal request (viewport JPEG `inlineData` + topology JSON with the hole axis and four outer corners), the `Send viewport view` toggle, hydrogen resolution to `gemini-4-hydrogen` with Gemini-4 models in the Recommended group, per-generation thinking config (`thinkingLevel` vs `thinkingBudget`), and a targeted fillet that selects only the four outer corners with the analytic 1,545.13 mm³ volume loss.
 
 The phase-5 suite (`e2e-phase5.mjs`, 23 checks) proves the memory discipline and the new UI: 20
 consecutive rebuilds with `created 2002 / deleted 2002 / leaked 0 / untracked 0` and a stable

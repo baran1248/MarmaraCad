@@ -97,6 +97,17 @@ try {
     { calls: panel.calls },
   );
 
+  // Saving the same key twice re-lists the models but must not duplicate the
+  // "N Gemini model(s) listed" chat notice.
+  const listCalls = await page.evaluate(() => window.__aiCalls.filter((c) => c.method === "GET").length);
+  await page.click("#ai-key-save");
+  await page.waitForFunction((n) => window.__aiCalls.filter((c) => c.method === "GET").length > n, listCalls, { timeout: 20000 });
+  await page.waitForTimeout(300);
+  const listedMessages = await page.evaluate(
+    () => [...document.querySelectorAll(".ai-msg.bot")].filter((el) => /model\(s\) listed/.test(el.textContent ?? "")).length,
+  );
+  record("Re-listing the same models does not duplicate the chat notice", listedMessages === 1, { listedMessages });
+
   await page.fill("#ai-prompt", "40 x 20 x 10 mm plate in 6061-T6");
   await page.click("#ai-send");
   await page.waitForSelector(".ai-apply", { timeout: 15000 });
@@ -111,17 +122,18 @@ try {
     { text: beforeApply.text.slice(-220) },
   );
   record(
-    "Request uses the hydrogen→flash alias with a 2.5 thinkingBudget and the full command schema",
-    /gemini-2\.5-flash:generateContent/.test(beforeApply.last?.url ?? "") &&
-      beforeApply.last?.body?.generationConfig?.thinkingConfig?.thinkingBudget === 8192 &&
-      beforeApply.last?.body?.generationConfig?.thinkingConfig?.thinkingLevel === undefined &&
+    "Request aliases hydrogen to the newest flash model (gemini-3-flash) with thinkingLevel medium and the full command schema",
+    /gemini-3-flash:generateContent/.test(beforeApply.last?.url ?? "") &&
+      beforeApply.last?.body?.generationConfig?.thinkingConfig?.thinkingLevel === "medium" &&
+      beforeApply.last?.body?.generationConfig?.thinkingConfig?.thinkingBudget === undefined &&
       /Allowed actions and params/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
       /box: \{length,width,height/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
       /cut: \{sketch/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
       /revolve: \{sketch/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
       /mirror: \{plane/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
       /pattern: \{axis/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
-      /mate: \{type/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? ""),
+      /mate: \{type/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? "") &&
+      /al6061 \(Aluminum 6061-T6\)/.test(beforeApply.last?.body?.systemInstruction?.parts?.[0]?.text ?? ""),
     {
       url: beforeApply.last?.url?.replace(/key=[^&]+/, "key=***"),
       thinking: beforeApply.last?.body?.generationConfig?.thinkingConfig,
@@ -180,6 +192,15 @@ try {
       return { url: last?.url ?? "", thinking: last?.body?.generationConfig?.thinkingConfig };
     });
 
+  await page.selectOption("#ai-model", "gemini-2.5-flash");
+  await sendAndWait("repeat the plate", await page.locator(".ai-apply").count());
+  const g25 = await lastPost();
+  record(
+    "Gemini 2.5 requests keep thinkingBudget (8192), not thinkingLevel",
+    /gemini-2\.5-flash:generateContent/.test(g25.url) && g25.thinking?.thinkingBudget === 8192 && g25.thinking?.thinkingLevel === undefined,
+    g25,
+  );
+
   await page.selectOption("#ai-model", "gemini-3-flash");
   await sendAndWait("repeat the plate", await page.locator(".ai-apply").count());
   const g3 = await lastPost();
@@ -222,6 +243,200 @@ try {
       hydrogenPanel.options.includes("hydrogen") &&
       /\/models\/hydrogen:generateContent/.test(hydrogen.url),
     { hydrogen, hydrogenPanel },
+  );
+
+  // --- No exact `hydrogen`: the newest hydrogen alias must win, and Gemini 4
+  // models belong to the Recommended group in the model picker.
+  await page.evaluate(() => {
+    window.__aiModels = [
+      { name: "models/gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen", supportedGenerationMethods: ["generateContent"] },
+      ...window.__aiModels.filter((m) => m.name !== "models/hydrogen"),
+    ];
+  });
+  const getCalls4 = await page.evaluate(() => window.__aiCalls.filter((c) => c.method === "GET").length);
+  await page.click("#ai-key-save");
+  await page.waitForFunction((n) => window.__aiCalls.filter((c) => c.method === "GET").length > n, getCalls4, { timeout: 20000 });
+  await page.waitForTimeout(300);
+  const g4Panel = await page.evaluate(() => {
+    const select = document.querySelector("#ai-model");
+    const option = [...select.querySelectorAll("option")].find((o) => o.value === "gemini-4-hydrogen");
+    return {
+      selected: select.value,
+      hasOption: !!option,
+      group: option?.parentElement?.tagName === "OPTGROUP" ? option.parentElement.label : option?.parentElement?.tagName,
+      options: [...select.querySelectorAll("option")].map((o) => o.value),
+      head: document.getElementById("ai-head-state")?.textContent,
+    };
+  });
+  record(
+    "Gemini 4 models are listed in the Recommended model group",
+    g4Panel.selected === "hydrogen" && g4Panel.hasOption && g4Panel.group === "Recommended",
+    g4Panel,
+  );
+  await sendAndWait("repeat the plate", await page.locator(".ai-apply").count());
+  const g4 = await lastPost();
+  record(
+    "hydrogen resolves to the newest hydrogen alias (gemini-4-hydrogen) with thinkingLevel medium",
+    /\/models\/gemini-4-hydrogen:generateContent/.test(g4.url) &&
+      g4.thinking?.thinkingLevel === "medium" &&
+      g4.thinking?.thinkingBudget === undefined,
+    { g4, selected: g4Panel.selected, head: g4Panel.head },
+  );
+
+  // --- Multimodal context: viewport JPEG + B-Rep topology in every request.
+  await newDocument(page);
+  await page.click('[data-tree-action="sample"]');
+  await page.waitForFunction(
+    () => {
+      const api = window.__marmaracad;
+      const part = api.doc().parts[0];
+      const mesh = part && api.meshes().get(part.id);
+      return !!mesh && Math.abs(mesh.volume - 98507) < 2;
+    },
+    null,
+    { timeout: 240000 },
+  );
+  await page.waitForTimeout(400);
+  await page.evaluate(() => {
+    window.__aiReply = { message: "Moved to iso view.", commands: [{ action: "view", params: { name: "iso" } }] };
+  });
+  const visionApplies = await page.locator(".ai-apply").count();
+  await page.fill("#ai-prompt", "Show me the plate in iso view");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-apply").length > n, visionApplies, { timeout: 30000 });
+  await page.waitForTimeout(200);
+  const vision = await page.evaluate(() => {
+    const calls = window.__aiCalls.filter((c) => c.method === "POST");
+    const last = calls.at(-1);
+    const parts = last?.body?.contents?.at(-1)?.parts ?? [];
+    const system = last?.body?.systemInstruction?.parts?.[0]?.text ?? "";
+    const marker = "CURRENT TOPOLOGY (JSON):";
+    const at = system.indexOf(marker);
+    let topology = null;
+    if (at >= 0) {
+      try {
+        topology = JSON.parse(system.slice(at + marker.length).trim());
+      } catch {
+        topology = null;
+      }
+    }
+    const capture = window.__marmaracad.lastCapture?.();
+    return {
+      image: parts.find((p) => p.inlineData)?.inlineData ?? null,
+      hasTopology: at >= 0,
+      topology: topology && {
+        holeAxes: topology.holeAxes,
+        bbox: topology.part?.bbox,
+        corners: topology.edges?.filter((e) => e.isOuterCorner).map((e) => e.index),
+        faces: topology.faces?.length,
+        edges: topology.edges?.length,
+        selection: topology.selection,
+      },
+      capture: capture && { bytes: capture.bytes, content: capture.content, fallback: capture.fallback, width: capture.width, height: capture.height },
+      systemChars: system.length,
+    };
+  });
+  record(
+    "Every request attaches the viewport JPEG and the B-Rep topology (hole axis + four outer corners)",
+    vision.image?.mimeType === "image/jpeg" &&
+      (vision.image?.data?.length ?? 0) > 2000 &&
+      vision.hasTopology &&
+      Array.isArray(vision.topology?.holeAxes) &&
+      vision.topology.holeAxes.includes("y") &&
+      vision.topology?.corners?.length === 4 &&
+      vision.topology?.faces === 13 &&
+      vision.topology?.edges === 30 &&
+      (vision.capture?.bytes ?? 0) > 1000 &&
+      (vision.capture?.content ?? 0) > 0.01,
+    {
+      imageBytes: Math.round(((vision.image?.data?.length ?? 0) * 3) / 4),
+      topology: vision.topology,
+      capture: vision.capture,
+      systemChars: vision.systemChars,
+    },
+  );
+
+  await page.uncheck("#ai-send-view");
+  const textOnlyApplies = await page.locator(".ai-apply").count();
+  await page.fill("#ai-prompt", "Repeat that without the picture");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-apply").length > n, textOnlyApplies, { timeout: 30000 });
+  await page.waitForTimeout(200);
+  const textOnly = await page.evaluate(() => {
+    const calls = window.__aiCalls.filter((c) => c.method === "POST");
+    const last = calls.at(-1);
+    const parts = last?.body?.contents?.at(-1)?.parts ?? [];
+    const system = last?.body?.systemInstruction?.parts?.[0]?.text ?? "";
+    return { images: parts.filter((p) => p.inlineData).length, hasTopology: system.includes("CURRENT TOPOLOGY (JSON):") };
+  });
+  record("Turning Send viewport view off removes only the image, not the topology", textOnly.images === 0 && textOnly.hasTopology, textOnly);
+  await page.check("#ai-send-view");
+
+  // --- Targeted fillet: only the four outer corner edges, matching the analytic loss.
+  const prepared = await page.evaluate(async () => {
+    const api = window.__marmaracad;
+    const part = api.doc().parts[0];
+    const base = part.features.find((f) => f.type === "extrude" && f.params?.depth === 10);
+    base.params.depth = 18;
+    part.features = [base];
+    await api.app.rebuild();
+    const mesh = api.meshes().get(part.id);
+    const summary = api.topology();
+    return {
+      volume: mesh?.volume,
+      corners: summary.edges.filter((e) => e.isOuterCorner).map((e) => e.index),
+      holeAxes: summary.holeAxes,
+    };
+  });
+  record(
+    "Test plate is 120 × 80 × 18 with four outer corners parallel to the holes",
+    Math.abs((prepared.volume ?? 0) - 168219.56) < 2 && prepared.corners.length === 4 && prepared.holeAxes.includes("y"),
+    prepared,
+  );
+  await page.evaluate(() => {
+    window.__aiReply = {
+      message: "Filleted only the four outer corners.",
+      commands: [{ action: "fillet", params: { radius: 10, edges: { axis: "parallel-to-holes", outerOnly: true, straightOnly: true } } }],
+    };
+  });
+  const filletApplies = await page.locator(".ai-apply").count();
+  await page.fill("#ai-prompt", "Sadece deliklerle aynı yöndeki dış dört köşeye 10 mm radyus ver");
+  await page.click("#ai-send");
+  await page.waitForFunction((n) => document.querySelectorAll(".ai-apply").length > n, filletApplies, { timeout: 30000 });
+  await page.locator(".ai-apply").last().click();
+  await page.waitForFunction(
+    () => {
+      const api = window.__marmaracad;
+      const part = api.doc().parts[0];
+      const mesh = api.meshes().get(part.id);
+      return !!mesh && part.features.some((f) => f.type === "fillet") && mesh.volume < 168000;
+    },
+    null,
+    { timeout: 180000 },
+  );
+  await page.waitForTimeout(300);
+  const filleted = await page.evaluate(() => {
+    const api = window.__marmaracad;
+    const part = api.doc().parts[0];
+    const mesh = api.meshes().get(part.id);
+    const feature = part.features.find((f) => f.type === "fillet");
+    return {
+      volume: mesh?.volume,
+      radius: feature?.params?.radius,
+      edgeIndices: feature?.params?.edgeIndices,
+      warnings: mesh?.warnings,
+      faces: mesh?.faces.length,
+      edges: mesh?.edges.length,
+    };
+  });
+  const loss = (prepared.volume ?? 0) - (filleted.volume ?? 0);
+  record(
+    "The selector fillets exactly the four outer corners and removes ≈1,545 mm³",
+    JSON.stringify(filleted.edgeIndices) === JSON.stringify(prepared.corners) &&
+      Math.abs((filleted.radius ?? 0) - 10) < 1e-9 &&
+      Math.abs(loss - 1545.13) < 2 &&
+      (filleted.warnings?.length ?? 0) === 0,
+    { ...filleted, loss, corners: prepared.corners },
   );
 
   // --- AI force/direction must land in the study as a support + load.

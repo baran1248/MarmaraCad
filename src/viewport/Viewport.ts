@@ -105,6 +105,19 @@ export interface EdgeSel {
   edgeIndex: number;
 }
 
+/** A JPEG frame of the viewport, ready for a Gemini `inlineData` part. */
+export interface ViewportCapture {
+  mimeType: "image/jpeg";
+  base64: string;
+  dataUrl: string;
+  width: number;
+  height: number;
+  bytes: number;
+  /** Fraction of sampled pixels that differ from the corner pixel (0..1). */
+  content: number;
+  fallback: boolean;
+}
+
 interface BodyView {
   key: string;
   partId: string;
@@ -250,6 +263,8 @@ export class Viewport {
   private shadowPlane: THREE.Mesh | null = null;
   /** Translucent live preview from a PropertyManager (Extrude, Cut, Fillet…). */
   private ghostGroup: THREE.Group | null = null;
+  /** Last JPEG handed to the AI panel; the e2e suite reads this as evidence. */
+  lastCapture: ViewportCapture | null = null;
 
   constructor(container: HTMLElement, renderer: RendererLike, backend: RendererBackend = "webgl2") {
     this.container = container;
@@ -2332,6 +2347,72 @@ export class Viewport {
   screenshotDataURL(): string {
     this.renderer.render(this.scene, this.camera);
     return this.renderer.domElement.toDataURL("image/png");
+  }
+
+  /** Capture the current viewport as a downscaled JPEG for the multimodal AI.
+   *  The frame is drawn into a 2D canvas so the result works for both WebGL2
+   *  and WebGPU canvases, and so the image stays small enough for the model. */
+  captureJpeg(quality = 0.78, maxWidth = 1024): ViewportCapture | null {
+    const canvas = this.renderer.domElement;
+    const encode = (fallback: boolean): ViewportCapture | null => {
+      try {
+        const scale = Math.min(1, maxWidth / Math.max(1, canvas.width));
+        const width = Math.max(1, Math.round(canvas.width * scale));
+        const height = Math.max(1, Math.round(canvas.height * scale));
+        const out = document.createElement("canvas");
+        out.width = width;
+        out.height = height;
+        const ctx = out.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return null;
+        ctx.drawImage(canvas, 0, 0, width, height);
+        const dataUrl = out.toDataURL("image/jpeg", quality);
+        const comma = dataUrl.indexOf(",");
+        const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+        let content = 0;
+        try {
+          const pixels = ctx.getImageData(0, 0, width, height).data;
+          const r0 = pixels[0];
+          const g0 = pixels[1];
+          const b0 = pixels[2];
+          const total = width * height;
+          const step = Math.max(1, Math.floor(total / 6000));
+          let samples = 0;
+          let different = 0;
+          for (let i = 0; i < total; i += step) {
+            const o = i * 4;
+            samples++;
+            if (Math.abs(pixels[o] - r0) > 8 || Math.abs(pixels[o + 1] - g0) > 8 || Math.abs(pixels[o + 2] - b0) > 8) {
+              different++;
+            }
+          }
+          content = samples ? different / samples : 0;
+        } catch {
+          content = 0;
+        }
+        return {
+          mimeType: "image/jpeg",
+          base64,
+          dataUrl,
+          width,
+          height,
+          bytes: Math.round((base64.length * 3) / 4),
+          content,
+          fallback,
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    // The last presented frame is already readable. If it is empty (a WebGPU
+    // canvas can expose an unpresented buffer), force one frame and retry.
+    let capture = encode(false);
+    if (!capture || capture.content < 0.01) {
+      this.renderer.render(this.scene, this.camera);
+      capture = encode(true);
+    }
+    this.lastCapture = capture;
+    return capture;
   }
 
   dispose(): void {
